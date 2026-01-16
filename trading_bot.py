@@ -43,7 +43,7 @@ class TradingBot:
         self.exchange = BinanceExchange(
             api_key=os.getenv('BINANCE_API_KEY'),
             api_secret=os.getenv('BINANCE_API_SECRET'),
-            testnet=os.getenv('USE_TESTNET', 'True').lower() == 'true'
+            testnet=os.getenv('USE_TESTNET', 'True').lower() in ('true', '1', 'yes', 'on')
         )
         
         self.technical_analysis = TechnicalAnalysis()
@@ -87,7 +87,7 @@ class TradingBot:
         # 1. Fetch market data
         market_data = self.exchange.get_market_data(self.symbol)
         if not market_data:
-            logger.warning("Failed to fetch market data")
+            logger.warning(f"Failed to fetch market data for {self.symbol}")
             return
         
         logger.info(f"Current price: ${market_data['price']:.2f}")
@@ -119,18 +119,20 @@ class TradingBot:
         
         # 5. Check current position
         current_position = self.exchange.get_position(self.symbol)
+        num_positions = 1 if current_position else 0
         if current_position:
             logger.info(f"Current position: {current_position}")
         
         # 6. Execute trading decision
-        self.execute_decision(ai_decision, market_data, balance, current_position)
+        self.execute_decision(ai_decision, market_data, balance, current_position, num_positions)
     
     def execute_decision(
         self,
         ai_decision: Dict[str, Any],
         market_data: Dict[str, Any],
         balance: Dict[str, Any],
-        current_position: Optional[Dict[str, Any]]
+        current_position: Optional[Dict[str, Any]],
+        num_positions: int
     ):
         """
         Execute trading decision based on AI analysis.
@@ -140,6 +142,7 @@ class TradingBot:
             market_data: Current market data
             balance: Account balance
             current_position: Current position info
+            num_positions: Number of current open positions
         """
         action = ai_decision.get('action', 'HOLD')
         confidence = ai_decision.get('confidence', 0)
@@ -148,7 +151,7 @@ class TradingBot:
         if not self.risk_manager.should_enter_trade(
             confidence=confidence,
             account_balance=balance.get('available_balance', 0),
-            current_positions=1 if current_position else 0
+            current_positions=num_positions
         ):
             logger.info("Trade rejected by risk manager")
             return

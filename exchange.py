@@ -1,10 +1,14 @@
 """
 Binance USDT futures exchange integration.
 """
+import logging
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from typing import Dict, Any, Optional
 import time
+
+
+logger = logging.getLogger(__name__)
 
 
 class BinanceExchange:
@@ -63,7 +67,7 @@ class BinanceExchange:
                 'klines': klines
             }
         except BinanceAPIException as e:
-            print(f"Binance API error: {e}")
+            logger.error(f"Binance API error getting market data for {symbol}: {e}")
             return {}
     
     def get_account_balance(self) -> Dict[str, Any]:
@@ -77,7 +81,7 @@ class BinanceExchange:
             }
             return balance
         except BinanceAPIException as e:
-            print(f"Error getting account balance: {e}")
+            logger.error(f"Error getting account balance: {e}")
             return {}
     
     def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -103,7 +107,7 @@ class BinanceExchange:
                     }
             return None
         except BinanceAPIException as e:
-            print(f"Error getting position: {e}")
+            logger.error(f"Error getting position for {symbol}: {e}")
             return None
     
     def place_order(
@@ -147,7 +151,7 @@ class BinanceExchange:
             
             return order
         except BinanceAPIException as e:
-            print(f"Error placing order: {e}")
+            logger.error(f"Error placing order for {symbol}: {e}")
             return None
     
     def set_leverage(self, symbol: str, leverage: int) -> bool:
@@ -165,5 +169,5 @@ class BinanceExchange:
             self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
             return True
         except BinanceAPIException as e:
-            print(f"Error setting leverage: {e}")
+            logger.error(f"Error setting leverage for {symbol}: {e}")
             return False

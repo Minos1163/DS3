@@ -2,9 +2,13 @@
 DeepSeek AI integration module for trading decisions.
 """
 import os
+import logging
 from openai import OpenAI
 from typing import Dict, Any, Optional
 import json
+
+
+logger = logging.getLogger(__name__)
 
 
 class DeepSeekAI:
@@ -56,7 +60,7 @@ class DeepSeekAI:
             return result
             
         except Exception as e:
-            print(f"Error calling DeepSeek API: {e}")
+            logger.error(f"Error calling DeepSeek API: {e}")
             return {
                 "action": "HOLD",
                 "confidence": 0,
