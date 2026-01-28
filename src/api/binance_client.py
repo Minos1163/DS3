@@ -86,28 +86,28 @@ class BinanceBroker:
         """
         检测API Key的权限能力
         - STANDARD: 标准期货API Key，可以访问FAPI
-        - PAPI_ONLY: 仅PAPI权限，不能访问FAPI
-        
-        注意：这是硬检测，避免FAPI失败后回退到PAPI的错误设计
+        - PAPI_ONLY: 仅PAPI权限，专门用于统一保证金账户
+
+        注意：PAPI模式已支持，所有下单将走PAPI-UM接口
         """
         try:
             url = f"{self.FAPI_BASE}/fapi/v2/account"
             response = self.request("GET", url, signed=True, allow_error=True)
             if response.status_code == 401:
-                # 401 表示无权限访问 FAPI，说明是 PAPI Key
-                print("🔍 API检测: 当前Key是PAPI_ONLY（无FAPI权限）")
+                # 401 表示无权限访问 FAPI，说明是 PAPI Key（统一保证金账户）
+                print("[检测] API检测: 当前Key是PAPI_ONLY（统一保证金账户）")
                 return ApiCapability.PAPI_ONLY
             elif response.status_code == 200:
                 # 正常访问FAPI，是标准期货Key
-                print("🔍 API检测: 当前Key是STANDARD（完整FAPI权限）")
+                print("[检测] API检测: 当前Key是STANDARD（完整FAPI权限）")
                 return ApiCapability.STANDARD
             else:
                 # 其他状态码可能是限流或服务问题，不能判断为PAPI_ONLY
-                print(f"🔍 API检测: FAPI返回非401/200状态码 {response.status_code}，暂时认为是STANDARD")
+                print(f"[检测] API检测: FAPI返回非401/200状态码 {response.status_code}，暂时认为是STANDARD")
                 return ApiCapability.STANDARD
         except requests.RequestException as e:
             # 网络异常不能作为判断PAPI-only的依据
-            print(f"🔍 API检测: 网络异常 {e}，暂时认为是STANDARD")
+            print(f"[检测] API检测: 网络异常 {e}，暂时认为是STANDARD")
             return ApiCapability.STANDARD
 
     def _detect_account_mode(self) -> AccountMode:
@@ -162,55 +162,37 @@ class OrderGateway:
         side: str,
         quantity: float,
         order_type: str = "MARKET",
-        position_side: str = "BOTH",
         reduce_only: bool = False,
         **extra: Any
     ) -> Dict[str, Any]:
         """
-        下单（标准期货FAPI）
-        
-        Args:
-            reduce_only: True表示平仓单，False表示开仓单（防止反向开仓）
-            
-        Raises:
-            RuntimeError: 如果API Key是PAPI_ONLY类型，需要用户创建标准期货API Key
+        PAPI Unified Margin 下单（唯一合法路径）
         """
-        # 硬性检查：禁止PAPI_ONLY Key使用此下单方法
-        if self.broker.capability == ApiCapability.PAPI_ONLY:
-            error_msg = (
-                "❌ API Key权限错误：当前API Key是PAPI_ONLY类型，无法调用期货FAPI接口。\n"
-                "👉 修复步骤：\n"
-                "1. 登录币安官方网站 (https://www.binance.com)\n"
-                "2. 进入API管理页面\n"
-                "3. 创建一个新的API Key（不要勾选Portfolio Margin权限）\n"
-                "4. 确保勾选「Enable Futures」权限\n"
-                "5. 将新Key的API Key和Secret更新到.env文件中\n"
-                "6. 重启机器人\n"
-                "📌 注意：当前机器人设计为使用标准期货API（FAPI），不支持Portfolio Margin统一账户模式。"
-            )
-            print(error_msg)
-            raise RuntimeError("API Key权限不足：需要标准期货API Key（FAPI权限）")
-        
         params: Dict[str, Any] = {
             "symbol": symbol,
-            "side": side.upper(),
+            "side": side.upper(),          # BUY / SELL
             "type": order_type,
-            "quantity": quantity
+            "quantity": quantity,
+
+            # PAPI 必须显式声明
+            "reduceOnly": "true" if reduce_only else "false",
+
+            # 单向持仓模式必须
+            "positionSide": "BOTH",
         }
 
-        # 单向持仓不要传 positionSide；对冲模式才需要 LONG/SHORT
-        if position_side and position_side != "BOTH":
-            params["positionSide"] = position_side
-        
-        # 平仓单加reduceOnly防止反向开仓
-        if reduce_only:
-            params["reduceOnly"] = "true"
-        
+        # 允许额外参数（如 timeInForce 等）
         params.update(extra)
-        
-        # 使用标准期货FAPI接口
-        url = f"{self.broker.FAPI_BASE}/fapi/v1/order"
-        response = self.broker.request("POST", url, params=params, signed=True)
+
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/order"
+
+        response = self.broker.request(
+            "POST",
+            url,
+            params=params,
+            signed=True
+        )
+
         return response.json()
 
 
@@ -590,25 +572,8 @@ class BinanceClient:
         self.position = self.broker.position
         self.balance_engine = self.broker.balance
         self._symbol_info_cache: Dict[str, Dict[str, Any]] = {}
-        print(f"🔗 连接到币安正式网 (Broker模式)")
-        print(f"✅ 模式: {self.broker.account_mode.value} / 能力: {self.broker.capability.value}")
-        
-        # API自检：如果检测到PAPI_ONLY Key，给出明确的修复指导
-        if self.broker.capability == ApiCapability.PAPI_ONLY:
-            print("\n" + "=" * 70)
-            print("⚠️  警告：检测到PAPI_ONLY API Key")
-            print("=" * 70)
-            print("当前API Key仅具备Portfolio Margin权限，无法调用标准期货FAPI接口。")
-            print("机器人设计为使用标准期货API（FAPI），不支持Portfolio Margin模式。")
-            print("\n👉 修复步骤：")
-            print("1. 登录币安官方网站 (https://www.binance.com)")
-            print("2. 进入API管理页面")
-            print("3. 创建一个新的API Key（不要勾选Portfolio Margin权限）")
-            print("4. 确保勾选「Enable Futures」权限")
-            print("5. 将新Key的API Key和Secret更新到.env文件中")
-            print("6. 重启机器人")
-            print("\n📌 注意：如果不修复，所有下单操作都会失败！")
-            print("=" * 70 + "\n")
+        print(f"[连接] 连接到币安正式网 (PAPI统一保证金模式)")
+        print(f"[成功] 模式: {self.broker.account_mode.value} / 能力: {self.broker.capability.value}")
 
     def _um_endpoint(self, fapi_path: str, papi_path: str) -> str:
         base = self.broker.um_base()
@@ -700,18 +665,18 @@ class BinanceClient:
         """
         return self.order.place_order(symbol, side, quantity, **kwargs)
     
-    def create_limit_order(self, symbol: str, side: str, quantity: float, 
+    def create_limit_order(self, symbol: str, side: str, quantity: float,
                           price: float, **kwargs) -> Dict[str, Any]:
         """
-        创建限价单
-        
+        创建限价单（PAPI Unified Margin）
+
         Args:
             symbol: 交易对
             side: 买卖方向
             quantity: 数量
             price: 价格
-            **kwargs: 其他参数
-            
+            **kwargs: 其他参数（如 reduce_only=True 等）
+
         Returns:
             订单信息
         """
@@ -721,21 +686,27 @@ class BinanceClient:
             "type": "LIMIT",
             "timeInForce": "GTC",
             "quantity": quantity,
-            "price": price
+            "price": price,
+            # PAPI 必须显式声明
+            "reduceOnly": "true" if kwargs.get("reduce_only", False) else "false",
+            # 单向持仓模式必须
+            "positionSide": "BOTH",
         }
+        # 移除 reduce_only，避免作为额外参数传递
+        kwargs.pop("reduce_only", None)
         params.update(kwargs)
-        url = self._um_endpoint("/fapi/v1/order", "/papi/v1/um/order")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/order"
         response = self.broker.request("POST", url, params=params, signed=True)
         return response.json()
     
     def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
-        url = self._um_endpoint("/fapi/v1/order", "/papi/v1/um/order")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/order"
         params = {"symbol": symbol, "orderId": order_id}
         response = self.broker.request("DELETE", url, params=params, signed=True)
         return response.json()
-    
+
     def cancel_all_orders(self, symbol: str) -> Dict[str, Any]:
-        url = self._um_endpoint("/fapi/v1/allOpenOrders", "/papi/v1/um/allOpenOrders")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/allOpenOrders"
         params = {"symbol": symbol}
         response = self.broker.request("DELETE", url, params=params, signed=True)
         return response.json()
@@ -753,65 +724,73 @@ class BinanceClient:
         Returns:
             修改结果
         """
-        url = self._um_endpoint("/fapi/v1/leverage", "/papi/v1/um/leverage")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/leverage"
         params = {"symbol": symbol, "leverage": leverage}
         response = self.broker.request("POST", url, params=params, signed=True)
         return response.json()
-    
+
     def change_margin_type(self, symbol: str, margin_type: str = 'ISOLATED') -> Dict[str, Any]:
         """
         修改保证金类型
-        
+
         Args:
             symbol: 交易对
             margin_type: 'ISOLATED'(逐仓) 或 'CROSSED'(全仓)
         """
-        url = self._um_endpoint("/fapi/v1/marginType", "/papi/v1/um/marginType")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/marginType"
         params = {"symbol": symbol, "marginType": margin_type.upper()}
         response = self.broker.request("POST", url, params=params, signed=True)
         return response.json()
-    
+
     def set_hedge_mode(self, enabled: bool = True):
         """
         设置持仓模式（双向持仓）
-        
+
         Args:
             enabled: True=启用双向持仓, False=单向持仓
         """
-        url = self._um_endpoint("/fapi/v1/positionSide/dual", "/papi/v1/um/positionSide/dual")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/positionSide/dual"
         params = {"dualSidePosition": "true" if enabled else "false"}
         response = self.broker.request("POST", url, params=params, signed=True)
         return response.json()
     
     # ==================== 止盈止损 ====================
     
-    def set_take_profit_stop_loss(self, symbol: str, side: str, quantity: float, 
-                                   take_profit_price: Optional[float] = None, 
+    def set_take_profit_stop_loss(self, symbol: str, side: str, quantity: float,
+                                   take_profit_price: Optional[float] = None,
                                    stop_loss_price: Optional[float] = None) -> List[Dict[str, Any]]:
         """
-        设置止盈止损
-        
+        设置止盈止损（PAPI Unified Margin）
+
         注意：币安期货的止盈止损是通过特殊订单类型实现的
-        
+        当closePosition=True时，quantity参数不会被使用
+
         Args:
             symbol: 交易对
             side: 方向 'BUY' 或 'SELL'
-            quantity: 数量
+            quantity: 数量（当closePosition=True时不会被使用，但为保持接口一致性而保留）
             take_profit_price: 止盈价
             stop_loss_price: 止损价
-            
+
         Returns:
             创建的订单列表
         """
+        # quantity参数在closePosition=True时不会被使用
+        # 这里使用下划线表示故意不使用该参数
+        _ = quantity
         orders = []
-        url = self._um_endpoint("/fapi/v1/order", "/papi/v1/um/order")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/order"
         if take_profit_price is not None:
             params = {
                 "symbol": symbol,
                 "side": "SELL" if side == "BUY" else "BUY",
                 "type": "TAKE_PROFIT_MARKET",
                 "stopPrice": take_profit_price,
-                "closePosition": True
+                "closePosition": True,
+                # PAPI 必须显式声明
+                "reduceOnly": "true",
+                # 单向持仓模式必须
+                "positionSide": "BOTH",
             }
             response = self.broker.request("POST", url, params=params, signed=True)
             orders.append(response.json())
@@ -821,33 +800,37 @@ class BinanceClient:
                 "side": "SELL" if side == "BUY" else "BUY",
                 "type": "STOP_MARKET",
                 "stopPrice": stop_loss_price,
-                "closePosition": True
+                "closePosition": True,
+                # PAPI 必须显式声明
+                "reduceOnly": "true",
+                # 单向持仓模式必须
+                "positionSide": "BOTH",
             }
             response = self.broker.request("POST", url, params=params, signed=True)
             orders.append(response.json())
         return orders
     
     # ==================== 查询订单 ====================
-    
+
     def get_order(self, symbol: str, order_id: int) -> Optional[Dict[str, Any]]:
         """查询订单"""
-        url = self._um_endpoint("/fapi/v1/order", "/papi/v1/um/order")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/order"
         try:
             response = self.broker.request("GET", url, params={"symbol": symbol, "orderId": order_id}, signed=True)
             return response.json()
         except Exception as e:
-            print(f"⚠️ 查询订单失败 {symbol} {order_id}: {e}")
+            print(f"[警告] 查询订单失败 {symbol} {order_id}: {e}")
             return None
-    
+
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """获取所有挂单"""
-        url = self._um_endpoint("/fapi/v1/openOrders", "/papi/v1/um/openOrders")
+        url = f"{self.broker.PAPI_BASE}/papi/v1/um/openOrders"
         try:
             params = {"symbol": symbol} if symbol else {}
             response = self.broker.request("GET", url, params=params, signed=True)
             return response.json()
         except Exception as e:
-            print(f"⚠️ 获取挂单失败: {e}")
+            print(f"[警告] 获取挂单失败: {e}")
             return []
     
     # ==================== 工具方法 ====================

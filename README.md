@@ -50,33 +50,41 @@ cp .env.example .env
 # 编辑 .env 文件，填入您的 API 密钥
 ```
 
-#### ⚠️ API Key 重要要求
+#### API Key 要求
 
-**机器人需要标准期货API Key（启用Futures权限），不要使用Portfolio Margin (PAPI) Key！**
+**机器人支持两种API Key类型：**
 
-**正确创建API Key的步骤：**
+1. **标准期货API Key（STANDARD）**
+   - 适用于普通期货账户
+   - 使用FAPI接口
+
+2. **Portfolio Margin API Key（PAPI_ONLY）**
+   - 适用于统一保证金账户
+   - 使用PAPI-UM接口（推荐）
+
+**创建API Key的步骤：**
 1. 登录币安官方网站 (https://www.binance.com)
 2. 进入API管理页面
 3. 点击"创建API"按钮
 4. 输入标签名（如"AI-Trading-Bot"）
-5. **权限设置（关键步骤）：**
+5. **权限设置：**
    - ✅ 启用读取（默认）
-   - ✅ 启用交易（默认）  
-   - ✅ **Enable Futures（必须勾选！）**
-   - ❌ **不要勾选Portfolio Margin**
+   - ✅ 启用交易（默认）
+   - ✅ Enable Futures（必须勾选！）
+   - 如使用Portfolio Margin，勾选Portfolio Margin（可选）
 6. 保存并复制API Key和Secret到`.env`文件
 
-**为什么需要标准期货API Key？**
-- 机器人使用Binance的FAPI（期货API）接口
-- PAPI Key（Portfolio Margin Key）无法访问FAPI接口
-- 使用错误Key会导致401未授权错误和下单失败
+**验证配置：**
+运行检测脚本：
+```bash
+python check_api_key.py
+```
 
-**验证Key是否正确：**
-启动机器人时，控制台应显示：
-```
-✅ 模式: CLASSIC / 能力: STANDARD
-```
-如果显示`能力: PAPI_ONLY`，说明使用了错误的Key。
+预期输出：
+- **STANDARD模式**：`[支持] ✅ 标准期货FAPI权限`
+- **PAPI_ONLY模式**：`[支持] ✅ Portfolio Margin统一保证金`
+
+**两种模式都完全支持！** 机器人会自动检测并使用相应的API接口。
 
 ### 2. 运行回测
 
