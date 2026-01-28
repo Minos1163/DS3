@@ -155,6 +155,62 @@ class BinanceBroker:
 class OrderGateway:
     def __init__(self, broker: BinanceBroker) -> None:
         self.broker = broker
+        self._hedge_mode_cache: Optional[bool] = None
+
+    def _get_hedge_mode(self) -> bool:
+        """
+        查询当前是否为双向持仓模式（Hedge Mode）
+
+        Returns:
+            True=双向持仓（Hedge Mode）, False=单向持仓
+        """
+        if self._hedge_mode_cache is not None:
+            return self._hedge_mode_cache
+
+        try:
+            url = f"{self.broker.PAPI_BASE}/papi/v1/um/positionSide/dual"
+            response = self.broker.request("GET", url, signed=True, allow_error=True)
+            if response.status_code == 200:
+                data = response.json()
+                # Binance 返回 {"dualSidePosition": true/false}
+                self._hedge_mode_cache = data.get("dualSidePosition", False)
+                return self._hedge_mode_cache
+        except Exception:
+            # 异常情况默认假设为单向持仓（安全）
+            self._hedge_mode_cache = False
+            return self._hedge_mode_cache
+
+        # 兜底返回（理论上不会走到这里）
+        return False
+
+    def _position_side(self, side: str, reduce_only: bool) -> str:
+        """
+        根据账户模式和操作返回正确的 positionSide
+
+        Args:
+            side: BUY 或 SELL
+            reduce_only: 是否为平仓操作
+
+        Returns:
+            positionSide 值（BOTH, LONG, 或 SHORT）
+        """
+        # 如果不是统一账户，使用 BOTH（单向持仓）
+        if self.broker.account_mode != AccountMode.UNIFIED:
+            return "BOTH"
+
+        # 统一账户下，检查是否为双向持仓模式
+        is_hedge = self._get_hedge_mode()
+        if not is_hedge:
+            return "BOTH"
+
+        # 双向持仓模式下，根据 side 和 reduce_only 决定
+        side = side.upper()
+        if side == "BUY":
+            # 买入时：开仓=LONG，平空=SHORT
+            return "SHORT" if reduce_only else "LONG"
+        else:  # SELL
+            # 卖出时：平多=LONG，开空=SHORT
+            return "LONG" if reduce_only else "SHORT"
 
     def place_order(
         self,
@@ -166,19 +222,29 @@ class OrderGateway:
         **extra: Any
     ) -> Dict[str, Any]:
         """
-        PAPI Unified Margin 下单（唯一合法路径）
+        PAPI Unified Margin 下单（自动适配持仓模式）
+
+        Args:
+            symbol: 交易对
+            side: BUY 或 SELL
+            quantity: 数量
+            order_type: 订单类型（默认MARKET）
+            reduce_only: 是否为平仓操作
+            **extra: 额外参数
         """
+        position_side = self._position_side(side, reduce_only)
+
         params: Dict[str, Any] = {
             "symbol": symbol,
-            "side": side.upper(),          # BUY / SELL
+            "side": side.upper(),
             "type": order_type,
             "quantity": quantity,
 
             # PAPI 必须显式声明
             "reduceOnly": "true" if reduce_only else "false",
 
-            # 单向持仓模式必须
-            "positionSide": "BOTH",
+            # 自动适配持仓模式
+            "positionSide": position_side,
         }
 
         # 允许额外参数（如 timeInForce 等）
@@ -668,7 +734,7 @@ class BinanceClient:
     def create_limit_order(self, symbol: str, side: str, quantity: float,
                           price: float, **kwargs) -> Dict[str, Any]:
         """
-        创建限价单（PAPI Unified Margin）
+        创建限价单（PAPI Unified Margin，自动适配持仓模式）
 
         Args:
             symbol: 交易对
@@ -680,6 +746,9 @@ class BinanceClient:
         Returns:
             订单信息
         """
+        reduce_only = kwargs.get("reduce_only", False)
+        position_side = self.order._position_side(side, reduce_only)
+
         params = {
             "symbol": symbol,
             "side": side.upper(),
@@ -688,9 +757,9 @@ class BinanceClient:
             "quantity": quantity,
             "price": price,
             # PAPI 必须显式声明
-            "reduceOnly": "true" if kwargs.get("reduce_only", False) else "false",
-            # 单向持仓模式必须
-            "positionSide": "BOTH",
+            "reduceOnly": "true" if reduce_only else "false",
+            # 自动适配持仓模式
+            "positionSide": position_side,
         }
         # 移除 reduce_only，避免作为额外参数传递
         kwargs.pop("reduce_only", None)
@@ -760,14 +829,14 @@ class BinanceClient:
                                    take_profit_price: Optional[float] = None,
                                    stop_loss_price: Optional[float] = None) -> List[Dict[str, Any]]:
         """
-        设置止盈止损（PAPI Unified Margin）
+        设置止盈止损（PAPI Unified Margin，自动适配持仓模式）
 
         注意：币安期货的止盈止损是通过特殊订单类型实现的
         当closePosition=True时，quantity参数不会被使用
 
         Args:
             symbol: 交易对
-            side: 方向 'BUY' 或 'SELL'
+            side: 原开仓方向 'BUY' 或 'SELL'（用于双向持仓模式判断）
             quantity: 数量（当closePosition=True时不会被使用，但为保持接口一致性而保留）
             take_profit_price: 止盈价
             stop_loss_price: 止损价
@@ -780,31 +849,40 @@ class BinanceClient:
         _ = quantity
         orders = []
         url = f"{self.broker.PAPI_BASE}/papi/v1/um/order"
+
+        # 对于止盈止损，需要确定正确的 positionSide
+        # 止盈止损总是平仓操作（reduce_only=True）
+        position_side = self.order._position_side(side, reduce_only=True)
+
         if take_profit_price is not None:
+            # 止盈是平仓操作，方向与原开仓方向相反
+            order_side = "SELL" if side == "BUY" else "BUY"
             params = {
                 "symbol": symbol,
-                "side": "SELL" if side == "BUY" else "BUY",
+                "side": order_side,
                 "type": "TAKE_PROFIT_MARKET",
                 "stopPrice": take_profit_price,
                 "closePosition": True,
                 # PAPI 必须显式声明
                 "reduceOnly": "true",
-                # 单向持仓模式必须
-                "positionSide": "BOTH",
+                # 自动适配持仓模式（双向模式下为LONG/SHORT，单向为BOTH）
+                "positionSide": position_side,
             }
             response = self.broker.request("POST", url, params=params, signed=True)
             orders.append(response.json())
         if stop_loss_price is not None:
+            # 止损是平仓操作，方向与原开仓方向相反
+            order_side = "SELL" if side == "BUY" else "BUY"
             params = {
                 "symbol": symbol,
-                "side": "SELL" if side == "BUY" else "BUY",
+                "side": order_side,
                 "type": "STOP_MARKET",
                 "stopPrice": stop_loss_price,
                 "closePosition": True,
                 # PAPI 必须显式声明
                 "reduceOnly": "true",
-                # 单向持仓模式必须
-                "positionSide": "BOTH",
+                # 自动适配持仓模式（双向模式下为LONG/SHORT，单向为BOTH）
+                "positionSide": position_side,
             }
             response = self.broker.request("POST", url, params=params, signed=True)
             orders.append(response.json())
