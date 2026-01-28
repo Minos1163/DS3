@@ -83,14 +83,32 @@ class BinanceBroker:
         return response
 
     def _detect_api_capability(self) -> ApiCapability:
+        """
+        检测API Key的权限能力
+        - STANDARD: 标准期货API Key，可以访问FAPI
+        - PAPI_ONLY: 仅PAPI权限，不能访问FAPI
+        
+        注意：这是硬检测，避免FAPI失败后回退到PAPI的错误设计
+        """
         try:
             url = f"{self.FAPI_BASE}/fapi/v2/account"
             response = self.request("GET", url, signed=True, allow_error=True)
-            if response.status_code == 200:
+            if response.status_code == 401:
+                # 401 表示无权限访问 FAPI，说明是 PAPI Key
+                print("🔍 API检测: 当前Key是PAPI_ONLY（无FAPI权限）")
+                return ApiCapability.PAPI_ONLY
+            elif response.status_code == 200:
+                # 正常访问FAPI，是标准期货Key
+                print("🔍 API检测: 当前Key是STANDARD（完整FAPI权限）")
                 return ApiCapability.STANDARD
-        except requests.RequestException:
-            pass
-        return ApiCapability.PAPI_ONLY
+            else:
+                # 其他状态码可能是限流或服务问题，不能判断为PAPI_ONLY
+                print(f"🔍 API检测: FAPI返回非401/200状态码 {response.status_code}，暂时认为是STANDARD")
+                return ApiCapability.STANDARD
+        except requests.RequestException as e:
+            # 网络异常不能作为判断PAPI-only的依据
+            print(f"🔍 API检测: 网络异常 {e}，暂时认为是STANDARD")
+            return ApiCapability.STANDARD
 
     def _detect_account_mode(self) -> AccountMode:
         try:
@@ -149,11 +167,30 @@ class OrderGateway:
         **extra: Any
     ) -> Dict[str, Any]:
         """
-        下单（优先用于期货FAPI，现货回退到PAPI）
+        下单（标准期货FAPI）
         
         Args:
             reduce_only: True表示平仓单，False表示开仓单（防止反向开仓）
+            
+        Raises:
+            RuntimeError: 如果API Key是PAPI_ONLY类型，需要用户创建标准期货API Key
         """
+        # 硬性检查：禁止PAPI_ONLY Key使用此下单方法
+        if self.broker.capability == ApiCapability.PAPI_ONLY:
+            error_msg = (
+                "❌ API Key权限错误：当前API Key是PAPI_ONLY类型，无法调用期货FAPI接口。\n"
+                "👉 修复步骤：\n"
+                "1. 登录币安官方网站 (https://www.binance.com)\n"
+                "2. 进入API管理页面\n"
+                "3. 创建一个新的API Key（不要勾选Portfolio Margin权限）\n"
+                "4. 确保勾选「Enable Futures」权限\n"
+                "5. 将新Key的API Key和Secret更新到.env文件中\n"
+                "6. 重启机器人\n"
+                "📌 注意：当前机器人设计为使用标准期货API（FAPI），不支持Portfolio Margin统一账户模式。"
+            )
+            print(error_msg)
+            raise RuntimeError("API Key权限不足：需要标准期货API Key（FAPI权限）")
+        
         params: Dict[str, Any] = {
             "symbol": symbol,
             "side": side.upper(),
@@ -171,19 +208,10 @@ class OrderGateway:
         
         params.update(extra)
         
-        # 统一账户/仅PAPI时走 PAPI-UM；其余走 FAPI
-        # 优先使用 FAPI (USDT-M Futures)，遇到不可达时再回退 PAPI-UM
-        try:
-            url = f"{self.broker.FAPI_BASE}/fapi/v1/order"
-            response = self.broker.request("POST", url, params=params, signed=True)
-            return response.json()
-        except Exception as e:
-            if "404" in str(e) or "papi" in str(e).lower() or self.broker.capability == ApiCapability.PAPI_ONLY:
-                print(f"⚠️  FAPI下单失败，回退到PAPI-UM: {e}")
-                url = f"{self.broker.PAPI_BASE}/papi/v1/um/order"
-                response = self.broker.request("POST", url, params=params, signed=True)
-                return response.json()
-            raise
+        # 使用标准期货FAPI接口
+        url = f"{self.broker.FAPI_BASE}/fapi/v1/order"
+        response = self.broker.request("POST", url, params=params, signed=True)
+        return response.json()
 
 
 class PositionGateway:
@@ -564,6 +592,23 @@ class BinanceClient:
         self._symbol_info_cache: Dict[str, Dict[str, Any]] = {}
         print(f"🔗 连接到币安正式网 (Broker模式)")
         print(f"✅ 模式: {self.broker.account_mode.value} / 能力: {self.broker.capability.value}")
+        
+        # API自检：如果检测到PAPI_ONLY Key，给出明确的修复指导
+        if self.broker.capability == ApiCapability.PAPI_ONLY:
+            print("\n" + "=" * 70)
+            print("⚠️  警告：检测到PAPI_ONLY API Key")
+            print("=" * 70)
+            print("当前API Key仅具备Portfolio Margin权限，无法调用标准期货FAPI接口。")
+            print("机器人设计为使用标准期货API（FAPI），不支持Portfolio Margin模式。")
+            print("\n👉 修复步骤：")
+            print("1. 登录币安官方网站 (https://www.binance.com)")
+            print("2. 进入API管理页面")
+            print("3. 创建一个新的API Key（不要勾选Portfolio Margin权限）")
+            print("4. 确保勾选「Enable Futures」权限")
+            print("5. 将新Key的API Key和Secret更新到.env文件中")
+            print("6. 重启机器人")
+            print("\n📌 注意：如果不修复，所有下单操作都会失败！")
+            print("=" * 70 + "\n")
 
     def _um_endpoint(self, fapi_path: str, papi_path: str) -> str:
         base = self.broker.um_base()
