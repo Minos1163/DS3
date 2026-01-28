@@ -1,0 +1,27 @@
+{
+  "trading": {
+    "symbols": ["SOLUSDT"],
+    "default_leverage": 2,
+    "max_leverage": 100,
+    "min_position_percent": 10,
+    "max_position_percent": 30,
+    "reserve_percent": 20
+  },
+  "risk": {
+    "max_daily_loss_percent": 10,
+    "max_consecutive_losses": 5,
+    "stop_loss_default_percent": 2,
+    "take_profit_default_percent": 3
+  },
+  "ai": {
+    "model": "deepseek-reasoner",
+    "temperature": 0.7,
+    "max_tokens": 2000,
+    "enabled": false
+  },
+  "schedule": {
+    "interval_seconds": 180,
+    "retry_times": 3,
+    "retry_delay_seconds": 5
+  }
+}

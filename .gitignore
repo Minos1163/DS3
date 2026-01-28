@@ -1,0 +1,74 @@
+# 环境变量和敏感信息
+.env
+.env.local
+.env.*.local
+config/.env
+
+# API密钥文件
+*.key
+*.pem
+secrets.json
+
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 日志文件
+logs/
+*.log
+
+# 数据和缓存
+.cache/
+cache/
+*.cache
+data/*.csv
+data/*.pkl
+
+# 运行结果
+results/
+output/
+dist/
+build/
+*.egg-info/
+
+# 测试覆盖率
+.coverage
+htmlcov/
+
+# 操作系统
+Thumbs.db
+.DS_Store
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# Node相关（如果有）
+node_modules/
+package-lock.json
+
+# 数据库相关
+*.db
+*.sqlite
+*.sqlite3
+
+# 敏感的配置文件
+trading_config.*.json
+config_*.json
+!trading_config.json  # 但保留默认配置模板
