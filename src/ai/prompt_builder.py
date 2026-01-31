@@ -307,7 +307,7 @@ class PromptBuilder:
             
             # 多周期技术指标
             multi_data = market_data.get('multi_timeframe', {}) or {}
-            for interval in ['5m', '15m', '1h', '4h', '1d']:
+            for interval in ['15m', '30m', '1h', '4h', '1d']:
                 if interval not in multi_data:
                     continue
                 

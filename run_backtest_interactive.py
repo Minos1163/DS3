@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 一键启动回测脚本
-5分钟K线 2天数据 完整AI分析
+15分钟K线 2天数据 完整AI分析
 """
 import os
 import sys
@@ -57,11 +57,11 @@ def check_credentials():
 
 def start_backtest():
     """启动回测"""
-    print_header("启动回测: 5分钟K线 2天数据 完整AI分析")
+    print_header("启动回测: 15分钟K线 2天数据 完整AI分析")
     
     print("\n配置参数:")
     print("  交易对: SOLUSDT")
-    print("  周期: 5分钟 (5m)")
+    print("  周期: 15分钟 (15m)")
     print("  时长: 2天")
     print("  初始资金: 10,000 USDT")
     print("  AI分析: 每根K线")

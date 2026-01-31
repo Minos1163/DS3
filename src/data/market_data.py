@@ -32,12 +32,12 @@ class MarketDataManager:
         
         Args:
             symbol: 交易对
-            intervals: 时间周期列表，如 ['5m', '15m', '1h', '4h', '1d']
+            intervals: 时间周期列表，如 ['15m', '30m', '1h', '4h', '1d']
             
         Returns:
             {
-                '5m': {'klines': [...], 'dataframe': df, 'indicators': {...}},
-                '15m': {...},
+                '15m': {'klines': [...], 'dataframe': df, 'indicators': {...}},
+                '30m': {...},
                 ...
             }
         """
@@ -171,10 +171,19 @@ class MarketDataManager:
             # 获取持仓量
             open_interest = self.client.get_open_interest(symbol)
             
+            # 获取15m K线计算15分钟涨跌幅
+            klines_15m = self.client.get_klines(symbol, '15m', limit=2)
+            change_15m = 0.0
+            if klines_15m and len(klines_15m) >= 2:
+                prev_close = float(klines_15m[-2][4])
+                current_close = float(klines_15m[-1][4])
+                if prev_close > 0:
+                    change_15m = ((current_close - prev_close) / prev_close) * 100
+            
             return {
                 'price': float(ticker['lastPrice']),
                 'change_24h': float(ticker.get('priceChangePercent', 0)),
-                'change_15m': 0.0,  # 需要单独计算
+                'change_15m': change_15m,
                 'volume_24h': float(ticker.get('volume', 0)),
                 'high_24h': float(ticker.get('highPrice', 0)),
                 'low_24h': float(ticker.get('lowPrice', 0)),

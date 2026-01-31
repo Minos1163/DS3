@@ -37,19 +37,19 @@ def main():
         return
     
     print("=" * 60)
-    print("🚀 开始优化回测 V4：5分钟K线，7天数据，100 USDT")
+    print("🚀 开始优化回测 V4：15分钟K线，7天数据，100 USDT")
     print("=" * 60)
     
     # 创建回测器
     backtester = BacktesterV3(
         symbol="SOLUSDT",
-        interval="5m",
+        interval="15m",
         days=7,  # 改为 7 天 (从 30 天)
         api_key=api_key,
         api_secret=api_secret,
     )
     
-    print(f"✅ V4 参数已加载 (5分钟K线, 7天数据)")
+    print(f"✅ V4 参数已加载 (15分钟K线, 7天数据)")
     print(f"   - 预期数据量: ~2000根K线 (从原来的1000根增加)")
     print(f"   - 冷却期: {backtester.cooldown_bars}根K线 (V3: 8根)")
     print(f"   - 最小持仓时间: {backtester.min_hold_bars}根K线 (V3: 10根)")

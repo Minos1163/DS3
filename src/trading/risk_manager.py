@@ -26,32 +26,35 @@ class RiskManager:
                            total_equity: float) -> tuple[bool, str]:
         """
         检查仓位大小是否超限
-        
+
         Returns:
             (是否通过, 错误消息)
         """
         trading_config = self.config.get('trading', {})
-        
+
         min_percent = trading_config.get('min_position_percent', 10) / 100
         max_percent = trading_config.get('max_position_percent', 30) / 100
         reserve_percent = trading_config.get('reserve_percent', 20) / 100
-        
+
         # 计算持仓价值
         position_value = quantity * price
-        
-        # 检查最小仓位
-        if position_value < total_equity * min_percent:
-            return False, f"仓位过小（小于{min_percent*100}%）"
-        
+
+        # 计算仓位占比
+        position_percent = position_value / total_equity if total_equity > 0 else 0
+
+        # 检查最小仓位（允许等于最小值）
+        if position_percent < min_percent:
+            return False, f"仓位过小（{position_percent*100:.1f}% < 最小要求{min_percent*100:.0f}%）"
+
         # 检查最大仓位
-        if position_value > total_equity * max_percent:
-            return False, f"仓位过大（超过{max_percent*100}%）"
-        
+        if position_percent > max_percent:
+            return False, f"仓位过大（{position_percent*100:.1f}% > 最大限制{max_percent*100:.0f}%）"
+
         # 检查预留资金
         used_margin = position_value  # 简化
         if used_margin > total_equity * (1 - reserve_percent):
             return False, f"违反预留资金要求（需保留{reserve_percent*100}%）"
-        
+
         return True, ""
     
     def check_max_daily_loss(self, current_balance: float) -> tuple[bool, str]:

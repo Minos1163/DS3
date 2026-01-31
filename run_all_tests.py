@@ -109,6 +109,12 @@ def main(skip_real: bool = False):
         print()
         print("⚠️  repro_open_short 测试失败，请查看详细输出")
 
+    # 4.6 验证 TradeExecutor _execute_open 行为（Dry-Run）
+    print()
+    if not run_test("测试 3.6: 验证 TradeExecutor._execute_open (Dry-Run)", "scripts/validate_trade_executor.py", dry_run=True):
+        print()
+        print("⚠️  validate_trade_executor 测试失败，请查看详细输出")
+
     # 5. 真实下单测试（可选）
     if not skip_real:
         print()

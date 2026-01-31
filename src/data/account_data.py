@@ -96,11 +96,11 @@ class AccountDataManager:
                 equity = total_wallet_balance + total_unrealized_profit
             
             # ============ 资产级聚合值 (作为备用和验证) ============
-            assets = []
+            assets: List[Any] = []
             if isinstance(account, dict) and isinstance(account.get('assets'), list) and account.get('assets'):
-                assets = account.get('assets')
+                assets = account.get('assets')  # type: ignore[assignment]
             elif isinstance(raw_data, dict) and isinstance(raw_data.get('assets'), list):
-                assets = raw_data.get('assets')
+                assets = raw_data.get('assets')  # type: ignore[assignment]
             assets_total_wallet = 0.0
             assets_total_unrealized = 0.0
             assets_total_margin = 0.0

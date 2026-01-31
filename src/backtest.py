@@ -25,13 +25,13 @@ from src.utils.indicators import (
 class BacktestEngine:
     """回测引擎"""
     
-    def __init__(self, symbol: str = 'SOLUSDT', interval: str = '5m', days: int = 30):
+    def __init__(self, symbol: str = 'SOLUSDT', interval: str = '15m', days: int = 30):
         """
         初始化回测引擎
         
         Args:
             symbol: 交易对，如 'SOLUSDT'
-            interval: K线周期，如 '5m'
+            interval: K线周期，如 '15m'
             days: 回测天数，如 30
         """
         self.symbol = symbol
@@ -44,10 +44,10 @@ class BacktestEngine:
         self.client = BinanceClient(api_key=api_key, api_secret=api_secret)
         
         # 数据存储
-        self.klines = []
-        self.df = None
-        self.trades = []
-        self.statistics = {}
+        self.klines: List[Any] = []
+        self.df: Optional[pd.DataFrame] = None
+        self.trades: List[Dict[str, Any]] = []
+        self.statistics: Dict[str, Any] = {}
         
     def download_data(self) -> Optional[pd.DataFrame]:
         """
@@ -197,7 +197,7 @@ class BacktestEngine:
         print(f"🔍 分析交易信号")
         print(f"{'='*60}")
         
-        analysis = {
+        analysis: Dict[str, Any] = {
             'total_candles': len(self.df),
             'buy_signals': 0,
             'sell_signals': 0,
@@ -294,7 +294,7 @@ class BacktestEngine:
             print("❌ 没有数据，无法进行回测")
             return {}
         
-        backtest_result = {
+        backtest_result: Dict[str, Any] = {
             'symbol': self.symbol,
             'interval': self.interval,
             'period': f"{self.days}天",
@@ -308,8 +308,9 @@ class BacktestEngine:
         }
         
         # 计算价格变化
-        start_price = self.df['close'].iloc[0]
-        end_price = self.df['close'].iloc[-1]
+        # ensure numeric types for arithmetic
+        start_price = float(self.df['close'].iloc[0])
+        end_price = float(self.df['close'].iloc[-1])
         price_change = end_price - start_price
         price_change_percent = (price_change / start_price) * 100
         backtest_result['price_change_percent'] = price_change_percent
@@ -331,10 +332,10 @@ class BacktestEngine:
         print(f"波动率: {volatility:.2f}%")
         
         # 简单交易策略 (基于RSI)
-        position = None
-        entry_price = 0
-        entry_time = None
-        trades = []
+        position: Optional[str] = None
+        entry_price: float = 0.0
+        entry_time: Optional[datetime] = None
+        trades: List[Dict[str, Any]] = []
         
         for i in range(50, len(self.df)):
             close = self.df['close'].iloc[i]
@@ -349,8 +350,8 @@ class BacktestEngine:
             
             # 卖出信号
             elif position == 'LONG' and rsi > 70 and entry_time is not None:
-                pnl = close - entry_price
-                pnl_percent = (pnl / entry_price) * 100
+                pnl = float(close) - float(entry_price)
+                pnl_percent = (pnl / float(entry_price)) * 100
                 trades.append({
                     'entry_time': entry_time.strftime('%Y-%m-%d %H:%M'),
                     'entry_price': entry_price,
@@ -364,10 +365,10 @@ class BacktestEngine:
         backtest_result['trades'] = trades
         
         if trades:
-            total_pnl = sum([t['pnl'] for t in trades])
-            total_return = (total_pnl / trades[0]['entry_price']) * 100
-            win_trades = len([t for t in trades if t['pnl'] > 0])
-            loss_trades = len([t for t in trades if t['pnl'] < 0])
+            total_pnl = sum(float(t['pnl']) for t in trades)
+            total_return = (total_pnl / float(trades[0]['entry_price'])) * 100
+            win_trades = len([t for t in trades if float(t['pnl']) > 0])
+            loss_trades = len([t for t in trades if float(t['pnl']) < 0])
             
             backtest_result['total_return_percent'] = total_return
             backtest_result['statistics'] = {
@@ -487,7 +488,7 @@ class BacktestEngine:
 def main():
     """主函数"""
     # 创建回测引擎
-    engine = BacktestEngine(symbol='SOLUSDT', interval='5m', days=30)
+    engine = BacktestEngine(symbol='SOLUSDT', interval='15m', days=30)
     
     # 运行回测
     engine.run()

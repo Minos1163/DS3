@@ -11,7 +11,11 @@ import os
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-from src.api.binance_client import BinanceClient, AccountMode, ApiCapability
+# 🔥 加载 .env 文件
+from dotenv import load_dotenv
+load_dotenv()
+
+from src.api.binance_client import BinanceClient, ApiCapability
 
 
 def check_position_mode():
@@ -29,7 +33,7 @@ def check_position_mode():
         print(f"[能力] API能力: {broker.capability.value}")
 
         # 获取持仓模式
-        is_hedge = client.order._get_hedge_mode()
+        is_hedge = client.broker.get_hedge_mode()
 
         if is_hedge:
             print(f"\n[持仓] 双向持仓模式（Hedge Mode）")
@@ -74,7 +78,7 @@ def check_position_mode():
         ]
 
         for desc, side, reduce_only in test_cases:
-            position_side = client.order._position_side(side, reduce_only)
+            position_side = client.broker.calculate_position_side(side, reduce_only)
             print(f"{desc:8s} | side={side:4s} | reduceOnly={reduce_only!s:5s} | → positionSide={position_side}")
 
         print("\n" + "=" * 70)

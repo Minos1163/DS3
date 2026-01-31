@@ -6,6 +6,11 @@ API Key检测脚本
 
 import os
 import sys
+
+# 🔥 加载 .env 文件
+from dotenv import load_dotenv
+load_dotenv()
+
 from src.api.binance_client import BinanceClient, ApiCapability
 
 def check_api_key():

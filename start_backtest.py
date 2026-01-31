@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 启动回测脚本
-5分钟K线 2天数据 完整AI分析
+15分钟K线 2天数据 完整AI分析
 """
 import os
 import sys
@@ -20,11 +20,11 @@ from backtest_ai import AIBacktester
 def main():
     """主函数 - 启动回测"""
     print("=" * 60)
-    print("开始回测: 5分钟K线 2天数据 启用完整AI分析")
+    print("开始回测: 15分钟K线 2天数据 启用完整AI分析")
     print("=" * 60)
     
-    # 创建回测器 - 5m间隔，2天数据
-    backtester = AIBacktester(symbol='SOLUSDT', interval='5m', days=2)
+    # 创建回测器 - 15m间隔，2天数据
+    backtester = AIBacktester(symbol='SOLUSDT', interval='15m', days=2)
     
     # 下载数据
     print("\n开始下载数据...")

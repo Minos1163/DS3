@@ -128,5 +128,7 @@ class ConfigLoader:
         return {
             'interval_seconds': schedule.get('interval_seconds', 180),
             'retry_times': schedule.get('retry_times', 3),
-            'retry_delay_seconds': schedule.get('retry_delay_seconds', 5)
+            'retry_delay_seconds': schedule.get('retry_delay_seconds', 5),
+            # 启动/每次K线更新后等待多少秒再开始下载并分析（应小于等于30）
+            'download_delay_seconds': schedule.get('download_delay_seconds', 5)
         }

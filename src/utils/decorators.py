@@ -7,11 +7,11 @@ import functools
 from typing import Callable, Any
 
 
-def retry_on_failure(max_retries: int = 3, delay: float = 1.0, 
+def retry_on_failure(max_retries: int = 3, delay: float = 1.0,
                      exceptions: tuple = (Exception,)):
     """
     失败重试装饰器
-    
+
     Args:
         max_retries: 最大重试次数
         delay: 重试延迟（秒）
@@ -20,17 +20,32 @@ def retry_on_failure(max_retries: int = 3, delay: float = 1.0,
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs) -> Any:
-            last_exception = None
+            last_exception: Exception | None = None
             for i in range(max_retries):
                 try:
                     return func(*args, **kwargs)
                 except exceptions as e:
                     last_exception = e
+                    
+                    # 🚫 致命权限错误：立即终止，禁止重试
+                    err_msg = str(e)
+                    if "FATAL AUTH ERROR" in err_msg or "401" in err_msg or "Unauthorized" in err_msg or "-2015" in err_msg or "-2014" in err_msg:
+                        print(f"🚫 {func.__name__} 遇到致命权限错误，立即终止（不重试）: {e}")
+                        raise
+                    
+                    # 检查是否还有重试机会
                     if i < max_retries - 1:
                         print(f"⚠️ {func.__name__} 失败 (尝试 {i+1}/{max_retries}): {e}")
+                        print(f"💤 等待 {delay}秒 后重试...")
                         time.sleep(delay)
-            # 所有重试都失败
-            print(f"❌ {func.__name__} 失败，已重试 {max_retries} 次")
+                        print(f"🔄 开始第 {i+2} 次尝试...")
+                    else:
+                        # 最后一次重试也失败
+                        print(f"❌ {func.__name__} 失败，已重试 {max_retries} 次")
+
+            # 确保有异常可抛出（理论上不可能，但为了类型检查）
+            if last_exception is None:
+                raise RuntimeError(f"{func.__name__} 重试逻辑错误：last_exception 不应为 None")
             raise last_exception
         return wrapper
     return decorator

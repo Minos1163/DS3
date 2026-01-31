@@ -97,7 +97,9 @@ class PositionDataManager:
                 symbol = pos['symbol']
                 amount = float(pos['positionAmt'])
                 if amount != 0:
-                    result[symbol] = self.get_current_position(symbol)
+                    pos_data = self.get_current_position(symbol)
+                    if pos_data is not None:
+                        result[symbol] = pos_data
             
             return result
         except Exception as e:

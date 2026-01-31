@@ -1,7 +1,8 @@
 {
+  "dry_run": false,
   "trading": {
     "symbols": ["SOLUSDT"],
-    "default_leverage": 2,
+    "default_leverage": 3,
     "max_leverage": 100,
     "min_position_percent": 10,
     "max_position_percent": 30,
@@ -20,8 +21,9 @@
     "enabled": false
   },
   "schedule": {
-    "interval_seconds": 180,
+    "interval_seconds": 900,
     "retry_times": 3,
-    "retry_delay_seconds": 5
+    "retry_delay_seconds": 20,
+    "download_delay_seconds": 5
   }
 }

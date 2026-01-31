@@ -12,10 +12,10 @@ from openai import OpenAI
 class DeepSeekClient:
     """DeepSeek AI客户端"""
     
-    def __init__(self, api_key: str = None, model: str = "deepseek-reasoner"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "deepseek-reasoner"):
         """
         初始化DeepSeek客户端
-        
+
         Args:
             api_key: DeepSeek API密钥
             model: 模型名称
@@ -23,12 +23,13 @@ class DeepSeekClient:
         self.api_key = api_key or os.getenv('DEEPSEEK_API_KEY')
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY 未设置")
-        
+
         self.model = model
         self.base_url = "https://api.deepseek.com"
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            default_headers={"User-Agent": "AI-Trading-Bot"}
         )
         
         # 抑制urllib3警告
@@ -87,9 +88,9 @@ class DeepSeekClient:
                 'content': content,
                 'raw_response': response,
                 'usage': {
-                    'prompt_tokens': response.usage.prompt_tokens,
-                    'completion_tokens': response.usage.completion_tokens,
-                    'total_tokens': response.usage.total_tokens
+                    'prompt_tokens': getattr(response.usage, 'prompt_tokens', 0),
+                    'completion_tokens': getattr(response.usage, 'completion_tokens', 0),
+                    'total_tokens': getattr(response.usage, 'total_tokens', 0)
                 }
             }
             

@@ -111,7 +111,7 @@ class TradingBot:
         print(f"✅ AI组件初始化完成")
 
         # 状态追踪
-        self.decision_history = []
+        self.decision_history: List[Dict[str, Any]] = []
         self.trade_count = 0
 
         # 预加载历史K线数据
@@ -164,7 +164,7 @@ class TradingBot:
         在启动时为所有交易对下载200根K线，确保有足够的历史数据用于技术分析
         """
         symbols = ConfigLoader.get_trading_symbols(self.config)
-        intervals = ['5m', '15m', '1h', '4h', '1d']
+        intervals = ['15m', '30m', '1h', '4h', '1d']
         
         print(f"📥 正在为 {len(symbols)} 个交易对预加载历史数据...")
         print(f"   时间周期: {', '.join(intervals)}")
@@ -223,8 +223,8 @@ class TradingBot:
     
     def get_market_data_for_symbol(self, symbol: str) -> Dict[str, Any]:
         """获取单个币种的市场数据"""
-        # 多周期K线
-        intervals = ['5m', '15m', '1h', '4h', '1d']
+        # 多周期K线 (15m为主要交易周期)
+        intervals = ['15m', '30m', '1h', '4h', '1d']
         multi_timeframe = self.market_data.get_multi_timeframe_data(symbol, intervals)
         
         # 实时行情
@@ -407,83 +407,31 @@ class TradingBot:
             print(f"❌ 执行决策失败 {symbol}: {e}")
     
     def _open_long(self, symbol: str, decision: Dict[str, Any], total_equity: float, current_price: float):
-        """开多仓"""
+        """开多仓（修正版）"""
+        position_percent = float(decision.get('position_percent', 0))
+        if position_percent <= 0:
+            print(f"⚠️ {symbol} 目标仓位为0，跳过开仓")
+            return
+
         # 检查账户余额
         if total_equity <= 0:
             print(f"⚠️ {symbol} 账户余额为0，无法开仓")
             print(f"   请确保账户有足够的 USDT 余额")
             return
-        
-        # 检查是否已有持仓
-        position = self.position_data.get_current_position(symbol)
-        if position:
-            print(f"⚠️ {symbol} 已有持仓，无法开多仓")
-            return
-        
-        # 计算仓位数量
-        position_percent = float(decision.get('position_percent', 0))
-        quantity = self._calculate_order_quantity(symbol, position_percent, total_equity, current_price)
 
+        # 计算开仓数量
+        quantity = self._calculate_order_quantity(symbol, position_percent, total_equity, current_price)
         if quantity <= 0:
-            print(f"❌ {symbol} 计算出的数量无效: {quantity} (目标仓位: {position_percent}%)")
+            print(f"❌ {symbol} 计算出的数量无效: {quantity}")
             return
-        
-        # 风险检查
-        leverage = decision['leverage']
-        ok, errors = self.risk_manager.check_all_risk_limits(
-            symbol, quantity, current_price, total_equity, total_equity
-        )
-        if not ok:
-            print(f"❌ {symbol} 风控检查失败:")
-            for err in errors:
-                print(f"   - {err}")
-            return
-        
-        # 计算止盈止损价格
+
+        leverage = decision.get('leverage', 1)
         take_profit_percent = decision.get('take_profit_percent', 5.0)
         stop_loss_percent = decision.get('stop_loss_percent', -2.0)
         take_profit = current_price * (1 + take_profit_percent / 100)
         stop_loss = current_price * (1 + stop_loss_percent / 100)
-        
-        # 执行开仓
-        try:
-            self.trade_executor.open_long(
-                symbol=symbol,
-                quantity=quantity,
-                leverage=leverage,
-                take_profit=take_profit,
-                stop_loss=stop_loss,
-                price=current_price
-            )
-            print(f"✅ {symbol} 开多仓成功")
-            self.trade_count += 1
-        except Exception as e:
-            print(f"❌ {symbol} 开多仓失败: {e}")
-    
-    def _open_short(self, symbol: str, decision: Dict[str, Any], total_equity: float, current_price: float):
-        """开空仓"""
-        # 检查账户余额
-        if total_equity <= 0:
-            print(f"⚠️ {symbol} 账户余额为0，无法开仓")
-            print(f"   请确保账户有足够的 USDT 余额")
-            return
-        
-        # 检查是否已有持仓
-        position = self.position_data.get_current_position(symbol)
-        if position:
-            print(f"⚠️ {symbol} 已有持仓，无法开空仓")
-            return
-        
-        # 计算仓位数量
-        position_percent = float(decision.get('position_percent', 0))
-        quantity = self._calculate_order_quantity(symbol, position_percent, total_equity, current_price)
 
-        if quantity <= 0:
-            print(f"❌ {symbol} 计算出的数量无效: {quantity} (目标仓位: {position_percent}%)")
-            return
-        
         # 风险检查
-        leverage = decision['leverage']
         ok, errors = self.risk_manager.check_all_risk_limits(
             symbol, quantity, current_price, total_equity, total_equity
         )
@@ -492,25 +440,73 @@ class TradingBot:
             for err in errors:
                 print(f"   - {err}")
             return
-        
-        # 计算止盈止损价格
-        take_profit_percent = decision.get('take_profit_percent', 5.0)
-        stop_loss_percent = decision.get('stop_loss_percent', -2.0)
-        take_profit = current_price * (1 - take_profit_percent / 100)  # 做空止盈价降低
-        stop_loss = current_price * (1 + abs(stop_loss_percent) / 100)  # 做空止损价提高
-        
-        # 执行开仓
+
         try:
-            self.trade_executor.open_short(
+            # ⚠️ 强制传递数量给 TradeExecutor
+            res = self.trade_executor.open_long(
                 symbol=symbol,
                 quantity=quantity,
                 leverage=leverage,
                 take_profit=take_profit,
-                stop_loss=stop_loss,
-                price=current_price
+                stop_loss=stop_loss
             )
-            print(f"✅ {symbol} 开空仓成功")
-            self.trade_count += 1
+            # 检查返回结果中的 status
+            if res.get("status") == "error":
+                print(f"❌ {symbol} 开多仓失败: {res.get('message', '未知错误')}")
+            else:
+                print(f"✅ {symbol} 开多仓成功: {res}")
+                self.trade_count += 1
+        except Exception as e:
+            print(f"❌ {symbol} 开多仓失败: {e}")
+    
+    def _open_short(self, symbol: str, decision: Dict[str, Any], total_equity: float, current_price: float):
+        """开空仓（修正版）"""
+        position_percent = float(decision.get('position_percent', 0))
+        if position_percent <= 0:
+            print(f"⚠️ {symbol} 目标仓位为0，跳过开空仓")
+            return
+
+        # 检查账户余额
+        if total_equity <= 0:
+            print(f"⚠️ {symbol} 账户余额为0，无法开仓")
+            print(f"   请确保账户有足够的 USDT 余额")
+            return
+
+        quantity = self._calculate_order_quantity(symbol, position_percent, total_equity, current_price)
+        if quantity <= 0:
+            print(f"❌ {symbol} 计算出的数量无效: {quantity}")
+            return
+
+        leverage = decision.get('leverage', 1)
+        take_profit_percent = decision.get('take_profit_percent', 5.0)
+        stop_loss_percent = decision.get('stop_loss_percent', -2.0)
+        take_profit = current_price * (1 - take_profit_percent / 100)  # 做空止盈
+        stop_loss = current_price * (1 + abs(stop_loss_percent) / 100)  # 做空止损
+
+        # 风险检查
+        ok, errors = self.risk_manager.check_all_risk_limits(
+            symbol, quantity, current_price, total_equity, total_equity
+        )
+        if not ok:
+            print(f"❌ {symbol} 风控检查失败:")
+            for err in errors:
+                print(f"   - {err}")
+            return
+
+        try:
+            res = self.trade_executor.open_short(
+                symbol=symbol,
+                quantity=quantity,
+                leverage=leverage,
+                take_profit=take_profit,
+                stop_loss=stop_loss
+            )
+            # 检查返回结果中的 status
+            if res.get("status") == "error":
+                print(f"❌ {symbol} 开空仓失败: {res.get('message', '未知错误')}")
+            else:
+                print(f"✅ {symbol} 开空仓成功: {res}")
+                self.trade_count += 1
         except Exception as e:
             print(f"❌ {symbol} 开空仓失败: {e}")
     
@@ -536,9 +532,13 @@ class TradingBot:
     def _close_position(self, symbol: str, decision: Dict[str, Any]):
         """平仓"""
         try:
-            self.trade_executor.close_position(symbol)
-            print(f"✅ {symbol} 平仓成功")
-            self.trade_count += 1
+            res = self.trade_executor.close_position(symbol)
+            # 检查返回结果中的 status
+            if res.get("status") == "error":
+                print(f"❌ {symbol} 平仓失败: {res.get('message', '未知错误')}")
+            elif res.get("status") != "noop":
+                print(f"✅ {symbol} 平仓成功")
+                self.trade_count += 1
         except Exception as e:
             print(f"❌ {symbol} 平仓失败: {e}")
     
@@ -569,13 +569,16 @@ class TradingBot:
                 
                 # 使用trade_executor的close_position方法
                 result = self.trade_executor.close_position(symbol)
-                
-                if result:
+
+                # 检查返回结果中的 status
+                if result.get("status") == "error":
+                    print(f"   ❌ {symbol} 平仓失败: {result.get('message', '未知错误')}")
+                elif result.get("status") == "noop":
+                    print(f"   ✅ {symbol} 无持仓，无需平仓")
+                else:
                     print(f"   ✅ {symbol} 平仓成功")
                     self._write_log(f"平仓: {symbol} (交易对变更)")
                     self.trade_count += 1
-                else:
-                    print(f"   ❌ {symbol} 平仓失败")
                     
             except Exception as e:
                 print(f"   ❌ {symbol} 平仓异常: {e}")
@@ -735,30 +738,59 @@ class TradingBot:
     def run(self):
         """启动主循环"""
         schedule_config = ConfigLoader.get_schedule_config(self.config)
-        # 改为5分钟周期 (300秒)
-        interval_seconds = 300
+        # 15分钟周期 (900秒)
+        interval_seconds = schedule_config['interval_seconds']
+        download_delay_seconds = schedule_config.get('download_delay_seconds', 5)
+        # 限制 download_delay_seconds 最大为30秒，确保在K线更新后的30s内完成下载/分析
+        if download_delay_seconds > 30:
+            download_delay_seconds = 30
         
-        print(f"\n⏱️  交易周期: 每{interval_seconds}秒 (5分钟)")
+        print(f"\n⏱️  交易周期: 每{interval_seconds}秒 (15分钟)")
         print(f"📊 交易币种: {', '.join(ConfigLoader.get_trading_symbols(self.config))}")
         print(f"📁 日志目录: {self.logs_dir}")
         print(f"📋 日志格式: logs/YYYY-MM/YYYY-MM-DD_HH.txt (每6小时一个文件，每天4个)")
         print(f"\n按 Ctrl+C 停止运行\n")
         
+        def _next_kline_boundary(ts: float) -> float:
+            """返回下一个对齐到 interval_seconds 的时间戳（单位: 秒）"""
+            # 计算下一个整周期边界
+            rem = ts % interval_seconds
+            if rem == 0:
+                return ts
+            return ts - rem + interval_seconds
+
         try:
+            # 启动时先对齐到最近的K线边界，并在边界后等待 download_delay_seconds 再开始第一次分析
+            now = time.time()
+            next_boundary = _next_kline_boundary(now)
+            wait_until = next_boundary + download_delay_seconds
+            initial_sleep = max(0, wait_until - now)
+            if initial_sleep > 0:
+                print(f"⏳ 等待对齐到下一次K线边界 {datetime.fromtimestamp(next_boundary).strftime('%Y-%m-%d %H:%M:%S')}，再延迟 {download_delay_seconds}s 后开始")
+                time.sleep(initial_sleep)
+
             while True:
-                start_time = time.time()
-                
-                # 执行交易周期
+                cycle_start = time.time()
+
+                # 执行交易周期（在K线更新后的短延迟内运行）
                 self.run_cycle()
-                
-                # 等待下一个周期
-                elapsed = time.time() - start_time
-                sleep_time = max(0, interval_seconds - elapsed)
-                
+
+                # 计算下一个K线边界并在边界后 download_delay_seconds 秒开始下一次
+                now = time.time()
+                next_boundary = _next_kline_boundary(now)
+                # 如果当前正好位于边界并且距离边界0s, 则 next_boundary == now ; 我们要确保等待到下一个边界
+                if next_boundary - now < 1e-6:
+                    next_boundary += interval_seconds
+
+                sleep_until = next_boundary + download_delay_seconds
+                sleep_time = sleep_until - time.time()
                 if sleep_time > 0:
-                    print(f"\n💤 等待 {sleep_time:.0f}秒...")
+                    print(f"\n💤 对齐等待：下次K线边界 {datetime.fromtimestamp(next_boundary).strftime('%Y-%m-%d %H:%M:%S')}, 在其后 {download_delay_seconds}s 开始 (睡眠 {sleep_time:.0f}s)")
                     time.sleep(sleep_time)
-                
+                else:
+                    # 如果已经超过计划时间，直接立即进入下一轮（不再sleep）
+                    print("⚠️ 已错过预定的对齐时间，立即开始下一周期")
+
         except KeyboardInterrupt:
             print("\n\n⚠️ 收到中断信号，正在安全退出...")
             self.shutdown()

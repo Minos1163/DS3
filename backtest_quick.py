@@ -16,7 +16,7 @@ from src.api.binance_client import BinanceClient
 from src.config.env_manager import EnvManager
 
 
-def download_klines_safe(symbol: str = 'SOLUSDT', interval: str = '5m', 
+def download_klines_safe(symbol: str = 'SOLUSDT', interval: str = '15m', 
                         days: int = 3, max_retries: int = 3) -> Optional[pd.DataFrame]:
     """
     安全下载K线数据
@@ -185,7 +185,7 @@ def analyze_and_backtest(df: pd.DataFrame, symbol: str = 'SOLUSDT') -> str:
     
     # 波动率
     returns = close.pct_change().dropna()
-    volatility = returns.std() * np.sqrt(288) * 100  # 年化波动率 (5分钟一根K线，一天288根)
+    volatility = returns.std() * np.sqrt(96) * 100  # 年化波动率 (15分钟一根K线，一天96根)
     
     # 简单交易策略：RSI < 30买入，RSI > 70卖出
     position = None
@@ -279,8 +279,8 @@ def main():
     print("🚀 SOLUSDT 快速回测分析")
     print("=" * 60)
     
-    # 下载最近3天的5分钟数据
-    df = download_klines_safe(symbol='SOLUSDT', interval='5m', days=3)
+    # 下载最近3天的15分钟数据
+    df = download_klines_safe(symbol='SOLUSDT', interval='15m', days=3)
     
     if df is None or len(df) == 0:
         print("❌ 数据下载失败，无法进行回测")

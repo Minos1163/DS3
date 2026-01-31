@@ -1,13 +1,14 @@
 from typing import Any, Dict, List, Optional
 import time
-import requests
+import requests  # type: ignore
+
 
 class OrderGateway:
     """
     负责：Binance 订单指令的格式化、参数映射、终端选择及实际发送。
     """
 
-    def __init__(self, broker):
+    def __init__(self, broker: Any) -> None:
         self.broker = broker
         # 🔒 L1: symbol + side 时间锁（20秒内禁止重复 OPEN）
         self._open_locks: Dict[str, float] = {}
@@ -17,9 +18,12 @@ class OrderGateway:
         if isinstance(err, dict):
             return err.get("code") in (-2015, -2014)
         msg = str(err)
-        return "401" in msg or "Unauthorized" in msg or "-2015" in msg or "-2014" in msg
+        checks = ["401", "Unauthorized", "-2015", "-2014"]
+        return any(s in msg for s in checks)
 
-    def has_open_position(self, symbol: str, side: Optional[str] = None) -> bool:
+    def has_open_position(
+        self, symbol: str, side: Optional[str] = None
+    ) -> bool:
         """🔥 L2: 统一的「是否已有仓位」判断（支持方向 LONG/SHORT/BOTH 和 BUY/SELL）
 
         接受的 side 可以是 'LONG'/'SHORT' 或者 'BUY'/'SELL'，也可以为 None (等同于 BOTH)。
@@ -72,10 +76,16 @@ class OrderGateway:
         if not reduce_only and not is_close_position:
             last_ts = self._open_locks.get(lock_key)
             if last_ts and now - last_ts < delay:
-                raise RuntimeError(
-                    f"[OPEN BLOCKED] {symbol} {side} within {delay}s lock "
-                    f"(last: {last_ts}, now: {now}, elapsed: {now - last_ts:.1f}s)"
+                msg = (
+                    "[OPEN BLOCKED] "
+                    + symbol
+                    + " "
+                    + side
+                    + " within "
+                    + str(delay)
+                    + "s lock"
                 )
+                raise RuntimeError(msg)
 
         # 计算用于仓位检查的 position side（兼容 BUY/SELL 和 LONG/SHORT）
         s_up = side.upper() if isinstance(side, str) else ""
@@ -88,10 +98,14 @@ class OrderGateway:
 
         # 🔒 L2: 真实仓位检查（不是openOrders），按方向检查避免重复开仓
         # 对于平仓请求（closePosition）应跳过此检查
-        if not reduce_only and not is_close_position and self.has_open_position(symbol, pos_check_side):
-            raise RuntimeError(
-                f"[OPEN BLOCKED] {symbol} already has open position (real check via positionAmt)"
+        cond_skip_l2 = not reduce_only and not is_close_position
+        if cond_skip_l2 and self.has_open_position(symbol, pos_check_side):
+            msg = (
+                "[OPEN BLOCKED] "
+                + symbol
+                + " already has open position (real check via positionAmt)"
             )
+            raise RuntimeError(msg)
 
         # 记录锁（先锁，防并发）
         self._open_locks[lock_key] = now
@@ -111,33 +125,42 @@ class OrderGateway:
             if "code" in data and data["code"] < 0:
                 # 🚫 致命权限错误：直接抛出，禁止 retry
                 if self._is_fatal_auth_error(data):
-                    raise RuntimeError(
-                        f"[FATAL AUTH ERROR] API key has no futures permission or invalid IP: {data}"
+                    msg = (
+                        "[FATAL AUTH ERROR] API key has no futures permission "
+                        "or invalid IP: " + str(data)
                     )
+                    raise RuntimeError(msg)
 
                 # 🚫 -1116 Invalid orderType: 检查仓位（按方向），若已变则直接返回 warning
                 if data.get("code") == -1116:
-                    pos = self.broker.position.get_position(symbol, side=pos_check_side)
+                    pos = self.broker.position.get_position(
+                        symbol, side=pos_check_side
+                    )
                     if pos and abs(float(pos.get("positionAmt", 0))) > 0:
-                        print(f"[WARNING] -1116 Invalid orderType, but position exists: {data}")
+                        print("[WARN] -1116: position exists")
+                        print(data)
                         return {
                             "warning": "order_failed_but_position_exists",
                             "symbol": symbol,
                             "side": side,
                             "error": data,
-                            "position_exists": True
+                            "position_exists": True,
                         }
 
                 # 🔥 L3: 失败后 → 再查一次仓位（防止已成交）
-                if not reduce_only and self.has_open_position(symbol, pos_check_side):
-                    print(f"[WARNING] Order failed but position exists: {data}")
+                cond_l3 = not reduce_only and self.has_open_position(
+                    symbol, pos_check_side
+                )
+                if cond_l3:
+                    print("[WARN] Order failed but position exists")
+                    print(data)
                     # 返回特殊状态，避免上层误判
                     return {
                         "warning": "order_failed_but_position_exists",
                         "symbol": symbol,
                         "side": side,
                         "error": data,
-                        "position_exists": True
+                        "position_exists": True,
                     }
                 raise RuntimeError(f"Binance Error: {data}")
 
@@ -147,30 +170,40 @@ class OrderGateway:
             # 🚫 致命权限错误：直接抛出，禁止 retry
             if self._is_fatal_auth_error(e):
                 raise RuntimeError(
-                    f"[FATAL AUTH ERROR] API key has no futures permission or invalid IP: {e}"
+                    "[FATAL AUTH ERROR] API key has no futures permission "
+                    "or invalid IP: " + str(e)
                 ) from e
 
             # 🚫 -1116 Invalid orderType: 检查仓位，若已变則直接返回 warning
-            if isinstance(e, requests.HTTPError) and getattr(e, 'response', None) is not None:
+            if isinstance(e, requests.HTTPError) and getattr(
+                e, "response", None
+            ) is not None:
                 try:
                     err_data = e.response.json()
                     if err_data.get("code") == -1116:
-                        pos = self.broker.position.get_position(symbol, side=pos_check_side)
+                        pos = self.broker.position.get_position(
+                            symbol, side=pos_check_side
+                        )
                         if pos and abs(float(pos.get("positionAmt", 0))) > 0:
-                            print(f"[WARNING] -1116 Invalid orderType, but position exists: {err_data}")
+                            print("[WARN] -1116: position exists")
+                            print(err_data)
                             return {
                                 "warning": "order_failed_but_position_exists",
                                 "symbol": symbol,
                                 "side": side,
                                 "error": err_data,
-                                "position_exists": True
+                                "position_exists": True,
                             }
                 except Exception:
                     pass
 
             # 🔥 L3: 失败后 → 再查一次仓位（防止已成交）
-            if not reduce_only and self.has_open_position(symbol, pos_check_side):
-                print(f"[WARNING] Exception but position exists: {e}")
+            cond_l3_exc = not reduce_only and self.has_open_position(
+                symbol, pos_check_side
+            )
+            if cond_l3_exc:
+                print("[WARNING] Exception but position exists:")
+                print(e)
                 return {
                     "warning": "order_failed_but_position_exists",
                     "symbol": symbol,
@@ -180,13 +213,20 @@ class OrderGateway:
                 }
             raise
 
+            # 🔒 不立即释放锁，让delay真正生效
+            # 依赖时间戳检查，而不是立即释放
         finally:
             # 🔒 不立即释放锁，让delay真正生效
             # 依赖时间戳检查，而不是立即释放
             pass
 
-
-    def place_protection_orders(self, symbol: str, side: str, tp: Optional[float], sl: Optional[float]) -> List[Dict[str, Any]]:
+    def place_protection_orders(
+        self,
+        symbol: str,
+        side: str,
+        tp: Optional[float],
+        sl: Optional[float],
+    ) -> List[Dict[str, Any]]:
         """执行 TP/SL 止盈止损单"""
         results = []
         # 计算下单方向与仓位方向 (Hedge 模式适配)
@@ -208,21 +248,33 @@ class OrderGateway:
                 if pos_side:
                     p["positionSide"] = pos_side
 
-                res = self.broker.request("POST", endpoint, params=p, signed=True)
+                res = self.broker.request(
+                    "POST", endpoint, params=p, signed=True
+                )
                 results.append(res.json())
 
         return results
 
     def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
         endpoint = self._order_endpoint()
-        return self.broker.request("DELETE", endpoint, params={"symbol": symbol, "orderId": order_id}, signed=True).json()
+        params = {"symbol": symbol, "orderId": order_id}
+        return self.broker.request(
+            "DELETE",
+            endpoint,
+            params=params,
+            signed=True,
+        ).json()
 
-    def query_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    def query_open_orders(
+        self, symbol: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         # 🔥 统一使用 FAPI 端点
         base = self.broker.FAPI_BASE
         path = "/fapi/v1/openOrders"
         params = {"symbol": symbol} if symbol else {}
-        return self.broker.request("GET", f"{base}{path}", params=params, signed=True).json()
+        url = f"{base}{path}"
+        resp = self.broker.request("GET", url, params=params, signed=True)
+        return resp.json()
 
     # --- 内部协议细节 ---
 
@@ -235,11 +287,12 @@ class OrderGateway:
         if self.broker.is_papi_only():  # 检查是否为 PAPI_ONLY 模式
             base = self.broker.PAPI_BASE  # 使用 PAPI 基础路径
             return f"{base}/papi/v1/um/order"
-        else:
-            base = self.broker.FAPI_BASE  # 使用 FAPI 基础路径
-            return f"{base}/fapi/v1/order"
+        base = self.broker.FAPI_BASE  # 使用 FAPI 基础路径
+        return f"{base}/fapi/v1/order"
 
-    def _finalize_params(self, params: Dict[str, Any], side: str, reduce_only: bool) -> Dict[str, Any]:
+    def _finalize_params(
+        self, params: Dict[str, Any], side: str, reduce_only: bool
+    ) -> Dict[str, Any]:
         """
         格式化订单参数，兼容 PAPI 实盘：
         - 全仓平仓必须传 closePosition=True + quantity（PAPI 要求）
@@ -269,19 +322,29 @@ class OrderGateway:
             p.pop("positionSide", None)
 
         # 全仓平仓必须带 quantity
-        if p.get("closePosition") is True or str(p.get("closePosition")).lower() == "true":
+        if (
+            p.get("closePosition") is True
+            or str(p.get("closePosition")).lower() == "true"
+        ):
             p["closePosition"] = True
-            print(f"[DEBUG _finalize_params] Before quantity check: quantity={p.get('quantity')}")
+            print("[DEBUG _finalize_params] Before quantity check:")
+            print(p.get("quantity"))
             if "quantity" not in p or not p["quantity"]:
-                print(f"[DEBUG _finalize_params] Quantity missing or empty, fetching from position...")
-                pos = self.broker.position.get_position(p.get("symbol"), side="BOTH")
+                print("[DEBUG] quantity missing, fetching position")
+                pos = self.broker.position.get_position(
+                    p.get("symbol"), side="BOTH"
+                )
                 if pos:
                     p["quantity"] = abs(float(pos.get("positionAmt", 0)))
-                    print(f"[DEBUG _finalize_params] Fetched quantity from position: {p['quantity']}")
+                    print("[DEBUG _finalize_params] Fetched quantity")
+                    print(p["quantity"])
                 else:
-                    raise ValueError(f"无法获取 {p.get('symbol')} 的仓位数量进行全仓平仓")
+                    raise ValueError(
+                        f"无法获取仓位数量: {p.get('symbol')}"
+                    )
             else:
-                print(f"[DEBUG _finalize_params] Quantity already present: {p['quantity']}")
+                print("[DEBUG _finalize_params] Quantity already present:")
+                print(p["quantity"])
             p.pop("reduceOnly", None)
             p.pop("reduce_only", None)
         else:
@@ -295,5 +358,4 @@ class OrderGateway:
                 ps = self.broker.calculate_position_side(side, reduce_only)
                 if ps:
                     p["positionSide"] = ps
-
         return p

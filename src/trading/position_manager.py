@@ -27,7 +27,7 @@ class PositionManager:
             leverage: 杠杆倍数（1-100）
         """
         try:
-            result = self.client.change_leverage(symbol, leverage)
+            result = self.client.position_gateway.change_leverage(symbol, leverage)
             print(f"✅ 修改杠杆: {symbol} {leverage}x")
             return result
         except Exception as e:
@@ -42,7 +42,7 @@ class PositionManager:
             hedge_mode: True=双向持仓, False=单向持仓
         """
         try:
-            result = self.client.set_hedge_mode(hedge_mode)
+            result = self.client.position_gateway.set_hedge_mode(hedge_mode)
             print(f"✅ 设置持仓模式: {'双向持仓' if hedge_mode else '单向持仓'}")
             return result
         except Exception as e:
