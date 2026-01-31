@@ -23,6 +23,7 @@ class TradeIntent:
     """
     🔥 Strategy → System 的唯一通信协议
     """
+
     symbol: str
     action: IntentAction
     side: Optional[PositionSide] = None

@@ -1,43 +1,55 @@
 from typing import Optional
-from src.trading.intents import TradeIntent, IntentAction, PositionSide
+
+from src.trading.intents import IntentAction, PositionSide, TradeIntent
+
 
 class IntentBuilder:
     """交易意图构建器 V2"""
 
     @staticmethod
-    def build_open_long(symbol: str, quantity: float,
-                        take_profit: Optional[float] = None, stop_loss: Optional[float] = None) -> TradeIntent:
+    def build_open_long(
+        symbol: str,
+        quantity: float,
+        take_profit: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+    ) -> TradeIntent:
         """构建开多仓意图"""
         return TradeIntent(
             symbol=symbol,
             action=IntentAction.OPEN,
             side=PositionSide.LONG,
             quantity=quantity,
-            order_type="MARKET",        # ✅ 默认 MARKET
+            order_type="MARKET",  # ✅ 默认 MARKET
             reduce_only=False,
             take_profit=take_profit,
             stop_loss=stop_loss,
-            reason="开多仓"
+            reason="开多仓",
         )
 
     @staticmethod
-    def build_open_short(symbol: str, quantity: float,
-                         take_profit: Optional[float] = None, stop_loss: Optional[float] = None) -> TradeIntent:
+    def build_open_short(
+        symbol: str,
+        quantity: float,
+        take_profit: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+    ) -> TradeIntent:
         """构建开空仓意图"""
         return TradeIntent(
             symbol=symbol,
             action=IntentAction.OPEN,
             side=PositionSide.SHORT,
             quantity=quantity,
-            order_type="MARKET",        # ✅ 默认 MARKET
+            order_type="MARKET",  # ✅ 默认 MARKET
             reduce_only=False,
             take_profit=take_profit,
             stop_loss=stop_loss,
-            reason="开空仓"
+            reason="开空仓",
         )
 
     @staticmethod
-    def build_close(symbol: str, side: PositionSide, quantity: Optional[float] = None) -> TradeIntent:
+    def build_close(
+        symbol: str, side: PositionSide, quantity: Optional[float] = None
+    ) -> TradeIntent:
         """
         构建平仓意图
         - quantity=None 或 quantity=0 表示全仓平掉（PAPI 需要同时传 closePosition=True 和 quantity）
@@ -57,11 +69,11 @@ class IntentBuilder:
             action=IntentAction.CLOSE,
             side=side,
             quantity=quantity,
-            order_type="MARKET",        # ✅ 平仓也默认 MARKET
+            order_type="MARKET",  # ✅ 平仓也默认 MARKET
             reduce_only=reduce_only,
             take_profit=None,
             stop_loss=None,
-            reason="平仓"
+            reason="平仓",
         )
 
     @staticmethod
@@ -70,12 +82,14 @@ class IntentBuilder:
         return IntentBuilder.build_close(symbol, side, quantity)
 
     @staticmethod
-    def build_set_protection(symbol: str, tp: Optional[float] = None, sl: Optional[float] = None) -> TradeIntent:
+    def build_set_protection(
+        symbol: str, tp: Optional[float] = None, sl: Optional[float] = None
+    ) -> TradeIntent:
         return TradeIntent(
             symbol=symbol,
             action=IntentAction.SET_PROTECTION,
             take_profit=tp,
             stop_loss=sl,
             order_type=None,
-            reason=None
+            reason=None,
         )

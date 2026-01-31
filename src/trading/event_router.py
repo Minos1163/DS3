@@ -1,13 +1,16 @@
 from typing import TYPE_CHECKING
+
 from src.trading.events import ExchangeEvent, ExchangeEventType
 
 if TYPE_CHECKING:
     from src.trading.position_state_machine import PositionStateMachineV2
 
+
 class ExchangeEventRouter:
     """
     事件调度器：将外部交易所事件路由至状态机的相应处理方法
     """
+
     def __init__(self, state_machine: "PositionStateMachineV2"):
         self.sm = state_machine
 

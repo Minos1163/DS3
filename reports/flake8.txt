@@ -1,0 +1,113 @@
+src\ai\prompt_builder.py:29:80: E501 line too long (80 > 79 characters)
+src\ai\prompt_builder.py:201:80: E501 line too long (87 > 79 characters)
+src\ai\prompt_builder.py:203:80: E501 line too long (93 > 79 characters)
+src\ai\prompt_builder.py:253:80: E501 line too long (195 > 79 characters)
+src\ai\prompt_builder.py:254:80: E501 line too long (195 > 79 characters)
+src\ai\prompt_builder.py:255:80: E501 line too long (169 > 79 characters)
+src\ai\prompt_builder.py:373:80: E501 line too long (93 > 79 characters)
+src\ai\prompt_builder.py:374:80: E501 line too long (80 > 79 characters)
+src\ai\prompt_builder.py:377:25: F841 local variable 'body_size' is assigned to but never used
+src\ai\prompt_builder.py:378:25: F841 local variable 'upper_shadow' is assigned to but never used
+src\ai\prompt_builder.py:379:25: F841 local variable 'lower_shadow' is assigned to but never used
+src\api\binance_client_v2_logic.py:3:80: E501 line too long (88 > 79 characters)
+src\api\endpoint_manager.py:61:80: E501 line too long (102 > 79 characters)
+src\api\endpoint_manager.py:147:19: F541 f-string is missing placeholders
+src\api\endpoint_manager.py:167:19: F541 f-string is missing placeholders
+src\api\endpoint_manager.py:169:80: E501 line too long (81 > 79 characters)
+src\api\endpoint_manager.py:185:19: F541 f-string is missing placeholders
+src\api\endpoint_manager.py:271:26: F541 f-string is missing placeholders
+src\backtest.py:58:15: F541 f-string is missing placeholders
+src\backtest.py:68:80: E501 line too long (89 > 79 characters)
+src\backtest.py:136:19: F541 f-string is missing placeholders
+src\backtest.py:141:80: E501 line too long (87 > 79 characters)
+src\backtest.py:143:80: E501 line too long (89 > 79 characters)
+src\backtest.py:154:15: F541 f-string is missing placeholders
+src\backtest.py:160:9: F841 local variable 'volume' is assigned to but never used
+src\backtest.py:192:19: F541 f-string is missing placeholders
+src\backtest.py:207:15: F541 f-string is missing placeholders
+src\backtest.py:222:13: F841 local variable 'next_row' is assigned to but never used
+src\backtest.py:288:15: F541 f-string is missing placeholders
+src\backtest.py:310:15: F541 f-string is missing placeholders
+src\backtest.py:403:19: F541 f-string is missing placeholders
+src\backtest.py:406:80: E501 line too long (93 > 79 characters)
+src\backtest.py:410:19: F541 f-string is missing placeholders
+src\backtest.py:430:80: E501 line too long (130 > 79 characters)
+src\backtest.py:435:80: E501 line too long (106 > 79 characters)
+src\backtest.py:436:80: E501 line too long (106 > 79 characters)
+src\backtest.py:452:23: F541 f-string is missing placeholders
+src\backtest.py:462:23: F541 f-string is missing placeholders
+src\backtest.py:468:80: E501 line too long (84 > 79 characters)
+src\backtest.py:468:80: E501 line too long (84 > 79 characters)
+src\backtest.py:470:80: E501 line too long (86 > 79 characters)
+src\backtest.py:471:80: E501 line too long (84 > 79 characters)
+src\config\config_monitor.py:81:80: E501 line too long (87 > 79 characters)
+src\config\config_monitor.py:132:19: F541 f-string is missing placeholders
+src\config\config_monitor.py:142:19: F541 f-string is missing placeholders
+src\config\env_manager.py:44:19: F541 f-string is missing placeholders
+src\data\account_data.py:42:23: F541 f-string is missing placeholders
+src\data\account_data.py:77:80: E501 line too long (95 > 79 characters)
+src\data\account_data.py:82:80: E501 line too long (86 > 79 characters)
+src\data\account_data.py:94:80: E501 line too long (97 > 79 characters)
+src\data\account_data.py:118:80: E501 line too long (89 > 79 characters)
+src\data\account_data.py:138:80: E501 line too long (83 > 79 characters)
+src\data\account_data.py:150:80: E501 line too long (80 > 79 characters)
+src\data\account_data.py:152:80: E501 line too long (80 > 79 characters)
+src\data\account_data.py:154:80: E501 line too long (91 > 79 characters)
+src\data\account_data.py:169:80: E501 line too long (84 > 79 characters)
+src\data\account_data.py:261:80: E501 line too long (83 > 79 characters)
+src\data\account_data.py:262:80: E501 line too long (92 > 79 characters)
+src\data\account_data.py:266:80: E501 line too long (103 > 79 characters)
+src\data\account_data.py:267:80: E501 line too long (103 > 79 characters)
+src\data\account_data.py:268:80: E501 line too long (103 > 79 characters)
+src\data\account_data.py:269:80: E501 line too long (109 > 79 characters)
+src\data\account_data.py:270:80: E501 line too long (93 > 79 characters)
+src\data\account_data.py:272:80: E501 line too long (84 > 79 characters)
+src\data\market_data.py:62:80: E501 line too long (80 > 79 characters)
+src\data\market_data.py:129:80: E501 line too long (82 > 79 characters)
+src\data\market_data.py:240:17: F841 local variable 'high_p' is assigned to but never used
+src\data\market_data.py:241:17: F841 local variable 'low_p' is assigned to but never used
+src\data\market_data.py:245:80: E501 line too long (84 > 79 characters)
+src\data\position_data.py:79:80: E501 line too long (80 > 79 characters)
+src\main.py:76:15: F541 f-string is missing placeholders
+src\main.py:80:15: F541 f-string is missing placeholders
+src\main.py:87:15: F541 f-string is missing placeholders
+src\main.py:98:15: F541 f-string is missing placeholders
+src\main.py:104:15: F541 f-string is missing placeholders
+src\main.py:110:15: F541 f-string is missing placeholders
+src\main.py:115:15: F541 f-string is missing placeholders
+src\main.py:177:15: F541 f-string is missing placeholders
+src\main.py:197:15: F541 f-string is missing placeholders
+src\main.py:198:15: F541 f-string is missing placeholders
+src\main.py:248:80: E501 line too long (81 > 79 characters)
+src\main.py:274:19: F541 f-string is missing placeholders
+src\main.py:288:23: F541 f-string is missing placeholders
+src\main.py:295:19: F541 f-string is missing placeholders
+src\main.py:306:19: F541 f-string is missing placeholders
+src\main.py:310:80: E501 line too long (80 > 79 characters)
+src\main.py:372:80: E501 line too long (86 > 79 characters)
+src\main.py:443:19: F541 f-string is missing placeholders
+src\main.py:502:19: F541 f-string is missing placeholders
+src\main.py:670:19: F541 f-string is missing placeholders
+src\main.py:673:80: E501 line too long (81 > 79 characters)
+src\main.py:674:23: F541 f-string is missing placeholders
+src\main.py:683:19: F541 f-string is missing placeholders
+src\main.py:691:26: F541 f-string is missing placeholders
+src\main.py:799:15: F541 f-string is missing placeholders
+src\main.py:800:15: F541 f-string is missing placeholders
+src\main.py:819:80: E501 line too long (128 > 79 characters)
+src\main.py:823:17: F841 local variable 'cycle_start' is assigned to but never used
+src\main.py:840:80: E501 line too long (136 > 79 characters)
+src\main.py:840:80: E501 line too long (136 > 79 characters)
+src\trading\classic_papi_order_executor.py:90:80: E501 line too long (85 > 79 characters)
+src\trading\events.py:36:80: E501 line too long (115 > 79 characters)
+src\trading\intent_builder.py:54:80: E501 line too long (85 > 79 characters)
+src\trading\intent_guard.py:20:80: E501 line too long (81 > 79 characters)
+src\trading\intent_guard.py:28:80: E501 line too long (81 > 79 characters)
+src\trading\position_state_machine.py:585:80: E501 line too long (87 > 79 characters)
+src\trading\risk_manager.py:43:80: E501 line too long (83 > 79 characters)
+src\trading\trade_executor.py:54:80: E501 line too long (132 > 79 characters)
+src\trading\trade_executor.py:81:80: E501 line too long (94 > 79 characters)
+src\trading\trade_executor.py:273:80: E501 line too long (83 > 79 characters)
+src\trading\trade_executor.py:304:80: E501 line too long (87 > 79 characters)
+src\utils\decorators.py:32:80: E501 line too long (146 > 79 characters)
+src\utils\indicators.py:60:80: E501 line too long (87 > 79 characters)

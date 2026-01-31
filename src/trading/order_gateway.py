@@ -1,5 +1,6 @@
-from typing import Any, Dict, List, Optional
 import time
+from typing import Any, Dict, List, Optional
+
 import requests  # type: ignore
 
 
@@ -21,9 +22,7 @@ class OrderGateway:
         checks = ["401", "Unauthorized", "-2015", "-2014"]
         return any(s in msg for s in checks)
 
-    def has_open_position(
-        self, symbol: str, side: Optional[str] = None
-    ) -> bool:
+    def has_open_position(self, symbol: str, side: Optional[str] = None) -> bool:
         """🔥 L2: 统一的「是否已有仓位」判断（支持方向 LONG/SHORT/BOTH 和 BUY/SELL）
 
         接受的 side 可以是 'LONG'/'SHORT' 或者 'BUY'/'SELL'，也可以为 None (等同于 BOTH)。
@@ -133,9 +132,7 @@ class OrderGateway:
 
                 # 🚫 -1116 Invalid orderType: 检查仓位（按方向），若已变则直接返回 warning
                 if data.get("code") == -1116:
-                    pos = self.broker.position.get_position(
-                        symbol, side=pos_check_side
-                    )
+                    pos = self.broker.position.get_position(symbol, side=pos_check_side)
                     if pos and abs(float(pos.get("positionAmt", 0))) > 0:
                         print("[WARN] -1116: position exists")
                         print(data)
@@ -170,14 +167,15 @@ class OrderGateway:
             # 🚫 致命权限错误：直接抛出，禁止 retry
             if self._is_fatal_auth_error(e):
                 raise RuntimeError(
-                    "[FATAL AUTH ERROR] API key has no futures permission "
-                    "or invalid IP: " + str(e)
+                    "[FATAL AUTH ERROR] API key has no futures permission or invalid IP: "
+                    + str(e)
                 ) from e
 
             # 🚫 -1116 Invalid orderType: 检查仓位，若已变則直接返回 warning
-            if isinstance(e, requests.HTTPError) and getattr(
-                e, "response", None
-            ) is not None:
+            if (
+                isinstance(e, requests.HTTPError)
+                and getattr(e, "response", None) is not None
+            ):
                 try:
                     err_data = e.response.json()
                     if err_data.get("code") == -1116:
@@ -209,7 +207,7 @@ class OrderGateway:
                     "symbol": symbol,
                     "side": side,
                     "error": str(e),
-                    "position_exists": True
+                    "position_exists": True,
                 }
             raise
 
@@ -243,14 +241,12 @@ class OrderGateway:
                     "side": order_side,
                     "type": otype,
                     "stopPrice": price,
-                    "closePosition": True
+                    "closePosition": True,
                 }
                 if pos_side:
                     p["positionSide"] = pos_side
 
-                res = self.broker.request(
-                    "POST", endpoint, params=p, signed=True
-                )
+                res = self.broker.request("POST", endpoint, params=p, signed=True)
                 results.append(res.json())
 
         return results
@@ -265,9 +261,7 @@ class OrderGateway:
             signed=True,
         ).json()
 
-    def query_open_orders(
-        self, symbol: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+    def query_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         # 🔥 统一使用 FAPI 端点
         base = self.broker.FAPI_BASE
         path = "/fapi/v1/openOrders"
@@ -331,17 +325,13 @@ class OrderGateway:
             print(p.get("quantity"))
             if "quantity" not in p or not p["quantity"]:
                 print("[DEBUG] quantity missing, fetching position")
-                pos = self.broker.position.get_position(
-                    p.get("symbol"), side="BOTH"
-                )
+                pos = self.broker.position.get_position(p.get("symbol"), side="BOTH")
                 if pos:
                     p["quantity"] = abs(float(pos.get("positionAmt", 0)))
                     print("[DEBUG _finalize_params] Fetched quantity")
                     print(p["quantity"])
                 else:
-                    raise ValueError(
-                        f"无法获取仓位数量: {p.get('symbol')}"
-                    )
+                    raise ValueError(f"无法获取仓位数量: {p.get('symbol')}")
             else:
                 print("[DEBUG _finalize_params] Quantity already present:")
                 print(p["quantity"])

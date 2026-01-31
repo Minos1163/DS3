@@ -1,6 +1,7 @@
 import math
 from typing import Any, Dict, List, Optional
 
+
 class MarketGateway:
     """
     📊 行情与元数据网关
@@ -17,15 +18,19 @@ class MarketGateway:
         interval: str,
         limit: int = 500,
         start_time: Optional[int] = None,
-        end_time: Optional[int] = None
+        end_time: Optional[int] = None,
     ) -> List[List[Any]]:
         url = f"{self.broker.MARKET_BASE}/fapi/v1/klines"
-        params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        }
         if start_time is not None:
             params["startTime"] = start_time
         if end_time is not None:
             params["endTime"] = end_time
-        
+
         response = self.broker.request("GET", url, params=params)
         return response.json()
 
@@ -36,7 +41,9 @@ class MarketGateway:
 
     def get_funding_rate(self, symbol: str) -> Optional[float]:
         url = f"{self.broker.MARKET_BASE}/fapi/v1/fundingRate"
-        response = self.broker.request("GET", url, params={"symbol": symbol, "limit": 1})
+        response = self.broker.request(
+            "GET", url, params={"symbol": symbol, "limit": 1}
+        )
         data = response.json()
         if data:
             rate = data[0].get("fundingRate") or data[0].get("rate")
@@ -78,7 +85,9 @@ class MarketGateway:
                         tick_size = float(f["tickSize"])
                         price_precision = self._get_precision(tick_size)
                     elif f["filterType"] in ["MIN_NOTIONAL", "NOTIONAL"]:
-                        min_notional = float(f.get("minNotional") or f.get("notional") or 5.0)
+                        min_notional = float(
+                            f.get("minNotional") or f.get("notional") or 5.0
+                        )
 
                 res = {
                     "symbol": symbol,
@@ -99,12 +108,14 @@ class MarketGateway:
 
         step_size = info["step_size"]
         precision = info["quantity_precision"]
-        
+
         # 使用 math.floor 避免精度陷阱
         val = float(math.floor(quantity / step_size) * step_size)
         return round(val, precision)
 
-    def ensure_min_notional_quantity(self, symbol: str, quantity: float, price: float) -> float:
+    def ensure_min_notional_quantity(
+        self, symbol: str, quantity: float, price: float
+    ) -> float:
         info = self.get_symbol_info(symbol)
         if not info or quantity <= 0 or price <= 0:
             return quantity

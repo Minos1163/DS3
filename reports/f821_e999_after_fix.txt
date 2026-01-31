@@ -1,0 +1,4 @@
+src\ai\prompt_builder.py:205:32: F821 undefined name 'symbol'
+src\ai\prompt_builder.py:205:41: F821 undefined name 'market_data'
+src\ai\prompt_builder.py:205:54: F821 undefined name 'position'
+src\ai\prompt_builder.py:206:29: F821 undefined name 'symbol'

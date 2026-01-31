@@ -1,27 +1,18 @@
+import hashlib
+import hmac
 import os
 import time
-import hmac
-import hashlib
-import requests  # type: ignore
-from typing import (
-    Dict,
-    List,
-    Optional,
-    Any,
-    Tuple,
-)
 from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests  # type: ignore
 
 from src.api.market_gateway import MarketGateway
-from src.trading.order_gateway import OrderGateway
 from src.trading import position_state_machine
-from src.trading.intents import (
-    TradeIntent,
-    PositionSide as IntentPositionSide,
-)
-from src.trading.event_router import (
-    ExchangeEventRouter,
-)
+from src.trading.event_router import ExchangeEventRouter
+from src.trading.intents import PositionSide as IntentPositionSide
+from src.trading.intents import TradeIntent
+from src.trading.order_gateway import OrderGateway
 
 
 class ApiCapability(Enum):
@@ -36,6 +27,7 @@ class AccountMode(Enum):
 
 class BinanceBroker:
     """底层的 HTTP 会话与签名引擎 (适配 PAPI/FAPI)"""
+
     FAPI_BASE = "https://fapi.binance.com"
     PAPI_BASE = "https://papi.binance.com"
     SPOT_BASE = "https://api.binance.com"
@@ -64,9 +56,7 @@ class BinanceBroker:
     def _headers(self) -> Dict[str, str]:
         return {"X-MBX-APIKEY": self.api_key}
 
-    def _signed_params(
-        self, params: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    def _signed_params(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = dict(params or {})
         payload.setdefault("recvWindow", 5000)
         payload["timestamp"] = int(time.time() * 1000)
@@ -197,9 +187,7 @@ class BinanceBroker:
             return self._hedge_mode_cache[0]
         try:
             url = f"{self.PAPI_BASE}/papi/v1/um/positionSide/dual"
-            resp = self.request(
-                "GET", url, signed=True, allow_error=True
-            )
+            resp = self.request("GET", url, signed=True, allow_error=True)
             data = resp.json()
             val = data.get("dualSidePosition", False)
             self._hedge_mode_cache = (val, now)
@@ -207,9 +195,7 @@ class BinanceBroker:
         except Exception:
             return False
 
-    def calculate_position_side(
-        self, side: str, reduce_only: bool
-    ) -> Optional[str]:
+    def calculate_position_side(self, side: str, reduce_only: bool) -> Optional[str]:
         if not self.get_hedge_mode():
             return None
         s = side.upper()
@@ -249,11 +235,7 @@ class PositionGateway:
 
     def change_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         base = self.broker.um_base()
-        path = (
-            "/papi/v1/um/leverage"
-            if "papi" in base
-            else "/fapi/v1/leverage"
-        )
+        path = "/papi/v1/um/leverage" if "papi" in base else "/fapi/v1/leverage"
         params = {"symbol": symbol, "leverage": leverage}
         url = f"{base}{path}"
         return self.broker.request(
@@ -263,15 +245,9 @@ class PositionGateway:
             signed=True,
         ).json()
 
-    def change_margin_type(
-        self, symbol: str, margin_type: str
-    ) -> Dict[str, Any]:
+    def change_margin_type(self, symbol: str, margin_type: str) -> Dict[str, Any]:
         base = self.broker.um_base()
-        path = (
-            "/papi/v1/um/marginType"
-            if "papi" in base
-            else "/fapi/v1/marginType"
-        )
+        path = "/papi/v1/um/marginType" if "papi" in base else "/fapi/v1/marginType"
         params = {"symbol": symbol, "marginType": margin_type.upper()}
         url = f"{base}{path}"
         return self.broker.request(
@@ -319,17 +295,14 @@ class BalanceEngine:
         data = resp.json()
         # 统一标准化字段，确保兼容 AccountDataManager
         if is_papi:
-            available = (
-                float(data.get("totalMarginBalance", 0))
-                - float(data.get("accountInitialMargin", 0))
+            available = float(data.get("totalMarginBalance", 0)) - float(
+                data.get("accountInitialMargin", 0)
             )
             total_wallet = float(data.get("totalWalletBalance", 0))
             available_balance = available
             total_margin = float(data.get("totalMarginBalance", 0))
             total_initial = float(data.get("accountInitialMargin", 0))
-            total_unrealized = float(
-                data.get("totalUnrealizedProfit", 0) or 0
-            )
+            total_unrealized = float(data.get("totalUnrealizedProfit", 0) or 0)
             account_equity = float(data.get("accountEquity", 0))
             return {
                 "totalWalletBalance": total_wallet,
@@ -346,14 +319,10 @@ class BalanceEngine:
             # 标准 FAPI 路径
         total_wallet = float(data.get("totalWalletBalance", 0))
         avail = float(data.get("availableBalance", 0))
-        total_margin = float(
-            data.get("totalMarginBalance", 0) or total_wallet
-        )
+        total_margin = float(data.get("totalMarginBalance", 0) or total_wallet)
         total_initial = float(data.get("totalInitialMargin", 0))
         total_unrealized = float(data.get("totalUnrealizedProfit", 0))
-        equity_val = float(
-            data.get("totalMarginBalance", 0) or total_wallet
-        )
+        equity_val = float(data.get("totalMarginBalance", 0) or total_wallet)
         return {
             "totalWalletBalance": total_wallet,
             "availableBalance": avail,
@@ -365,6 +334,7 @@ class BalanceEngine:
             "raw": data,
         }
 
+
 class BinanceClient:
     """
     Binance API 客户端 (V2 瘦身架构)
@@ -372,6 +342,7 @@ class BinanceClient:
     统一入口: execute_intent(intent)
     所有行情、下单、持仓逻辑均已委托至子模块。
     """
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -416,32 +387,32 @@ class BinanceClient:
         from src.trading.events import ExchangeEvent, ExchangeEventType
 
         # 1. 如果是 WebSocket 的订单成交推送 (e: 'ORDER_TRADE_UPDATE')
-        if event_data.get('e') == 'ORDER_TRADE_UPDATE':
-            o = event_data.get('o', {})
+        if event_data.get("e") == "ORDER_TRADE_UPDATE":
+            o = event_data.get("o", {})
             event_type = (
                 ExchangeEventType.ORDER_FILLED
-                if o.get('X') == 'FILLED'
+                if o.get("X") == "FILLED"
                 else ExchangeEventType.ORDER_CANCELED
             )
             event = ExchangeEvent(
                 type=event_type,
-                symbol=o.get('s', ''),
-                order_id=o.get('i'),
-                side=o.get('S'),
-                position_side=o.get('ps', 'BOTH'),
-                filled_qty=float(o.get('l', 0)),
+                symbol=o.get("s", ""),
+                order_id=o.get("i"),
+                side=o.get("S"),
+                position_side=o.get("ps", "BOTH"),
+                filled_qty=float(o.get("l", 0)),
             )
             self.event_router.dispatch(event)
 
         # 2. 如果是 WebSocket 的持仓变更推送 (e: 'ACCOUNT_UPDATE')
-        elif event_data.get('e') == 'ACCOUNT_UPDATE':
-            a = event_data.get('a', {})
-            for p in a.get('P', []):
+        elif event_data.get("e") == "ACCOUNT_UPDATE":
+            a = event_data.get("a", {})
+            for p in a.get("P", []):
                 event = ExchangeEvent(
                     type=ExchangeEventType.POSITION_UPDATE,
-                    symbol=p.get('s', ''),
-                    position_amt=float(p.get('pa', 0)),
-                    position_side=p.get('ps', 'BOTH')
+                    symbol=p.get("s", ""),
+                    position_amt=float(p.get("pa", 0)),
+                    position_side=p.get("ps", "BOTH"),
                 )
                 self.event_router.dispatch(event)
 
@@ -464,9 +435,7 @@ class BinanceClient:
     def ensure_min_notional_quantity(
         self, symbol: str, quantity: float, price: float
     ) -> float:
-        return self.market.ensure_min_notional_quantity(
-            symbol, quantity, price
-        )
+        return self.market.ensure_min_notional_quantity(symbol, quantity, price)
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         return self.market.get_symbol_info(symbol)
@@ -528,7 +497,7 @@ class BinanceClient:
             symbol=params.get("symbol", ""),
             side=side,
             params=params,
-            reduce_only=reduce_only
+            reduce_only=reduce_only,
         )
 
     def _execute_protection_v2(
@@ -564,5 +533,3 @@ class BinanceClient:
             return self.get_server_time() is not None
         except Exception:
             return False
-
-

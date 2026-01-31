@@ -1,15 +1,13 @@
 import dataclasses
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 from src.api.binance_client import BinanceClient
-from src.trading.intents import (
-    TradeIntent,
-    IntentAction,
-    PositionSide as IntentPositionSide,
-)
 from src.trading.intent_builder import IntentBuilder
 from src.trading.intent_guard import IntentGuard
-from src.utils.decorators import retry_on_failure, log_execution
+from src.trading.intents import IntentAction
+from src.trading.intents import PositionSide as IntentPositionSide
+from src.trading.intents import TradeIntent
+from src.utils.decorators import log_execution, retry_on_failure
 
 
 class TradeExecutor:
@@ -33,7 +31,7 @@ class TradeExecutor:
         """检查状态机中是否存在指定 symbol 和 side 的仓位快照"""
         snapshot = self.state.snapshots.get(symbol)
         return snapshot is not None and snapshot.side == side
-    
+
     def _execute_open(self, intent: TradeIntent) -> Dict[str, Any]:
         assert intent.action == IntentAction.OPEN
         assert intent.side is not None  # OPEN 意图必须有 side
@@ -53,10 +51,18 @@ class TradeExecutor:
         except Exception as e:
             # 如果执行期间抛出与重复开仓相关的 RuntimeError（例如 L2/L1 检查）
             msg = str(e)
-            if "[OPEN BLOCKED]" in msg or "-1116" in msg or "Invalid orderType" in msg or "order_failed_but_position_exists" in msg:
+            if (
+                "[OPEN BLOCKED]" in msg
+                or "-1116" in msg
+                or "Invalid orderType" in msg
+                or "order_failed_but_position_exists" in msg
+            ):
                 # 优化逻辑：先直接询问交易所持仓，优先以交易所确认为准，避免本地预创建快照导致的误判
                 try:
-                    pos = self.client.get_position(intent.symbol, side=(intent.side.value if intent.side else None))
+                    pos = self.client.get_position(
+                        intent.symbol,
+                        side=(intent.side.value if intent.side else None),
+                    )
                     if pos and abs(float(pos.get("positionAmt", 0))) > 0:
                         # 重建快照到状态机（以交易所数据为准）
                         amt = abs(float(pos.get("positionAmt", 0)))
@@ -68,7 +74,10 @@ class TradeExecutor:
                         else:
                             snap_side = intent.side
 
-                        from src.trading.position_state_machine import PositionSnapshot, PositionLifecycle
+                        from src.trading.position_state_machine import (
+                            PositionLifecycle,
+                            PositionSnapshot,
+                        )
 
                         snap = PositionSnapshot(
                             symbol=intent.symbol,
@@ -77,8 +86,17 @@ class TradeExecutor:
                             lifecycle=PositionLifecycle.OPEN,
                         )
                         self.state.snapshots[intent.symbol] = snap
-                        print(f"[DEBUG _execute_open] 捕获到异常但交易所显示已有仓位，已创建快照: {snap_side} {amt}")
-                        return {"status": "success", "open": {"warning": "exception_but_position_exists", "detail": msg}, "position_exists": True}
+                        print(
+                            f"[DEBUG _execute_open] 捕获到异常但交易所显示已有仓位，已创建快照: {snap_side} {amt}"
+                        )
+                        return {
+                            "status": "success",
+                            "open": {
+                                "warning": "exception_but_position_exists",
+                                "detail": msg,
+                            },
+                            "position_exists": True,
+                        }
                 except Exception:
                     # 查询交易所失败则回落到同步本地状态机并检查
                     pass
@@ -92,8 +110,17 @@ class TradeExecutor:
                 # 如果状态机显示已有仓位，则视为成功（仅在无法直接从交易所确认时作为补偿性手段）
                 snap = self.state.snapshots.get(intent.symbol)
                 if snap and snap.is_open():
-                    print(f"[DEBUG _execute_open] 捕获到异常但状态机已发现仓位，视为成功: {msg}")
-                    return {"status": "success", "open": {"warning": "exception_but_position_exists", "detail": msg}, "position_exists": True}
+                    print(
+                        f"[DEBUG _execute_open] 捕获到异常但状态机已发现仓位，视为成功: {msg}"
+                    )
+                    return {
+                        "status": "success",
+                        "open": {
+                            "warning": "exception_but_position_exists",
+                            "detail": msg,
+                        },
+                        "position_exists": True,
+                    }
 
             # 其他异常继续抛出以触发重试逻辑
             raise
@@ -132,7 +159,9 @@ class TradeExecutor:
         # 否则部分平仓，使用 reduceOnly=True
         if intent.quantity is None or intent.quantity == 0:
             # 全仓平仓：不设置 reduceOnly，让状态机使用 closePosition
-            intent = dataclasses.replace(intent, quantity=abs(float(pos["positionAmt"])))
+            intent = dataclasses.replace(
+                intent, quantity=abs(float(pos["positionAmt"]))
+            )
         else:
             # 部分平仓：使用 reduceOnly=True
             intent = dataclasses.replace(intent, reduce_only=True)
@@ -172,7 +201,7 @@ class TradeExecutor:
     def open_short(
         self,
         symbol: str,
-        quantity: float, 
+        quantity: float,
         leverage: Optional[int] = None,
         take_profit: Optional[float] = None,
         stop_loss: Optional[float] = None,
@@ -197,12 +226,16 @@ class TradeExecutor:
     # =========================
     @log_execution
     @retry_on_failure(max_retries=3, delay=20)
-    def close_long(self, symbol: str, quantity: Optional[float] = None) -> Dict[str, Any]:
+    def close_long(
+        self, symbol: str, quantity: Optional[float] = None
+    ) -> Dict[str, Any]:
         return self._close(symbol, IntentPositionSide.LONG, quantity)
 
     @log_execution
     @retry_on_failure(max_retries=3, delay=20)
-    def close_short(self, symbol: str, quantity: Optional[float] = None) -> Dict[str, Any]:
+    def close_short(
+        self, symbol: str, quantity: Optional[float] = None
+    ) -> Dict[str, Any]:
         return self._close(symbol, IntentPositionSide.SHORT, quantity)
 
     def _close(
@@ -233,18 +266,21 @@ class TradeExecutor:
     # =========================
     @log_execution
     @retry_on_failure(max_retries=3, delay=20)
-    def close_position(self, symbol: str,
-                       take_profit: Optional[float] = None,
-                       stop_loss: Optional[float] = None) -> Dict[str, Any]:
+    def close_position(
+        self,
+        symbol: str,
+        take_profit: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """兼容性方法：自动检测 side 并平仓，忽略 TP/SL 参数"""
         if take_profit is not None or stop_loss is not None:
             print("⚠️  CLOSE 动作不支持 TP/SL 参数，已忽略")
-        
+
         # 获取仓位信息，使用 positionSide 而不是 positionAmt 正负
         pos = self.client.get_position(symbol)
         if not pos or float(pos.get("positionAmt", 0)) == 0:
             return {"status": "noop", "message": f"{symbol} 无持仓"}
-        
+
         # 使用 positionSide 字段，确保 Hedge Mode 下正确
         side_str = pos.get("positionSide", "BOTH")
         if side_str == "LONG":
@@ -255,17 +291,20 @@ class TradeExecutor:
             # 对于 ONEWAY 模式，根据 positionAmt 正负判断
             qty = float(pos.get("positionAmt", 0))
             side = IntentPositionSide.LONG if qty > 0 else IntentPositionSide.SHORT
-        
+
         return self._close(symbol, side, None)
 
     @log_execution
-    def close_all_positions(self, symbol: Optional[str] = None,
-                            take_profit: Optional[float] = None,
-                            stop_loss: Optional[float] = None) -> Dict[str, Any]:
+    def close_all_positions(
+        self,
+        symbol: Optional[str] = None,
+        take_profit: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """兼容性方法：平掉所有仓位，忽略 TP/SL 参数"""
         if take_profit is not None or stop_loss is not None:
             print("⚠️  CLOSE 动作不支持 TP/SL 参数，已忽略")
-        
+
         results = []
 
         for pos in self.client.get_all_positions():
@@ -295,11 +334,17 @@ class TradeExecutor:
 
     @log_execution
     @retry_on_failure(max_retries=3, delay=20)
-    def reduce_position(self, symbol: str, quantity: float, side: IntentPositionSide,
-                        take_profit: Optional[float] = None, stop_loss: Optional[float] = None) -> Dict[str, Any]:
+    def reduce_position(
+        self,
+        symbol: str,
+        quantity: float,
+        side: IntentPositionSide,
+        take_profit: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """部分平仓（兼容性方法，禁止 TP/SL）"""
         if take_profit is not None or stop_loss is not None:
             raise RuntimeError("REDUCE 动作不允许携带 TP / SL")
-        
+
         qty = self.client.format_quantity(symbol, quantity)
         return self._close(symbol, side, qty)

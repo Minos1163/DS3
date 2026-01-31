@@ -1,15 +1,15 @@
 # position_state_machine.py
 import time
-from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Any
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
-from src.trading.intents import TradeIntent, IntentAction, PositionSide
-
+from src.trading.intents import IntentAction, PositionSide, TradeIntent
 
 # =========================
 # 状态枚举
 # =========================
+
 
 class PositionLifecycle(Enum):
     FLAT = "FLAT"
@@ -21,6 +21,7 @@ class PositionLifecycle(Enum):
 # =========================
 # Protection State
 # =========================
+
 
 @dataclass
 class ProtectionState:
@@ -37,6 +38,7 @@ class ProtectionState:
 # =========================
 # Position Snapshot
 # =========================
+
 
 @dataclass
 class PositionSnapshot:
@@ -59,29 +61,22 @@ class PositionSnapshot:
 # Invariant Checker
 # =========================
 
+
 class PositionInvariantViolation(RuntimeError):
     pass
 
 
 class PositionInvariantChecker:
     @staticmethod
-    def check(
-        snapshot: Optional[PositionSnapshot], intent: TradeIntent
-    ) -> None:
+    def check(snapshot: Optional[PositionSnapshot], intent: TradeIntent) -> None:
         # -------- 基础 --------
         if intent.action == IntentAction.OPEN:
             # 🔥 移除本地快照检查，让交易所 API 判断是否真的有仓位
             # 避免第一次请求失败后，retry 时错误地阻止开仓
             # 只有在交易所返回明确错误时才阻止
 
-            if (
-                intent.side is None
-                or intent.quantity is None
-                or intent.quantity <= 0
-            ):
-                raise PositionInvariantViolation(
-                    "❌ OPEN 必须指定 side + 正 quantity"
-                )
+            if intent.side is None or intent.quantity is None or intent.quantity <= 0:
+                raise PositionInvariantViolation("❌ OPEN 必须指定 side + 正 quantity")
 
         if intent.action == IntentAction.CLOSE:
             if snapshot is None or not snapshot.is_open():
@@ -97,17 +92,15 @@ class PositionInvariantChecker:
                 # 可选：检查减仓数量是否超过持仓，或者允许尝试扣减
                 pass
 
-        if (
-            intent.action
-            in {IntentAction.SET_PROTECTION, IntentAction.UPDATE_PROTECTION}
-        ):
+        if intent.action in {
+            IntentAction.SET_PROTECTION,
+            IntentAction.UPDATE_PROTECTION,
+        }:
             if snapshot is None or not snapshot.is_open():
                 raise PositionInvariantViolation("❌ 无仓位却设置止盈止损")
 
             if intent.take_profit is None and intent.stop_loss is None:
-                raise PositionInvariantViolation(
-                    "❌ SET_PROTECTION 至少需要 TP 或 SL"
-                )
+                raise PositionInvariantViolation("❌ SET_PROTECTION 至少需要 TP 或 SL")
 
         # -------- 保护态合法性 --------
         if snapshot and snapshot.protection.is_active():
@@ -122,6 +115,7 @@ class PositionInvariantChecker:
 # =========================
 # PositionStateMachineV2
 # =========================
+
 
 class PositionStateMachineV2:
     """
@@ -151,10 +145,10 @@ class PositionStateMachineV2:
         if intent.action == IntentAction.REDUCE:
             return self._reduce(intent)
 
-        if (
-            intent.action
-            in {IntentAction.SET_PROTECTION, IntentAction.UPDATE_PROTECTION}
-        ):
+        if intent.action in {
+            IntentAction.SET_PROTECTION,
+            IntentAction.UPDATE_PROTECTION,
+        }:
             return self._set_protection(intent)
 
         if intent.action == IntentAction.CLOSE:
@@ -209,9 +203,7 @@ class PositionStateMachineV2:
         warn_flag = result.get("warning") == "order_failed_but_position_exists"
         pos_exists_flag = result.get("position_exists") is True
         if warn_flag or pos_exists_flag:
-            msg = (
-                "[DEBUG _open] 订单返回已存在仓位警告，尝试从交易所读取持仓并建立快照"
-            )
+            msg = "[DEBUG _open] 订单返回已存在仓位警告，尝试从交易所读取持仓并建立快照"
             print(msg, result)
             # 根据 intent.side 确定查询方向
             pos_check_side = intent.side.value if intent.side else None
@@ -275,10 +267,7 @@ class PositionStateMachineV2:
 
         # 🔥 只有在订单真正成功时，才更新状态快照
         existing_snapshot = self.snapshots.get(intent.symbol)
-        if (
-            existing_snapshot is not None
-            and existing_snapshot.side == intent.side
-        ):
+        if existing_snapshot is not None and existing_snapshot.side == intent.side:
             # 已有同向仓位，增加数量
             existing_snapshot.quantity += float(intent.quantity)
             existing_snapshot.last_update_ts = time.time()
@@ -295,7 +284,7 @@ class PositionStateMachineV2:
                 side=intent.side,
                 quantity=float(intent.quantity),
                 lifecycle=PositionLifecycle.OPEN,
-                last_update_ts=time.time()
+                last_update_ts=time.time(),
             )
             self.snapshots[intent.symbol] = snap
             print("[DEBUG _open] 创建新快照:", intent.side, snap.quantity)
@@ -303,7 +292,11 @@ class PositionStateMachineV2:
         # 如果开仓意图自带保护，则立即执行
         if intent.take_profit or intent.stop_loss:
             protection_res = self._set_protection(intent)
-            return {"status": "success", "open": result, "protection": protection_res}
+            return {
+                "status": "success",
+                "open": result,
+                "protection": protection_res,
+            }
 
         return {"status": "success", "open": result}
 
@@ -333,9 +326,7 @@ class PositionStateMachineV2:
             params["positionSide"] = snap.side.value
 
         # 🔥 使用 intent.reduce_only（对于 REDUCE，通常是 True）
-        reduce_only = (
-            intent.reduce_only if intent.reduce_only is not None else True
-        )
+        reduce_only = intent.reduce_only if intent.reduce_only is not None else True
 
         result = self.client._execute_order_v2(
             params=params,
@@ -368,11 +359,14 @@ class PositionStateMachineV2:
                     symbol=intent.symbol,
                     side=snap_side,
                     quantity=abs(amt),
-                    lifecycle=PositionLifecycle.OPEN
+                    lifecycle=PositionLifecycle.OPEN,
                 )
                 self.snapshots[intent.symbol] = snap
             else:
-                return {"status": "error", "message": "No position for protection"}
+                return {
+                    "status": "error",
+                    "message": "No position for protection",
+                }
 
         # 设置保护前清理旧保护单
         try:
@@ -432,7 +426,8 @@ class PositionStateMachineV2:
         query_side = intent.side.value if intent.side else None
         pos = self.client.get_position(intent.symbol, side=query_side)
         if not pos:
-            return {"status": "success", "message": f"No {query_side or ''} position to close"}
+            return {"status": "success", "message": f"No {
+                    query_side or ''} position to close"}
 
         amt = float(pos.get("positionAmt", 0))
         p_side = pos.get("positionSide", "BOTH")
@@ -502,9 +497,7 @@ class PositionStateMachineV2:
                 # 部分平仓：更新数量
                 if intent.symbol in self.snapshots:
                     snap = self.snapshots[intent.symbol]
-                    qty = (
-                        intent.quantity if intent.quantity is not None else 0.0
-                    )
+                    qty = intent.quantity if intent.quantity is not None else 0.0
                     snap.quantity = max(0.0, snap.quantity - float(qty))
                     if snap.quantity == 0:
                         del self.snapshots[intent.symbol]
@@ -602,7 +595,6 @@ class PositionStateMachineV2:
         # 3. 基础数量更新 (兜底逻辑)
         # 注意：这里我们更倾向于依赖 on_position_update 的绝对值同步
         # 因为在 Web 套接字中，账户更新推送通常比订单成交推送更接近事实
-        pass
 
     def on_order_canceled(self, symbol: str, order_id: Optional[int]):
         """挂单取消事件入口"""
@@ -617,7 +609,7 @@ class PositionStateMachineV2:
         if snap.protection.tp_order_id == order_id:
             snap.protection.tp_order_id = None
             snap.protection.take_profit = None
-        
+
         if snap.protection.sl_order_id == order_id:
             snap.protection.sl_order_id = None
             snap.protection.stop_loss = None
@@ -628,7 +620,12 @@ class PositionStateMachineV2:
         ):
             snap.lifecycle = PositionLifecycle.OPEN
 
-    def on_position_update(self, symbol: str, position_amt: Optional[float], position_side: Optional[str]):
+    def on_position_update(
+        self,
+        symbol: str,
+        position_amt: Optional[float],
+        position_side: Optional[str],
+    ):
         """
         仓位级别终极同步 (这是解决所有状态漂移的保底逻辑)
         position_amt 为 signed (正为多，负为空，0为平)
@@ -654,7 +651,7 @@ class PositionStateMachineV2:
                 symbol=symbol,
                 side=side,
                 quantity=abs_amt,
-                lifecycle=PositionLifecycle.OPEN
+                lifecycle=PositionLifecycle.OPEN,
             )
         else:
             # 校准本地快照

@@ -2,19 +2,20 @@
 配置文件监控器
 监控trading_config.json文件的变化，并处理交易对变更
 """
-import os
+
 import json
-from typing import Dict, Any, Optional, List
+import os
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
 class ConfigMonitor:
     """配置文件监控器"""
-    
+
     def __init__(self, config_path: str):
         """
         初始化配置监控器
-        
+
         Args:
             config_path: 配置文件路径
         """
@@ -22,10 +23,10 @@ class ConfigMonitor:
         self.last_modified_time: Optional[float] = None
         self.current_config: Optional[Dict[str, Any]] = None
         self.current_symbols: List[str] = []
-        
+
         # 初始化：记录当前配置和修改时间
         self._update_state()
-    
+
     def _get_file_modified_time(self) -> float:
         """获取配置文件的修改时间"""
         try:
@@ -33,29 +34,29 @@ class ConfigMonitor:
         except Exception as e:
             print(f"⚠️ 无法获取配置文件修改时间: {e}")
             return 0.0
-    
+
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件"""
         try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
+            with open(self.config_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ 无法加载配置文件: {e}")
             return {}
-    
+
     def _update_state(self):
         """更新当前状态"""
         self.last_modified_time = self._get_file_modified_time()
         self.current_config = self._load_config()
-        self.current_symbols = self.current_config.get('trading', {}).get('symbols', [])
-    
+        self.current_symbols = self.current_config.get("trading", {}).get("symbols", [])
+
     def check_for_updates(self) -> Dict[str, Any]:
-        """
+        f"""
         检查配置文件是否有更新
-        
+
         Returns:
             {
-                'updated': bool,  # 是否有更新
+            'updated': bool,  # 是否有更新
                 'symbols_changed': bool,  # 交易对是否变化
                 'old_symbols': List[str],  # 旧的交易对列表
                 'new_symbols': List[str],  # 新的交易对列表
@@ -64,88 +65,86 @@ class ConfigMonitor:
             }
         """
         result = {
-            'updated': False,
-            'symbols_changed': False,
-            'old_symbols': self.current_symbols.copy(),
-            'new_symbols': [],
-            'removed_symbols': [],
-            'added_symbols': [],
-            'new_config': None
+            "updated": False,
+            "symbols_changed": False,
+            "old_symbols": self.current_symbols.copy(),
+            "new_symbols": [],
+            "removed_symbols": [],
+            "added_symbols": [],
+            "new_config": None,
         }
-        
+
         # 获取当前文件修改时间
         current_mtime = self._get_file_modified_time()
-        
+
         # 检查文件是否被修改（需要处理None的情况）
         if self.last_modified_time is None or current_mtime <= self.last_modified_time:
             return result
-        
+
         # 文件已更新
-        result['updated'] = True
-        
+        result["updated"] = True
+
         # 加载新配置
         new_config = self._load_config()
-        new_symbols = new_config.get('trading', {}).get('symbols', [])
-        
-        result['new_symbols'] = new_symbols
-        result['new_config'] = new_config
-        
+        new_symbols = new_config.get("trading", {}).get("symbols", [])
+
+        result["new_symbols"] = new_symbols
+        result["new_config"] = new_config
+
         # 检查交易对是否变化
         if set(new_symbols) != set(self.current_symbols):
-            result['symbols_changed'] = True
-            
+            result["symbols_changed"] = True
+
             # 找出被移除的交易对（需要平仓）
-            result['removed_symbols'] = [
-                symbol for symbol in self.current_symbols 
-                if symbol not in new_symbols
+            result["removed_symbols"] = [
+                symbol for symbol in self.current_symbols if symbol not in new_symbols
             ]
-            
+
             # 找出新增的交易对
-            result['added_symbols'] = [
-                symbol for symbol in new_symbols 
-                if symbol not in self.current_symbols
+            result["added_symbols"] = [
+                symbol for symbol in new_symbols if symbol not in self.current_symbols
             ]
-        
+
         return result
-    
+
     def apply_updates(self, update_info: Dict[str, Any]):
         """
         应用配置更新
-        
+
         Args:
             update_info: check_for_updates返回的更新信息
         """
-        if not update_info['updated']:
+        if not update_info["updated"]:
             return
-        
+
         # 更新状态
         self._update_state()
-        
+
         # 记录日志
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"\n{'='*60}")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n{'=' * 60}")
         print(f"📝 配置文件已更新 [{timestamp}]")
-        print(f"{'='*60}")
-        
-        if update_info['symbols_changed']:
-            print(f"⚠️  交易对发生变化:")
+        print(f"{'=' * 60}")
+
+        if update_info["symbols_changed"]:
+            print("⚠️  交易对发生变化:")
             print(f"   旧交易对: {', '.join(update_info['old_symbols'])}")
             print(f"   新交易对: {', '.join(update_info['new_symbols'])}")
-            
-            if update_info['removed_symbols']:
+
+            if update_info["removed_symbols"]:
                 print(f"   需要平仓: {', '.join(update_info['removed_symbols'])}")
-            
-            if update_info['added_symbols']:
+
+            if update_info["added_symbols"]:
                 print(f"   新增交易对: {', '.join(update_info['added_symbols'])}")
         else:
-            print(f"✅ 交易对未变化，参数已更新")
-        
-        print(f"{'='*60}\n")
-    
+            print("✅ 交易对未变化，参数已更新")
+
+        print(f"{'=' * 60}\n")
+
     def get_current_symbols(self) -> List[str]:
         """获取当前的交易对列表"""
         return self.current_symbols.copy()
-    
+
     def get_current_config(self) -> Dict[str, Any]:
         """获取当前的配置"""
         return self.current_config.copy() if self.current_config else {}

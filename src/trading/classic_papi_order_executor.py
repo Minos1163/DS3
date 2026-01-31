@@ -1,6 +1,7 @@
 """
 Classic + PAPI-only 专用下单器
 """
+
 from __future__ import annotations
 
 import math
@@ -45,25 +46,36 @@ class ClassicPapiOrderExecutor:
         if available <= 0:
             try:
                 # 先尝试全仓杠杆账户
-                margin_url = f"{self.client.broker.SPOT_BASE}/sapi/v1/margin/account"
-                margin_response = self.client.broker.request("GET", margin_url, signed=True)
+                margin_url = f"{
+                    self.client.broker.SPOT_BASE}/sapi/v1/margin/account"
+                margin_response = self.client.broker.request(
+                    "GET", margin_url, signed=True
+                )
                 margin_data = margin_response.json()
                 for asset in margin_data.get("userAssets", []):
                     if asset.get("asset") == "USDT":
-                        margin_usdt = float(asset.get("free", 0)) + float(asset.get("locked", 0))
+                        margin_usdt = float(asset.get("free", 0)) + float(
+                            asset.get("locked", 0)
+                        )
                         if margin_usdt > 0:
                             available = max(available, margin_usdt)
-                            print(f"   💡 [全仓杠杆备选] 使用杠杆USDT: {margin_usdt:.8f}")
+                            print(
+                                f"   💡 [全仓杠杆备选] 使用杠杆USDT: {margin_usdt:.8f}"
+                            )
                         break
-                
+
                 # 如果全仓杠杆也没有，尝试现货
                 if available <= 0:
                     spot_url = f"{self.client.broker.SPOT_BASE}/api/v3/account"
-                    spot_response = self.client.broker.request("GET", spot_url, signed=True)
+                    spot_response = self.client.broker.request(
+                        "GET", spot_url, signed=True
+                    )
                     spot_data = spot_response.json()
                     for asset in spot_data.get("balances", []):
                         if asset.get("asset") == "USDT":
-                            spot_usdt = float(asset.get("free", 0)) + float(asset.get("locked", 0))
+                            spot_usdt = float(asset.get("free", 0)) + float(
+                                asset.get("locked", 0)
+                            )
                             if spot_usdt > 0:
                                 available = max(available, spot_usdt)
                                 print(f"   💡 [现货备选] 使用现货USDT: {spot_usdt:.8f}")
@@ -152,7 +164,7 @@ class ClassicPapiOrderExecutor:
                 "side": side,
                 "quantity": qty,
                 "available_margin": available,
-                "leverage": leverage
+                "leverage": leverage,
             }
 
         url = f"{self.client.broker.PAPI_BASE}/papi/v1/um/order"
