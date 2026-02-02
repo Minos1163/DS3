@@ -5,10 +5,16 @@ AI交易机器人主程序
 
 import os
 import sys
+
+# 添加项目根目录到Python路径（必须在导入src.*之前）
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__ or "")))
+sys.path.insert(0, PROJECT_ROOT)
+
 import time
 from datetime import datetime
 from io import StringIO
 from typing import Any, Callable, Dict, List, Optional, TextIO
+import csv
 
 from src.ai.decision_parser import DecisionParser
 from src.ai.deepseek_client import DeepSeekClient
@@ -23,10 +29,7 @@ from src.data.position_data import PositionDataManager
 from src.trading.position_manager import PositionManager
 from src.trading.risk_manager import RiskManager
 from src.trading.trade_executor import TradeExecutor
-
-# 添加项目根目录到Python路径
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__ or "")))
-sys.path.insert(0, PROJECT_ROOT)
+from src.strategy import V5Strategy
 
 
 class TerminalOutputLogger:
@@ -88,9 +91,20 @@ class TradingBot:
         self._setup_logs_directory()
         self._redirect_terminal_output()
 
+        # 策略模式
+        self.strategy_mode = self.config.get("strategy", {}).get("mode", "AI")
+        self.ai_enabled = self.config.get("ai", {}).get("enabled", True)
+        self.ai_client: Optional[DeepSeekClient] = None
+        self.prompt_builder: Optional[PromptBuilder] = None
+        self.decision_parser: Optional[DecisionParser] = None
+        self.strategy: Optional[V5Strategy] = None
+
         # 初始化客户端
         self.client = self._init_binance_client()
-        self.ai_client = self._init_ai_client()
+        if self.strategy_mode == "V5_RULE":
+            self.ai_client = None
+        else:
+            self.ai_client = self._init_ai_client()
         print("✅ API客户端初始化完成")
 
         # 初始化管理器
@@ -105,10 +119,17 @@ class TradingBot:
         self.risk_manager = RiskManager(self.config)
         print("✅ 交易执行器初始化完成")
 
-        # AI组件
-        self.prompt_builder = PromptBuilder(self.config)
-        self.decision_parser = DecisionParser()
-        print("✅ AI组件初始化完成")
+        # AI组件 / 规则策略
+        if self.strategy_mode == "V5_RULE":
+            self.strategy = V5Strategy(self.config)
+            self.prompt_builder = None
+            self.decision_parser = None
+            print("✅ V5规则策略已启用")
+        else:
+            self.strategy = None
+            self.prompt_builder = PromptBuilder(self.config)
+            self.decision_parser = DecisionParser()
+            print("✅ AI组件初始化完成")
 
         # 状态追踪
         self.decision_history: List[Dict[str, Any]] = []
@@ -240,6 +261,8 @@ class TradingBot:
         self, all_symbols_data: Dict[str, Any]
     ) -> Dict[str, Dict[str, Any]]:
         """使用AI一次性分析所有币种"""
+        if not self.ai_client or not self.prompt_builder or not self.decision_parser:
+            return {}
         try:
             # 收集所有币种的持仓
             all_positions = {}
@@ -315,6 +338,8 @@ class TradingBot:
         self, symbol: str, market_data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """使用AI分析并获取决策"""
+        if not self.ai_client or not self.prompt_builder or not self.decision_parser:
+            return DecisionParser._get_default_decision()
         try:
             # 获取持仓
             position = self.position_data.get_current_position(symbol)
@@ -359,6 +384,24 @@ class TradingBot:
             print(f"❌ AI分析失败 {symbol}: {e}")
             return self.decision_parser._get_default_decision()
 
+    def analyze_with_strategy(
+        self, symbol: str, market_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """使用规则策略分析并获取决策"""
+        if not self.strategy:
+            return DecisionParser._get_default_decision()
+        position = self.position_data.get_current_position(symbol)
+        decision = self.strategy.decide(symbol, market_data, position)
+
+        print(f"\n📊 {symbol} V5策略决策:")
+        print(f"   动作: {decision['action']}")
+        print(f"   信心: {decision['confidence']:.2f}")
+        print(f"   杠杆: {decision['leverage']}x")
+        print(f"   仓位: {decision.get('position_percent', 0)}%")
+        print(f"   理由: {decision['reason']}")
+
+        return decision
+
     def execute_decision(
         self,
         symbol: str,
@@ -381,8 +424,45 @@ class TradingBot:
             else:
                 confidence = 0.5
 
-        # 如果信心度太低，不执行
-        if confidence < 0.5 and action != "CLOSE":
+        # ----- 阈值检查（配置可控制） -----
+        ai_conf_min = self.config.get("ai", {}).get("min_confidence", 0.6)
+        min_pos_pct = self.config.get("trading", {}).get("min_position_percent", 10)
+
+        # 如果信心度太低，不执行（但允许平仓；HOLD 也不阻断）
+        if confidence < ai_conf_min and action not in ("CLOSE", "HOLD"):
+            print(f"⚠️ {symbol} 信心度太低({confidence:.2f} < {ai_conf_min}), 跳过执行")
+            # 记录跳过的决策到交易日志
+            self._append_trade_log(
+                symbol=symbol,
+                action=action,
+                decision=decision,
+                quantity=0,
+                entry_price=market_data["realtime"].get("price", 0),
+                result="skipped_low_confidence",
+                pnl=None,
+            )
+            return
+
+        # 如果仓位小于最小阈值且是开仓操作，则跳过
+        try:
+            pos_pct = float(decision.get("position_percent", 0))
+        except Exception:
+            pos_pct = 0
+        if action in ("BUY_OPEN", "SELL_OPEN") and pos_pct < min_pos_pct:
+            print(f"⚠️ {symbol} 目标仓位太小({pos_pct}% < {min_pos_pct}%), 跳过执行")
+            self._append_trade_log(
+                symbol=symbol,
+                action=action,
+                decision=decision,
+                quantity=0,
+                entry_price=market_data["realtime"].get("price", 0),
+                result="skipped_small_position",
+                pnl=None,
+            )
+            return
+
+        # 如果信心度太低，不执行（但允许平仓；HOLD 也不阻断）
+        if confidence < 0.5 and action not in ("CLOSE", "HOLD"):
             print(f"⚠️ {symbol} 信心度太低({confidence:.2f})，跳过执行")
             return
 
@@ -411,7 +491,23 @@ class TradingBot:
 
             elif action == "CLOSE":
                 # 平仓
-                self._close_position(symbol, decision)
+                res = self._close_position(symbol, decision)
+                # 记录平仓到交易日志（如有返回结果与 pnl）
+                try:
+                    pnl = None
+                    if isinstance(res, dict):
+                        pnl = res.get("pnl") or res.get("profit")
+                    self._append_trade_log(
+                        symbol=symbol,
+                        action=action,
+                        decision=decision,
+                        quantity=0,
+                        entry_price=current_price,
+                        result=(res.get("status") if isinstance(res, dict) else str(res)),
+                        pnl=pnl,
+                    )
+                except Exception:
+                    pass
 
             elif action == "HOLD":
                 # 持有
@@ -574,6 +670,61 @@ class TradingBot:
             symbol, quantity, current_price
         )
         return quantity
+
+    def _append_trade_log(
+        self,
+        symbol: str,
+        action: str,
+        decision: Dict[str, Any],
+        quantity: float,
+        entry_price: float,
+        result: str,
+        pnl: Optional[float],
+    ):
+        """将交易信息追加到 CSV 日志，便于离线统计"""
+        try:
+            logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            csv_path = os.path.join(logs_dir, "trade_log.csv")
+            header = [
+                "timestamp",
+                "symbol",
+                "action",
+                "confidence",
+                "leverage",
+                "position_percent",
+                "quantity",
+                "entry_price",
+                "take_profit",
+                "stop_loss",
+                "result",
+                "pnl",
+                "reason",
+            ]
+            exists = os.path.exists(csv_path)
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not exists:
+                    writer.writerow(header)
+                writer.writerow(
+                    [
+                        datetime.now().isoformat(),
+                        symbol,
+                        action,
+                        decision.get("confidence"),
+                        decision.get("leverage"),
+                        decision.get("position_percent"),
+                        quantity,
+                        entry_price,
+                        decision.get("take_profit_percent"),
+                        decision.get("stop_loss_percent"),
+                        result,
+                        pnl,
+                        decision.get("reason"),
+                    ]
+                )
+        except Exception as e:
+            print(f"⚠️ 写入交易日志失败: {e}")
 
     def _close_position(self, symbol: str, decision: Dict[str, Any]):
         """平仓"""
@@ -742,8 +893,20 @@ class TradingBot:
                 cycle_log.append(note_line)
                 print(note_line)
 
+        # 规则策略模式（单币种逐个分析）
+        if self.strategy_mode == "V5_RULE":
+            for symbol in symbols:
+                symbol_sep = f"\n--- {symbol} ---"
+                cycle_log.append(symbol_sep)
+                print(symbol_sep)
+
+                market_data = self.get_market_data_for_symbol(symbol)
+                decision = self.analyze_with_strategy(symbol, market_data)
+                self.save_decision(symbol, decision, market_data)
+                self.execute_decision(symbol, decision, market_data)
+
         # 方式1：多币种一次性分析（优化）
-        if len(symbols) > 1:
+        elif len(symbols) > 1:
             # 收集所有币种的数据
             all_symbols_data = {}
             for symbol in symbols:
