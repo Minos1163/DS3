@@ -61,7 +61,7 @@ class PromptBuilder:
 - 最大仓位: {self.config['trading'].get('max_position_percent', 30)}%
 - 预留资金: {self.config['trading'].get('reserve_percent', 20)}%
 
-### 风险控制
+- ### 风险控制
 - 最大每日亏损: {self.config['risk'].get('max_daily_loss_percent', 10)}%
 - 最大连续亏损: {self.config['risk'].get('max_consecutive_losses', 5)}次
 - 建议止损: -{self.config['risk'].get('stop_loss_default_percent', 2) * 100}%
@@ -198,7 +198,7 @@ class PromptBuilder:
         account_summary: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        f"""
+        """
         构建多币种统一分析提示词
 
         Args:
@@ -211,9 +211,11 @@ class PromptBuilder:
             完整的多币种提示词
         """
         prompt = f"""
-    你是一位专业的日内交易员，需要同时分析多个币种并给出每个币种的独立交易决策。
+你是一位专业的日内交易员，需要同时分析多个币种并给出每个币种的独立交易决策。
 
-    当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**【输出格式】你必须以纯JSON格式回复，不要包含任何解释、注释或额外文本。**
+
+当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     ## 交易账户
     - 账户类型: Binance U本位永续合约
@@ -245,7 +247,9 @@ class PromptBuilder:
 
     请综合分析市场数据，为每个币种给出独立决策。
 
-    请严格按照以下JSON格式回复（不要有任何额外文本）：
+    **【关键】请直接输出JSON，不要有任何前缀、后缀、解释或markdown代码块标记。**
+
+    JSON格式示例：
     {{
         "BTCUSDT": {{
             "action": "BUY_OPEN",
@@ -275,6 +279,11 @@ class PromptBuilder:
             "stop_loss_percent": 0
         }}
     }}
+
+    ⚠️ 重要格式要求：
+    1. JSON的键必须是完整的交易对名称（如TRUMPUSDT），不要使用TRUMP/USDT或TRUMP这种格式
+    2. 确保响应只包含纯JSON，不要有任何额外的文本、说明或推理过程
+    3. 必须为每个输入的交易对都返回决策
 
     ### 字段说明
     - action: BUY_OPEN(开多) | SELL_OPEN(开空) | CLOSE(平仓) | HOLD(观望)

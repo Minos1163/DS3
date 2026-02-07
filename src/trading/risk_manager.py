@@ -45,16 +45,19 @@ class RiskManager:
         position_percent = position_value / total_equity if total_equity > 0 else 0
 
         # 检查最小仓位（允许等于最小值）
-        if position_percent < min_percent:
-            return False, f"仓位过小（{position_percent *
-                                  100:.1f}% < 最小要求{min_percent *
-                                                   100:.0f}%）"
+        # 为了避免浮点运算的微小误差导致等于边界时被误判为过小，加入微小容差
+        tol = 1e-6
+        if position_percent + tol < min_percent:
+            return False, (
+                f"仓位过小（{position_percent * 100:.1f}% < 最小要求{min_percent * 100:.0f}%）"
+            )
 
         # 检查最大仓位
-        if position_percent > max_percent:
-            return False, f"仓位过大（{position_percent *
-                                  100:.1f}% > 最大限制{max_percent *
-                                                   100:.0f}%）"
+        # 检查最大仓位（也加入容差以避免边界误判）
+        if position_percent > max_percent + tol:
+            return False, (
+                f"仓位过大（{position_percent * 100:.1f}% > 最大限制{max_percent * 100:.0f}%）"
+            )
 
         # 检查预留资金
         used_margin = position_value  # 简化
@@ -78,7 +81,23 @@ class RiskManager:
             self.last_reset_date = current_date
 
         risk_config = self.config.get("risk", {})
-        max_loss_percent = risk_config.get("max_daily_loss_percent", 10) / 100
+        # Accept flexible config formats for max_daily_loss_percent:
+        # - Common legacy: 10  (means 10%)
+        # - Decimal percentage: 0.2 (user may intend 20%)
+        # - Fraction: 0.002 (means 0.2%)
+        # Heuristic: if value > 1 -> treat as percent (divide by 100).
+        # Otherwise treat the value as the fractional percentage directly (0.2 => 20%).
+        raw_max = risk_config.get("max_daily_loss_percent", 10)
+        try:
+            raw_val = float(raw_max)
+        except Exception:
+            raw_val = 10.0
+
+        if raw_val > 1.0:
+            max_loss_percent = raw_val / 100.0
+        else:
+            # raw_val <= 1.0: interpret directly as fraction of 1.0 (0.2 => 20%)
+            max_loss_percent = raw_val
 
         if self.daily_start_balance == 0:
             self.daily_start_balance = current_balance

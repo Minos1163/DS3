@@ -112,8 +112,19 @@ class ConfigLoader:
     def get_risk_limits(config: Dict[str, Any]) -> Dict[str, float]:
         """获取风险限制配置"""
         risk = config.get("risk", {})
+        # 与 RiskManager 保持一致：接收两种格式，优先解释为整数百分比
+        raw_max = risk.get("max_daily_loss_percent", 10)
+        try:
+            rv = float(raw_max)
+        except Exception:
+            rv = 10.0
+        if rv > 1.0:
+            max_daily_loss_pct = rv / 100.0
+        else:
+            max_daily_loss_pct = rv
+
         return {
-            "max_daily_loss_percent": risk.get("max_daily_loss_percent", 10) / 100,
+            "max_daily_loss_percent": max_daily_loss_pct,
             "max_consecutive_losses": risk.get("max_consecutive_losses", 5),
             "stop_loss_default_percent": risk.get("stop_loss_default_percent", 2) / 100,
             "take_profit_default_percent": risk.get("take_profit_default_percent", 5)
