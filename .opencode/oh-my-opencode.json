@@ -1,0 +1,14 @@
+{
+  "agents": {
+    "sisyphus": { "model": "github-copilot/claude-opus-4.5" },
+    "oracle": { "model": "github-copilot/gpt-5.2" },
+    "librarian": { "model": "zai-coding-plan/glm-4.7" },
+    "multimodal-looker": { "model": "google/antigravity-gemini-3-flash" }
+  },
+  "mcp_overrides": {
+    "playwright": {
+      "mcp": "playwright",
+      "capabilities": ["screenshot", "form_fill", "oauth_flow"]
+    }
+  }
+}
