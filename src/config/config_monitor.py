@@ -51,7 +51,7 @@ class ConfigMonitor:
         self.current_symbols = self.current_config.get("trading", {}).get("symbols", [])
 
     def check_for_updates(self) -> Dict[str, Any]:
-        f"""
+        """
         检查配置文件是否有更新
 
         Returns:

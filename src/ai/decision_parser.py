@@ -69,10 +69,10 @@ class DecisionParser:
         defaults = {
             "action": "HOLD",
             "confidence": 0.5,
-            "leverage": 3,
-            "position_percent": 15,
+            "leverage": 10,
+            "position_percent": 30,
             "take_profit_percent": 5.0,
-            "stop_loss_percent": -2.0,
+            "stop_loss_percent": -1.5,
             "reason": "默认持有",
         }
 
@@ -184,8 +184,23 @@ class DecisionParser:
             # 解析JSON
             all_decisions = json.loads(response)
 
-            # 为每个币种应用默认值
+            # 打印原始键名用于调试
+            print(f"🔍 AI返回的键名: {list(all_decisions.keys())}")
+
+            # 归一化键名：将 TRUMP/USDT、TRUMP 等格式统一为 TRUMPUSDT
+            normalized_decisions = {}
             for symbol, decision in all_decisions.items():
+                # 移除斜杠和空格
+                normalized_symbol = symbol.replace("/", "").replace(" ", "")
+                # 如果不以USDT结尾，添加USDT
+                if not normalized_symbol.endswith("USDT"):
+                    normalized_symbol = normalized_symbol + "USDT"
+                normalized_decisions[normalized_symbol] = decision
+
+            print(f"✅ 归一化后的键名: {list(normalized_decisions.keys())}")
+
+            # 为每个币种应用默认值
+            for symbol, decision in normalized_decisions.items():
                 if isinstance(decision, dict):
                     # 特殊处理 confidence：如果是字符串，转换为数字
                     if "confidence" in decision and isinstance(
@@ -201,9 +216,9 @@ class DecisionParser:
                         else:
                             decision["confidence"] = 0.5
 
-                    all_decisions[symbol] = DecisionParser.apply_defaults(decision)
+                    normalized_decisions[symbol] = DecisionParser.apply_defaults(decision)
 
-            return all_decisions
+            return normalized_decisions
 
         except json.JSONDecodeError as e:
             print(f"⚠️ 多币种JSON解析失败: {e}")

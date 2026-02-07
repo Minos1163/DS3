@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests  # type: ignore
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from src.api.market_gateway import MarketGateway
 from src.trading import position_state_machine
@@ -13,6 +15,7 @@ from src.trading.event_router import ExchangeEventRouter
 from src.trading.intents import PositionSide as IntentPositionSide
 from src.trading.intents import TradeIntent
 from src.trading.order_gateway import OrderGateway
+from src.trading.tp_sl import PapiTpSlManager, TpSlConfig
 
 
 class ApiCapability(Enum):
@@ -52,14 +55,71 @@ class BinanceBroker:
 
         self._hedge_mode_cache: Optional[Tuple[bool, float]] = None
         self._HEDGE_MODE_CACHE_TTL = 10.0
+        self._time_offset_ms: int = 0
+        self._time_offset_updated_at: float = 0.0
+        self._TIME_OFFSET_TTL = 60.0
+        
+        # 设置 requests 会话重试策略
+        self._session = requests.Session()
+        self._proxies = self._load_proxies()
+        self._disable_env_proxy = os.getenv("BINANCE_DISABLE_PROXY") == "1"
+        self._proxy_fallback = os.getenv("BINANCE_PROXY_FALLBACK") == "1"
+        self._force_direct = os.getenv("BINANCE_FORCE_DIRECT") == "1"
+        self._session.trust_env = not self._disable_env_proxy
+        retry_strategy = Retry(
+            total=3,  # 最多重试 3 次
+            backoff_factor=0.5,  # 重试延迟：0.5s, 1s, 2s
+            status_forcelist=[429, 500, 502, 503, 504],  # 重试这些状态码
+            allowed_methods=["GET", "POST", "PUT", "DELETE"],  # SSL/连接错误会自动重试
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+
+        # 初始化时间偏移（避免 -1021 时间戳超前/滞后）
+        self._sync_time_offset(force=True)
+
+    def _load_proxies(self) -> Optional[Dict[str, str]]:
+        proxy = os.getenv("BINANCE_PROXY")
+        http_proxy = os.getenv("BINANCE_HTTP_PROXY")
+        https_proxy = os.getenv("BINANCE_HTTPS_PROXY")
+
+        if proxy:
+            return {"http": proxy, "https": proxy}
+        proxies = {}
+        if http_proxy:
+            proxies["http"] = http_proxy
+        if https_proxy:
+            proxies["https"] = https_proxy
+        return proxies or None
+
+    def _is_proxy_related_error(self, error: Exception) -> bool:
+        if isinstance(error, requests.exceptions.ProxyError):
+            return True
+        message = str(error).lower()
+        return "proxy" in message
+
+    def get_connection_mode(self) -> str:
+        """返回当前连接模式（代理/直连）"""
+        if self._force_direct or self._disable_env_proxy:
+            return "直连"
+        if self._proxies:
+            return f"代理({list(self._proxies.values())[0]})"
+        return "系统代理"
+
+    def get_forced_account_mode(self) -> Optional[str]:
+        forced_mode = os.getenv("BINANCE_ACCOUNT_MODE", "").strip().upper()
+        if forced_mode in {"UNIFIED", "CLASSIC"}:
+            return forced_mode
+        return None
 
     def _headers(self) -> Dict[str, str]:
         return {"X-MBX-APIKEY": self.api_key}
 
     def _signed_params(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = dict(params or {})
-        payload.setdefault("recvWindow", 5000)
-        payload["timestamp"] = int(time.time() * 1000)
+        payload.setdefault("recvWindow", 10000)
+        payload["timestamp"] = int(time.time() * 1000) + self._get_time_offset_ms()
 
         # 转换为精确字符串，避免科学计数法
         norm = {}
@@ -93,6 +153,47 @@ class BinanceBroker:
             return "{:.10f}".format(float(v)).rstrip("0").rstrip(".")
         return str(v)
 
+    def _get_time_offset_ms(self) -> int:
+        now = time.time()
+        if now - self._time_offset_updated_at > self._TIME_OFFSET_TTL:
+            self._sync_time_offset(force=True)
+        return self._time_offset_ms
+
+    def _sync_time_offset(self, force: bool = False) -> None:
+        if not force and (time.time() - self._time_offset_updated_at) <= self._TIME_OFFSET_TTL:
+            return
+        try:
+            url = f"{self.MARKET_BASE}/fapi/v1/time"
+            resp = self._session.request("GET", url, timeout=self.timeout)
+            data = resp.json()
+            server_time = int(data.get("serverTime", 0))
+            if server_time > 0:
+                local_time = int(time.time() * 1000)
+                self._time_offset_ms = server_time - local_time
+                self._time_offset_updated_at = time.time()
+        except Exception:
+            # 保留上一次时间偏移，避免因同步失败而中断请求
+            self._time_offset_updated_at = time.time()
+
+    def _is_timestamp_error(self, resp: requests.Response) -> bool:
+        try:
+            data = resp.json()
+        except Exception:
+            return False
+        return str(data.get("code")) == "-1021"
+
+    def _is_html_error(self, resp: requests.Response) -> bool:
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if "text/html" in content_type:
+            return True
+        try:
+            text = resp.text.lower()
+            if "<html" in text and "binance.com/en/error" in text:
+                return True
+        except Exception:
+            return False
+        return False
+
     def request(
         self,
         method: str,
@@ -113,35 +214,176 @@ class BinanceBroker:
             input_params.pop("reduce_only", None)
             # 保持 quantity 字段，PAPI 全仓平仓需要这个参数
 
-        payload = self._signed_params(input_params) if signed else input_params
+        # 如果目标是 PAPI 下单端点，则强制移除 reduceOnly（某些 PAPI 版本会拒绝此参数）
+        try:
+            if isinstance(url, str) and url.startswith(self.PAPI_BASE):
+                input_params.pop("reduceOnly", None)
+                input_params.pop("reduce_only", None)
+        except Exception:
+            pass
+
+        # NOTE: payload must be (re)computed each attempt because timestamp/signature
+        # depends on current time offset which may be resynced on -1021 errors.
         headers = self._headers()
         is_papi = url.startswith(self.PAPI_BASE)
         method_upper = method.upper()
-        if is_papi and method_upper in {"POST", "PUT", "DELETE"}:
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-            resp = requests.request(
-                method,
-                url,
-                data=payload,
-                headers=headers,
-                timeout=self.timeout,
-            )
-        else:
-            resp = requests.request(
-                method,
-                url,
-                params=payload,
-                headers=headers,
-                timeout=self.timeout,
-            )
+        
+        # 自动重试连接错误和超时
+        max_retries = 3
+        retry_delay = 1
+        last_exception = None
+        fallback_used = False
+        timestamp_retry_limit = 3
+        timestamp_retry_count = 0
+        
+        for attempt in range(max_retries):
+            # recompute payload on each attempt to refresh timestamp/signature
+            payload = self._signed_params(input_params) if signed else dict(input_params)
+            try:
+                request_kwargs = {
+                    "headers": headers,
+                    "timeout": self.timeout,
+                    "proxies": None if self._force_direct else self._proxies,
+                }
 
-        if not allow_error:
-            if resp.status_code >= 400:
-                # 避免一行过长，分开打印状态码和消息
-                print("❌ Binance Error (%s):" % (resp.status_code,))
-                print(resp.text)
-            resp.raise_for_status()
-        return resp
+                if is_papi and method_upper in {"POST", "PUT", "DELETE"}:
+                    headers["Content-Type"] = "application/x-www-form-urlencoded"
+                    resp = self._session.request(
+                        method,
+                        url,
+                        data=payload,
+                        **request_kwargs,
+                    )
+                else:
+                    resp = self._session.request(
+                        method,
+                        url,
+                        params=payload,
+                        **request_kwargs,
+                    )
+
+                if not allow_error:
+                    if self._is_html_error(resp) and not fallback_used:
+                        fallback_used = True
+                        print("⚠️ 检测到 HTML 错误页，可能被代理重定向，尝试直连重试一次...")
+                        trust_env_original = self._session.trust_env
+                        self._session.trust_env = False
+                        try:
+                            fallback_kwargs = {
+                                "headers": headers,
+                                "timeout": self.timeout,
+                                "proxies": None,
+                            }
+                            if is_papi and method_upper in {"POST", "PUT", "DELETE"}:
+                                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                                resp = self._session.request(
+                                    method,
+                                    url,
+                                    data=payload,
+                                    **fallback_kwargs,
+                                )
+                            else:
+                                resp = self._session.request(
+                                    method,
+                                    url,
+                                    params=payload,
+                                    **fallback_kwargs,
+                                )
+                            if resp.status_code < 400:
+                                self._force_direct = True
+                                print("✅ 直连成功，后续请求固定直连")
+                                return resp
+                        finally:
+                            self._session.trust_env = trust_env_original
+                    if resp.status_code == 400 and self._is_timestamp_error(resp):
+                        print("⚠️ 检测到时间戳偏差(-1021)，正在同步服务器时间并重试...")
+                        self._sync_time_offset(force=True)
+                        timestamp_retry_count += 1
+                        current_recv = input_params.get("recvWindow")
+                        try:
+                            current_recv_val = int(current_recv) if current_recv is not None else 0
+                        except (TypeError, ValueError):
+                            current_recv_val = 0
+                        if current_recv_val < 60000:
+                            input_params["recvWindow"] = 60000
+                        if timestamp_retry_count >= timestamp_retry_limit:
+                            raise RuntimeError(
+                                "时间戳偏差(-1021)仍然存在，已重试多次。"
+                            )
+                        continue
+                    if resp.status_code >= 400:
+                        # 避免一行过长，分开打印状态码和消息
+                        print("❌ Binance Error (%s):" % (resp.status_code,))
+                        print(resp.text)
+                    resp.raise_for_status()
+                return resp
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.SSLError,
+                requests.exceptions.ProxyError,
+            ) as e:
+                last_exception = e
+                if (
+                    self._proxy_fallback
+                    and not fallback_used
+                    and self._is_proxy_related_error(e)
+                ):
+                    fallback_used = True
+                    print("⚠️ 代理异常，尝试直连重试一次...")
+                    trust_env_original = self._session.trust_env
+                    self._session.trust_env = False
+                    try:
+                        fallback_kwargs = {
+                            "headers": headers,
+                            "timeout": self.timeout,
+                            "proxies": None,
+                        }
+                        if is_papi and method_upper in {"POST", "PUT", "DELETE"}:
+                            headers["Content-Type"] = "application/x-www-form-urlencoded"
+                            resp = self._session.request(
+                                method,
+                                url,
+                                data=payload,
+                                **fallback_kwargs,
+                            )
+                        else:
+                            resp = self._session.request(
+                                method,
+                                url,
+                                params=payload,
+                                **fallback_kwargs,
+                            )
+
+                        if not allow_error:
+                            if resp.status_code >= 400:
+                                print("❌ Binance Error (%s):" % (resp.status_code,))
+                                print(resp.text)
+                            resp.raise_for_status()
+                        # 直连成功后固定直连（后续请求不再使用代理）
+                        self._force_direct = True
+                        print("✅ 直连成功，后续请求固定直连")
+                        return resp
+                    except Exception as fallback_error:
+                        # 直连失败，恢复代理配置继续重试
+                        print(f"❌ 直连失败: {fallback_error}，恢复代理继续重试...")
+                        self._force_direct = False
+                        last_exception = fallback_error
+                    finally:
+                        self._session.trust_env = trust_env_original
+                if attempt < max_retries - 1:
+                    print(f"⚠️ 连接错误（第{attempt + 1}次），等待 {retry_delay}s 后重试...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    print(f"❌ 连接失败（已尝试 {max_retries} 次）")
+                    raise
+
+        if last_exception is not None:
+            raise last_exception
+        raise RuntimeError("请求失败，未知原因")
 
     def _detect_api_capability(self) -> ApiCapability:
         try:
@@ -154,8 +396,11 @@ class BinanceBroker:
         return ApiCapability.PAPI_ONLY
 
     def _detect_account_mode(self) -> AccountMode:
+        forced_mode = os.getenv("BINANCE_ACCOUNT_MODE", "").strip().upper()
+        if forced_mode in {"UNIFIED", "CLASSIC"}:
+            return AccountMode[forced_mode]
         try:
-            url = f"{self.PAPI_BASE}/papi/v1/um/account"
+            url = f"{self.PAPI_BASE}/papi/v1/account"
             resp = self.request("GET", url, signed=True, allow_error=True)
             if resp.status_code == 200:
                 return AccountMode.UNIFIED
@@ -365,6 +610,10 @@ class BinanceClient:
 
         # 使用两个参数避免超过行长限制
         print("[Client] 初始化完成 | 模式:", self.broker.account_mode.value)
+        print("[Client] 连接模式:", self.broker.get_connection_mode())
+        forced_mode = self.broker.get_forced_account_mode()
+        if forced_mode:
+            print("[Client] 强制账户模式:", forced_mode)
 
     def execute_intent(self, intent: TradeIntent) -> Dict[str, Any]:
         """唯一交易入口"""
@@ -474,6 +723,22 @@ class BinanceClient:
             signed=True,
         ).json()
 
+    def cancel_all_conditional_orders(self, symbol: str):
+        """撤销某个币种的所有条件单（STOP/TAKE_PROFIT）"""
+        base = self.broker.um_base()
+        if "papi" in base:
+            path = "/papi/v1/um/conditional/all"
+            url = f"{base}{path}"
+            return self.broker.request(
+                "DELETE",
+                url,
+                params={"symbol": symbol},
+                signed=True,
+            ).json()
+
+        # 非 PAPI 模式：使用 allOpenOrders 统一撤销（包含条件单）
+        return self.cancel_all_open_orders(symbol)
+
     def get_open_orders(self, symbol: Optional[str] = None):
         return self._order_gateway.query_open_orders(symbol)
 
@@ -515,6 +780,41 @@ class BinanceClient:
                 "tp": tp,
                 "sl": sl,
             }
+
+        # 🔥 优先使用position的实际entryPrice，而非ticker的lastPrice
+        # 因为开仓后立即设置保护单时，ticker价格可能与实际成交价不同
+        entry_price = 0.0
+        pos = self.get_position(symbol, side=side.value)
+        if pos and abs(float(pos.get("positionAmt", 0))) > 0:
+            entry_price = float(pos.get("entryPrice", 0))
+
+        # 如果没有position或entryPrice为0，则使用ticker的lastPrice作为fallback
+        if entry_price <= 0:
+            try:
+                ticker = self.get_ticker(symbol)
+                entry_price = float(ticker.get("lastPrice", 0)) if ticker else 0.0
+            except Exception:
+                entry_price = 0.0
+
+        # 校验entry_price是否有效
+        if entry_price <= 0:
+            return {
+                "status": "error",
+                "message": f"Invalid entry_price for {symbol}: {entry_price}. Cannot place protection orders.",
+                "orders": []
+            }
+
+        if self.broker.is_papi_only():
+            manager = PapiTpSlManager(self.broker)
+            cfg = TpSlConfig(
+                symbol=symbol,
+                position_side=side.value,
+                entry_price=entry_price,
+                stop_loss_price=sl,
+                take_profit_price=tp,
+            )
+            results = manager.place_tp_sl(cfg)
+            return {"status": "success", "orders": results}
 
         results = self._order_gateway.place_protection_orders(
             symbol=symbol,

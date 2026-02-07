@@ -177,10 +177,6 @@ class PositionStateMachineV2:
             "quantity": intent.quantity,
         }
 
-        # 避免过长行，分开打印 intent/order_type
-        print("[DEBUG _open] intent.order_type=", intent.order_type)
-        print("[DEBUG _open] order_type=", order_type)
-
         # Hedge 模式下必须带 positionSide
         if self.client.broker.get_hedge_mode():
             params["positionSide"] = intent.side.value
@@ -196,15 +192,12 @@ class PositionStateMachineV2:
         # 🔥 关键修复：检查订单是否真的成功或已存在仓位
         # 如果API返回错误，立即返回错误，不创建/更新快照
         if result.get("status") == "error":
-            print(f"[DEBUG _open] API返回错误，不创建快照: {result}")
             return result
 
         # 如果下单返回特殊警告（下单失败但交易所已有仓位），视为成功——从交易所读取真实仓位并建立快照
         warn_flag = result.get("warning") == "order_failed_but_position_exists"
         pos_exists_flag = result.get("position_exists") is True
         if warn_flag or pos_exists_flag:
-            msg = "[DEBUG _open] 订单返回已存在仓位警告，尝试从交易所读取持仓并建立快照"
-            print(msg, result)
             # 根据 intent.side 确定查询方向
             pos_check_side = intent.side.value if intent.side else None
             pos = self.client.get_position(intent.symbol, side=pos_check_side)
@@ -224,7 +217,6 @@ class PositionStateMachineV2:
                 ):
                     existing_snapshot.quantity = amt
                     existing_snapshot.last_update_ts = time.time()
-                    print("[DEBUG _open] 更新已存在快照:", snap_side, amt)
                 else:
                     snap = PositionSnapshot(
                         symbol=intent.symbol,
@@ -234,7 +226,6 @@ class PositionStateMachineV2:
                         last_update_ts=time.time(),
                     )
                     self.snapshots[intent.symbol] = snap
-                    print("[DEBUG _open] 创建新快照:", snap_side, snap.quantity)
 
                 # 如果开仓意图自带保护，则尝试设置保护
                 if intent.take_profit or intent.stop_loss:
@@ -253,7 +244,6 @@ class PositionStateMachineV2:
                 }
 
             # 无法从交易所确认仓位，视为可疑失败
-            print("[DEBUG _open] 警告表明仓位存在但查询失败:", result)
             return {
                 "status": "error",
                 "message": "订单失败且无法确认交易所持仓",
@@ -262,7 +252,6 @@ class PositionStateMachineV2:
 
         # 检查是否有 orderId 或其他成功标识
         if "orderId" not in result and result.get("dry_run") is not True:
-            print("[DEBUG _open] 订单结果可疑，未包含 orderId:", result)
             return {"status": "error", "message": "订单响应缺少 orderId"}
 
         # 🔥 只有在订单真正成功时，才更新状态快照
@@ -271,12 +260,6 @@ class PositionStateMachineV2:
             # 已有同向仓位，增加数量
             existing_snapshot.quantity += float(intent.quantity)
             existing_snapshot.last_update_ts = time.time()
-            print(
-                "[DEBUG _open] 已有同向仓位",
-                intent.side,
-                "增加数量到",
-                existing_snapshot.quantity,
-            )
         else:
             # 新仓位
             snap = PositionSnapshot(
@@ -287,7 +270,6 @@ class PositionStateMachineV2:
                 last_update_ts=time.time(),
             )
             self.snapshots[intent.symbol] = snap
-            print("[DEBUG _open] 创建新快照:", intent.side, snap.quantity)
 
         # 如果开仓意图自带保护，则立即执行
         if intent.take_profit or intent.stop_loss:
@@ -389,7 +371,7 @@ class PositionStateMachineV2:
             for order in result.get("orders", []):
                 # 如果下单失败（比如价格太近），order 会包含 code
                 if "orderId" in order:
-                    otype = order.get("type", "")
+                    otype = order.get("type") or order.get("strategyType", "")
                     if "TAKE_PROFIT" in otype:
                         tp_id = order["orderId"]
                     elif "STOP" in otype:
@@ -416,9 +398,15 @@ class PositionStateMachineV2:
         🔥 重要修正：PAPI 全仓平仓使用 closePosition=True 且必须带 quantity
         部分平仓使用 quantity + reduceOnly=True
         """
-        # 无论是否有快照，先清理挂单
+        # 无论是否有快照，先清理条件单 + 挂单（避免遗留未触发止盈止损）
         try:
-            self.client.cancel_all_open_orders(intent.symbol)
+            self.client.cancel_all_conditional_orders(intent.symbol)
+        except Exception:
+            pass
+        try:
+            # PAPI 条件单与普通挂单分离；非 PAPI 已在 conditional 中统一撤销
+            if "papi" in self.client.broker.um_base():
+                self.client.cancel_all_open_orders(intent.symbol)
         except Exception:
             pass
 
@@ -444,14 +432,11 @@ class PositionStateMachineV2:
             order_side = "SELL" if amt > 0 else "BUY"
 
         # 🔥 核心逻辑：全仓平仓必须带 quantity
-        print("[DEBUG _close] intent.quantity=", intent.quantity, "amt=", amt)
         is_full_close = (
             intent.quantity is None
             or intent.quantity == 0
             or abs(intent.quantity - abs(amt)) < 1e-8
         )
-        print("[DEBUG _close] is_full_close=", is_full_close)
-
         if is_full_close:
             # 全仓平仓：带 quantity 和 closePosition=True
             order_type = intent.order_type if intent.order_type else "MARKET"
@@ -462,7 +447,6 @@ class PositionStateMachineV2:
                 "closePosition": True,
                 "quantity": quantity,
             }
-            print("[DEBUG _close] Full close params:", params)
             reduce_only = False
         else:
             # 部分平仓：使用 quantity + reduceOnly=True

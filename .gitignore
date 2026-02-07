@@ -72,3 +72,6 @@ package-lock.json
 trading_config.*.json
 config_*.json
 !trading_config.json  # 但保留默认配置模板
+# Tools folder for moved scripts
+tools/
+__pycache__/

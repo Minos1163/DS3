@@ -19,7 +19,7 @@ class PositionDataManager:
         self.client = client
 
     def get_current_position(self, symbol: str) -> Optional[Dict[str, Any]]:
-        f"""
+        """
         获取当前持仓
 
         Returns:
@@ -80,7 +80,7 @@ class PositionDataManager:
             return None
 
     def get_all_positions(self) -> Dict[str, Dict[str, Any]]:
-        f"""
+        """
         获取所有持仓
 
         Returns:

@@ -30,14 +30,28 @@ class V5Strategy:
 
         self.volume_multiplier = strategy.get("volume_multiplier", 1.10)
         self.use_volume_quantile_filter = strategy.get("use_volume_quantile_filter", True)
-        self.volume_quantile = strategy.get("volume_quantile", 0.38)
-        self.short_volume_quantile = strategy.get("short_volume_quantile", 0.55)
+        # 更激进的默认量能阈值（实验B2）：降低多头量能门槛以增加多头触发
+        self.volume_quantile = strategy.get("volume_quantile", 0.30)
+        self.short_volume_quantile = strategy.get("short_volume_quantile", 0.45)
         self.volume_window = strategy.get("volume_window", 60)
 
         self.use_time_filter = strategy.get("use_time_filter", True)
         self.allowed_hours = strategy.get("allowed_hours_utc", [5, 22])
         # 可配置的默认持有信心度，默认与AI最小阈值保持一致，避免规则策略频繁被误判为低信心
         self.hold_confidence = strategy.get("hold_confidence", 0.6)
+
+        # 大趋势过滤与偏置（牛/熊）
+        self.trend_filter_enabled = bool(strategy.get("trend_filter_enabled", True))
+        self.trend_timeframe = strategy.get("trend_timeframe", "4h")
+        self.trend_ema_fast = int(strategy.get("trend_ema_fast", 20))
+        self.trend_ema_slow = int(strategy.get("trend_ema_slow", 50))
+        # 牛/熊市下的 RSI 阈值调整（正数=放宽，负数=收紧）
+        self.bull_long_rsi_adjust = float(strategy.get("bull_long_rsi_adjust", 3))
+        self.bull_short_rsi_adjust = float(strategy.get("bull_short_rsi_adjust", 3))
+        self.bear_long_rsi_adjust = float(strategy.get("bear_long_rsi_adjust", -3))
+        self.bear_short_rsi_adjust = float(strategy.get("bear_short_rsi_adjust", -3))
+        # 在不利趋势下增加额外趋势确认
+        self.regime_extra_filter_enabled = bool(strategy.get("regime_extra_filter_enabled", True))
 
     def decide(
         self,
@@ -75,10 +89,28 @@ class V5Strategy:
         volume_q = float(last["volume_q"]) if not pd.isna(last["volume_q"]) else None
         volume_q_short = float(last["volume_q_short"]) if "volume_q_short" in last and not pd.isna(last["volume_q_short"]) else None
 
+        regime = self._detect_market_regime(market_data) if self.trend_filter_enabled else "NEUTRAL"
+        if regime == "BULL":
+            long_rsi_thr = self.rsi_oversold + self.bull_long_rsi_adjust
+            short_rsi_thr = self.short_rsi_overbought + self.bull_short_rsi_adjust
+        elif regime == "BEAR":
+            long_rsi_thr = self.rsi_oversold + self.bear_long_rsi_adjust
+            short_rsi_thr = self.short_rsi_overbought + self.bear_short_rsi_adjust
+        else:
+            long_rsi_thr = self.rsi_oversold
+            short_rsi_thr = self.short_rsi_overbought
+
+        long_requires_uptrend = regime == "BEAR" and self.regime_extra_filter_enabled
+        short_requires_downtrend = regime == "BULL" and self.regime_extra_filter_enabled
+
+        # 区分多头/空头的量能门槛：对多头适度放宽量能要求以增加多头机会
         if self.use_volume_quantile_filter and volume_q is not None:
             volume_ok = volume >= volume_q
+            # 激进放宽：多头使用更低门槛（volume_q * 0.85）
+            volume_ok_long = volume >= (volume_q * 0.85)
         else:
             volume_ok = volume_ma > 0 and volume > (volume_ma * self.volume_multiplier)
+            volume_ok_long = volume_ma > 0 and volume > (volume_ma * (self.volume_multiplier * 0.85))
 
         current_price = market_data.get("realtime", {}).get("price") or close
 
@@ -86,28 +118,30 @@ class V5Strategy:
             return self._exit_decision_if_needed(position, current_price, rsi)
 
         # 做多信号
+        # 激进放宽多头入场：移除对 EMA5>EMA20 的必要性，允许接近下轨且满足 RSI/MACD/量能时开多
         if (
-            rsi < self.rsi_oversold
-            and ema_5 > ema_20
-            and close > ma_20
+            rsi < long_rsi_thr
+            and close <= bb_lower * 1.03
             and macd_hist > 0
-            and volume_ok
+            and volume_ok_long
+            and (not long_requires_uptrend or (ema_5 > ema_20 and close > ma_20))
         ):
             return self._entry_decision(
                 action="BUY_OPEN",
-                reason=f"V5多头: RSI{rsi:.1f}< {self.rsi_oversold}, EMA5>EMA20, MACD柱>0, 量能满足",
+                reason=f"V5多头: RSI{rsi:.1f}< {long_rsi_thr}, MACD柱>0, 量能满足, 趋势:{regime}",
             )
 
+        # 第二类多头信号也移除对 EMA 的硬性要求
         if (
-            ema_5 > ema_20
-            and macd_hist > 0
+            macd_hist > 0
             and close <= bb_lower * 1.02
             and close > ma_20 * 0.98
-            and volume_ok
+            and volume_ok_long
+            and (not long_requires_uptrend or (ema_5 > ema_20 and close > ma_20))
         ):
             return self._entry_decision(
                 action="BUY_OPEN",
-                reason="V5多头: 金叉+MACD向上+接近下轨+趋势确认+量能",
+                reason=f"V5多头: 金叉+MACD向上+接近下轨+趋势确认+量能, 趋势:{regime}",
             )
 
         # 做空信号
@@ -116,15 +150,16 @@ class V5Strategy:
             short_volume_ok = volume >= volume_q_short
 
         if (
-            rsi > self.short_rsi_overbought
+            rsi > short_rsi_thr
             and ema_5 < ema_20
             and close < ma_20
             and macd_hist < 0
             and short_volume_ok
+            and (not short_requires_downtrend or (ema_5 < ema_20 and close < ma_20))
         ):
             return self._entry_decision(
                 action="SELL_OPEN",
-                reason=f"V5空头: RSI{rsi:.1f}> {self.short_rsi_overbought}, EMA5<EMA20, MACD柱<0, 量能满足",
+                reason=f"V5空头: RSI{rsi:.1f}> {short_rsi_thr}, EMA5<EMA20, MACD柱<0, 量能满足, 趋势:{regime}",
             )
 
         if (
@@ -133,10 +168,11 @@ class V5Strategy:
             and close >= bb_upper * 0.995
             and close < ma_20 * 1.01
             and short_volume_ok
+            and (not short_requires_downtrend or (ema_5 < ema_20 and close < ma_20))
         ):
             return self._entry_decision(
                 action="SELL_OPEN",
-                reason="V5空头: 死叉+MACD向下+接近上轨+趋势确认+量能",
+                reason=f"V5空头: 死叉+MACD向下+接近上轨+趋势确认+量能, 趋势:{regime}",
             )
 
         return self._hold_decision("无入场信号")
@@ -205,6 +241,43 @@ class V5Strategy:
         multi = market_data.get("multi_timeframe", {})
         data_15m = multi.get("15m", {})
         return data_15m.get("dataframe")
+
+    def _get_timeframe_dataframe(self, market_data: Dict[str, Any], timeframe: str) -> Optional[pd.DataFrame]:
+        multi = market_data.get("multi_timeframe", {})
+        data = multi.get(timeframe, {})
+        df = data.get("dataframe") if isinstance(data, dict) else None
+        if df is not None:
+            return df
+        return None
+
+    def _detect_market_regime(self, market_data: Dict[str, Any]) -> str:
+        timeframe = str(self.trend_timeframe or "4h")
+        df = self._get_timeframe_dataframe(market_data, timeframe)
+        if df is None or len(df) < max(self.trend_ema_slow + 5, 60):
+            # fallback to 1h/1d if指定周期不可用
+            for tf in ("1h", "1d", "4h"):
+                df = self._get_timeframe_dataframe(market_data, tf)
+                if df is not None and len(df) >= max(self.trend_ema_slow + 5, 60):
+                    break
+
+        if df is None or len(df) < max(self.trend_ema_slow + 5, 60):
+            return "NEUTRAL"
+
+        close = df["close"]
+        ema_fast = close.ewm(span=self.trend_ema_fast, adjust=False).mean()
+        ema_slow = close.ewm(span=self.trend_ema_slow, adjust=False).mean()
+        last_close = float(close.iloc[-1])
+        last_fast = float(ema_fast.iloc[-1])
+        last_slow = float(ema_slow.iloc[-1])
+
+        if pd.isna(last_close) or pd.isna(last_fast) or pd.isna(last_slow):
+            return "NEUTRAL"
+
+        if last_close > last_fast > last_slow:
+            return "BULL"
+        if last_close < last_fast < last_slow:
+            return "BEAR"
+        return "NEUTRAL"
 
     def _compute_indicators(self, df: pd.DataFrame) -> None:
         close = df["close"]

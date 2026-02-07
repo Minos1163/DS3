@@ -1,4 +1,6 @@
 import dataclasses
+import os
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from src.api.binance_client import BinanceClient
@@ -23,6 +25,8 @@ class TradeExecutor:
         # 保持接口兼容性，接受 config 参数（但不使用）
         self.client = client
         self.state = client.state_machine
+        # 保存配置以支持可配置的回滚策略
+        self.config = config or {}
 
     # =========================
     # 核心执行入口（私有）
@@ -86,9 +90,6 @@ class TradeExecutor:
                             lifecycle=PositionLifecycle.OPEN,
                         )
                         self.state.snapshots[intent.symbol] = snap
-                        print(
-                            f"[DEBUG _execute_open] 捕获到异常但交易所显示已有仓位，已创建快照: {snap_side} {amt}"
-                        )
                         return {
                             "status": "success",
                             "open": {
@@ -110,9 +111,6 @@ class TradeExecutor:
                 # 如果状态机显示已有仓位，则视为成功（仅在无法直接从交易所确认时作为补偿性手段）
                 snap = self.state.snapshots.get(intent.symbol)
                 if snap and snap.is_open():
-                    print(
-                        f"[DEBUG _execute_open] 捕获到异常但状态机已发现仓位，视为成功: {msg}"
-                    )
                     return {
                         "status": "success",
                         "open": {
@@ -127,14 +125,153 @@ class TradeExecutor:
 
         # ===== TP / SL（只允许 OPEN）=====
         if intent.take_profit or intent.stop_loss:
-            self.client._execute_protection_v2(
-                symbol=intent.symbol,
-                side=intent.side,
-                tp=intent.take_profit,
-                sl=intent.stop_loss,
-            )
+            # 先尝试使用状态机返回的保护结果（避免重复下单）
+            protection = None
+            if isinstance(res, dict):
+                protection = res.get("protection")
+
+            # 若状态机未返回保护结果，则补发一次保护单
+            if protection is None:
+                protection = self.client._execute_protection_v2(
+                    symbol=intent.symbol,
+                    side=intent.side,
+                    tp=intent.take_profit,
+                    sl=intent.stop_loss,
+                )
+
+            if not self._protection_ok(protection):
+                # 失败时，自动尝试一次更宽的保护价
+                retry_tp, retry_sl = self._widen_protection_prices(
+                    intent.side.value if intent.side else "LONG",
+                    intent.take_profit,
+                    intent.stop_loss,
+                )
+                protection_retry = self.client._execute_protection_v2(
+                    symbol=intent.symbol,
+                    side=intent.side,
+                    tp=retry_tp,
+                    sl=retry_sl,
+                )
+                if self._protection_ok(protection_retry):
+                    return res
+
+                # 记录保护单失败
+                self._log_protection_failure(
+                    intent.symbol,
+                    intent.side.value if intent.side else "",
+                    intent.take_profit,
+                    intent.stop_loss,
+                    protection if isinstance(protection, dict) else {},
+                    protection_retry,
+                )
+
+                # 回滚策略：可配置是否在 TP/SL 失败时立即平仓
+                rollback_cfg = (
+                    self.config.get("trading", {}).get("rollback_on_tp_sl_fail")
+                    if isinstance(self.config, dict)
+                    else None
+                )
+                rollback = bool(rollback_cfg) if rollback_cfg is not None else False
+
+                if rollback:
+                    try:
+                        self._close(intent.symbol, intent.side, None)
+                    except Exception:
+                        pass
+                    try:
+                        self.client.cancel_all_open_orders(intent.symbol)
+                    except Exception:
+                        pass
+                    return {
+                        "status": "error",
+                        "message": "TP/SL 下单失败，已回滚开仓",
+                        "open": res,
+                        "protection": protection,
+                        "protection_retry": protection_retry,
+                    }
+                else:
+                    # 不回滚：保留已开仓位，记录警告并返回部分成功信息
+                    return {
+                        "status": "warning",
+                        "message": "TP/SL 下单失败，已保留开仓，请手动检查保护单",
+                        "open": res,
+                        "protection": protection,
+                        "protection_retry": protection_retry,
+                    }
 
         return res
+
+    def _protection_ok(self, protection: Dict[str, Any]) -> bool:
+        """判定保护单是否成功挂出（允许部分成功按失败处理）"""
+        if not isinstance(protection, dict):
+            return False
+        if protection.get("status") != "success":
+            return False
+        orders = protection.get("orders")
+        if isinstance(orders, dict):
+            orders = orders.get("orders")
+        if not isinstance(orders, list) or not orders:
+            return False
+        for order in orders:
+            if not isinstance(order, dict):
+                return False
+            if "code" in order:
+                return False
+            # PAPI 条件单返回 strategyStatus
+            if order.get("status") == "REJECTED":
+                return False
+            if order.get("strategyStatus") == "REJECTED":
+                return False
+        return True
+
+    def _widen_protection_prices(
+        self,
+        side: str,
+        take_profit: Optional[float],
+        stop_loss: Optional[float],
+    ) -> tuple[Optional[float], Optional[float]]:
+        """将 TP/SL 向外放宽一点，降低立即触发或精度拒绝概率"""
+        widen_factor = 0.003  # 0.3%
+        side = str(side).upper()
+        tp = take_profit
+        sl = stop_loss
+        if tp is not None:
+            if side == "LONG":
+                tp = tp * (1 + widen_factor)
+            else:
+                tp = tp * (1 - widen_factor)
+        if sl is not None:
+            if side == "LONG":
+                sl = sl * (1 - widen_factor)
+            else:
+                sl = sl * (1 + widen_factor)
+        return tp, sl
+
+    def _log_protection_failure(
+        self,
+        symbol: str,
+        side: str,
+        take_profit: Optional[float],
+        stop_loss: Optional[float],
+        first_result: Dict[str, Any],
+        retry_result: Dict[str, Any],
+    ) -> None:
+        """记录强制保护失败原因到日志文件"""
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            logs_dir = os.path.join(project_root, "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            path = os.path.join(logs_dir, "tp_sl_failures.log")
+            ts = datetime.now().isoformat()
+            line = (
+                f"{ts} symbol={symbol} side={side} "
+                f"tp={take_profit} sl={stop_loss} "
+                f"first={first_result} retry={retry_result}\n"
+            )
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
 
     def _execute_close(self, intent: TradeIntent) -> Dict[str, Any]:
         assert intent.action == IntentAction.CLOSE

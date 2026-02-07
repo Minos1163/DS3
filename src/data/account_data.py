@@ -4,6 +4,8 @@
 """
 
 from typing import Any, Dict, List, Optional
+import requests
+import time
 
 
 class AccountDataManager:
@@ -17,9 +19,14 @@ class AccountDataManager:
             client: Binance API客户端
         """
         self.client = client
+        # 缓存上一次成功的账户摘要（用于请求失败时回退）
+        self._last_account_summary: Optional[Dict[str, Any]] = None
+        self._last_account_updated_at: float = 0.0
+        # 缓存有效期（秒），默认 60 秒，可按需调整或暴露为参数
+        self._cache_ttl: float = 60.0
 
     def get_account_summary(self) -> Optional[Dict[str, Any]]:
-        f"""
+        """
         获取账户摘要 - 支持统一账户、全仓杠杆、U本位、币本位合约
 
         统一账户计算方式：
@@ -37,12 +44,40 @@ class AccountDataManager:
                 ...
             }
         """
-        try:
-            account = self.client.get_account()
-            if not account:
-                print("⚠️ 获取账户信息为空")
-                return None
+        # ========== 获取账户信息：增加重试，并在失败时使用缓存回退 ==========
+        retries = 3
+        backoff = 1.0
+        account = None
+        last_exc: Optional[BaseException] = None
+        for attempt in range(retries):
+            try:
+                account = self.client.get_account()
+                break
+            except Exception as e:
+                last_exc = e
+                print(f"⚠️ 获取账户信息失败（尝试 {attempt+1}/{retries}）：{e}")
+                try:
+                    import traceback
 
+                    traceback.print_exc()
+                except Exception:
+                    pass
+                time.sleep(backoff)
+                backoff *= 2
+
+        if not account:
+            # 如果有缓存且缓存仍在有效期内，作为回退返回缓存摘要
+            if (
+                self._last_account_summary is not None
+                and (time.time() - self._last_account_updated_at) <= self._cache_ttl
+            ):
+                print("⚠️ 使用缓存账户摘要回退（最近更新时间：%s）" % time.ctime(self._last_account_updated_at))
+                return self._last_account_summary
+            # 否则记录并返回 None
+            print("❌ 获取账户信息失败，且无可用缓存，返回 None")
+            return None
+
+        try:
             # 如果包含 raw，则作为辅助来源，但优先使用 account 顶层字段
             raw = account.get("raw") if isinstance(account, dict) else None
             raw_data = raw if isinstance(raw, dict) else None
@@ -208,7 +243,7 @@ class AccountDataManager:
                 print("⚠️ 账户关键字段为0，原始返回摘要:")
                 print(self._summarize_account(account))
 
-            return {
+            result = {
                 "total_balance": total_wallet_balance,
                 "available_balance": available_balance,
                 "used_margin": total_initial_margin,
@@ -224,11 +259,25 @@ class AccountDataManager:
                 "note": account.get("note"),
                 "raw_account": account,
             }
+            # 更新缓存
+            try:
+                self._last_account_summary = result
+                self._last_account_updated_at = time.time()
+            except Exception:
+                pass
+            return result
         except Exception as e:
             print(f"⚠️ 获取账户摘要失败: {e}")
             import traceback
 
             traceback.print_exc()
+            # 出错时尝试返回缓存（如果存在且未过期）
+            if (
+                self._last_account_summary is not None
+                and (time.time() - self._last_account_updated_at) <= self._cache_ttl
+            ):
+                print("⚠️ 出错时使用缓存账户摘要回退（最近更新时间：%s）" % time.ctime(self._last_account_updated_at))
+                return self._last_account_summary
             return None
 
     def _calculate_margin_ratio_v2(

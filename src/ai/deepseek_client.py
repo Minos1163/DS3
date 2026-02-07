@@ -37,7 +37,7 @@ class DeepSeekClient:
         warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
     def analyze_and_decide(self, prompt: str, **kwargs) -> Dict[str, Any]:
-        f"""
+        """
         调用AI分析并获取决策
 
         Args:

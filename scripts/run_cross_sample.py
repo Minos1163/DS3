@@ -4,7 +4,7 @@ import csv
 import json
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from backtest_15m30d_v2 import ConservativeBacktester
+from tools.backtest_15m30d_v2 import ConservativeBacktester
 
 
 def load_config(path='config/trading_config.json'):

@@ -34,7 +34,7 @@ class MarketDataManager:
     def get_multi_timeframe_data(
         self, symbol: str, intervals: List[str]
     ) -> Dict[str, Any]:
-        f"""
+        """
         获取多周期K线数据
 
         Args:
@@ -101,7 +101,7 @@ class MarketDataManager:
         return result
 
     def _calculate_indicators(self, df: pd.DataFrame) -> Dict[str, Any]:
-        f"""
+        """
         计算技术指标
 
         Returns:
@@ -167,7 +167,7 @@ class MarketDataManager:
         return indicators
 
     def get_realtime_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
-        f"""
+        """
         获取实时市场数据
 
         Returns:

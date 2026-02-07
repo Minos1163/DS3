@@ -52,11 +52,30 @@ class BacktestEngine:
         self.trades: List[Dict[str, Any]] = []
         self.statistics: Dict[str, Any] = {}
 
-    def download_data(self) -> Optional[pd.DataFrame]:
+    def download_data(self, cache_dir: str = "data", force_download: bool = False) -> Optional[pd.DataFrame]:
         """
         下载历史K线数据
         返回包含 30 天 5分钟 K线数据的 DataFrame
         """
+        # try loading from cache first
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cache_folder = os.path.join(project_root, cache_dir)
+        os.makedirs(cache_folder, exist_ok=True)
+        cache_file = os.path.join(cache_folder, f"klines_{self.symbol}_{self.interval}_{self.days}d.csv")
+        if os.path.exists(cache_file) and not force_download:
+            try:
+                print(f"加载本地缓存 K 线: {cache_file}")
+                df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                # ensure numeric types
+                for col in ["open", "high", "low", "close", "volume"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                self.df = df
+                print("✅ 已从本地缓存加载数据")
+                return self.df
+            except Exception as e:
+                print(f"警告：加载缓存失败，重新下载。原因: {e}")
+
         print(f"\n{'=' * 60}")
         print("📥 下载历史数据")
         print(f"{'=' * 60}")
@@ -156,6 +175,15 @@ class BacktestEngine:
             print(
                 f"   收盘价范围: {self.df['close'].min():.2f} - {self.df['close'].max():.2f}"
             )
+
+        return self.df
+
+        # save to cache
+        try:
+            self.df.to_csv(cache_file)
+            print(f"已保存 K 线到本地缓存: {cache_file}")
+        except Exception:
+            pass
 
         return self.df
 

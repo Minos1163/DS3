@@ -1,7 +1,11 @@
+import os
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests  # type: ignore
+import math
+import json
 
 
 class OrderGateway:
@@ -21,6 +25,28 @@ class OrderGateway:
         msg = str(err)
         checks = ["401", "Unauthorized", "-2015", "-2014"]
         return any(s in msg for s in checks)
+
+    def _log_order_reject(
+        self,
+        symbol: str,
+        side: str,
+        params: Dict[str, Any],
+        error: Any,
+    ) -> None:
+        """记录订单拒绝告警到日志文件（可选）"""
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            logs_dir = os.path.join(project_root, "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            path = os.path.join(logs_dir, "order_rejects.log")
+            ts = datetime.now().isoformat()
+            line = (
+                f"{ts} symbol={symbol} side={side} params={params} error={error}\n"
+            )
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
 
     def has_open_position(self, symbol: str, side: Optional[str] = None) -> bool:
         """🔥 L2: 统一的「是否已有仓位」判断（支持方向 LONG/SHORT/BOTH 和 BUY/SELL）
@@ -111,6 +137,33 @@ class OrderGateway:
 
         final = self._finalize_params(params, side, reduce_only)
 
+        # 确保下单满足交易所最小名义(notional)要求，避免 -4164 错误
+        try:
+            qty = final.get("quantity")
+            price = final.get("price")
+            if qty and (not price or float(price) <= 0):
+                # 尝试从行情获取当前价格
+                try:
+                    ticker = self.broker.get_ticker(symbol)
+                    price = float(ticker.get("lastPrice", 0)) if ticker else None
+                except Exception:
+                    price = None
+
+            if qty and price and float(price) > 0:
+                try:
+                    adjusted = self.broker.ensure_min_notional_quantity(
+                        symbol, float(qty), float(price)
+                    )
+                    if adjusted != float(qty):
+                        # 更新最终参数为符合最小名义量的数量
+                        final["quantity"] = adjusted
+                        print(f"[INFO] Adjusted quantity for min_notional: {qty} -> {adjusted} (price={price})")
+                except Exception:
+                    # 容错：如果检查失败，继续按原参数下单（上层会捕获并处理错误）
+                    pass
+        except Exception:
+            pass
+
         try:
             response = self.broker.request(
                 method="POST",
@@ -122,6 +175,9 @@ class OrderGateway:
 
             # Binance 返回错误
             if "code" in data and data["code"] < 0:
+                # 记录订单拒绝（可选告警日志）
+                self._log_order_reject(symbol, side, final, data)
+
                 # 🚫 致命权限错误：直接抛出，禁止 retry
                 if self._is_fatal_auth_error(data):
                     msg = (
@@ -176,12 +232,84 @@ class OrderGateway:
                 isinstance(e, requests.HTTPError)
                 and getattr(e, "response", None) is not None
             ):
+                # 尝试解析交易所返回的 JSON 错误
                 try:
                     err_data = e.response.json()
+                except Exception:
+                    err_data = None
+
+                if err_data:
+                    # 记录订单拒绝（可选告警日志）
+                    self._log_order_reject(symbol, side, final, err_data)
+
+                    # 处理最小名义额错误（-4164）：尝试读取交易所信息并自动调整一次重试
+                    if err_data.get("code") == -4164:
+                        try:
+                            ex_url = f"{self.broker.MARKET_BASE}/fapi/v1/exchangeInfo"
+                            resp = self.broker.request("GET", ex_url, params={"symbol": symbol}, allow_error=True)
+                            info = resp.json() if resp is not None else {}
+                            min_notional = None
+                            step_size = None
+                            for s in info.get("symbols", []):
+                                if s.get("symbol") == symbol:
+                                    for f in s.get("filters", []):
+                                        if f.get("filterType") in ("MIN_NOTIONAL", "NOTIONAL"):
+                                            try:
+                                                min_notional = float(f.get("minNotional") or f.get("notional") or 5.0)
+                                            except Exception:
+                                                min_notional = 5.0
+                                        if f.get("filterType") == "LOT_SIZE":
+                                            try:
+                                                step_size = float(f.get("stepSize"))
+                                            except Exception:
+                                                step_size = None
+                                    break
+
+                            price = final.get("price")
+                            if not price:
+                                try:
+                                    t = self.broker.request("GET", f"{self.broker.MARKET_BASE}/fapi/v1/ticker/24hr", params={"symbol": symbol}, allow_error=True)
+                                    price = float(t.json().get("lastPrice", 0)) if t is not None else None
+                                except Exception:
+                                    price = None
+
+                            if min_notional and price and price > 0:
+                                required_qty = min_notional / float(price)
+                                if step_size and step_size > 0:
+                                    required_qty = math.ceil(required_qty / step_size) * step_size
+                                required_qty = round(required_qty, 8)
+                                print(f"❗ -4164 最小名义额限制: symbol={symbol} min_notional={min_notional} price={price} -> required_qty~={required_qty}")
+
+                                # 尝试用调整后的数量重试一次下单（仅一次）
+                                try:
+                                    final_retry = dict(final)
+                                    final_retry["quantity"] = required_qty
+                                    print(f"🔁 尝试 -4164 自动重试: quantity -> {required_qty}")
+                                    resp2 = self.broker.request(
+                                        method="POST",
+                                        url=self._order_endpoint(),
+                                        params=final_retry,
+                                        signed=True,
+                                    )
+                                    data2 = resp2.json()
+                                    if "code" in data2 and data2["code"] < 0:
+                                        # 仍然失败：记录并继续按原逻辑抛出
+                                        self._log_order_reject(symbol, side, final_retry, data2)
+                                    else:
+                                        return data2
+                                except Exception as retry_exc:
+                                    try:
+                                        self._log_order_reject(symbol, side, final_retry, str(retry_exc))
+                                    except Exception:
+                                        pass
+
+                        except Exception:
+                            # 容错：读取 exchangeInfo / 价格 或 计算过程中出错，放弃自动重试路径
+                            pass
+
+                    # 处理 -1116（Invalid orderType）: 若交易所已有仓位，则返回 warning
                     if err_data.get("code") == -1116:
-                        pos = self.broker.position.get_position(
-                            symbol, side=pos_check_side
-                        )
+                        pos = self.broker.position.get_position(symbol, side=pos_check_side)
                         if pos and abs(float(pos.get("positionAmt", 0))) > 0:
                             print("[WARN] -1116: position exists")
                             print(err_data)
@@ -192,8 +320,10 @@ class OrderGateway:
                                 "error": err_data,
                                 "position_exists": True,
                             }
-                except Exception:
-                    pass
+                # else: 无法解析 err_data，继续后续处理
+            else:
+                # 非 HTTPError 场景也记录一次
+                self._log_order_reject(symbol, side, final, str(e))
 
             # 🔥 L3: 失败后 → 再查一次仓位（防止已成交）
             cond_l3_exc = not reduce_only and self.has_open_position(
@@ -210,46 +340,7 @@ class OrderGateway:
                     "position_exists": True,
                 }
             raise
-
-            # 🔒 不立即释放锁，让delay真正生效
-            # 依赖时间戳检查，而不是立即释放
-        finally:
-            # 🔒 不立即释放锁，让delay真正生效
-            # 依赖时间戳检查，而不是立即释放
-            pass
-
-    def place_protection_orders(
-        self,
-        symbol: str,
-        side: str,
-        tp: Optional[float],
-        sl: Optional[float],
-    ) -> List[Dict[str, Any]]:
-        """执行 TP/SL 止盈止损单"""
-        results = []
-        # 计算下单方向与仓位方向 (Hedge 模式适配)
-        order_side = "SELL" if side.upper() == "LONG" else "BUY"
-        pos_side = self.broker.calculate_position_side(order_side, True)
-
-        endpoint = self._order_endpoint()
-
-        for price, otype in [(tp, "TAKE_PROFIT_MARKET"), (sl, "STOP_MARKET")]:
-            if price:
-                # 🔥 PAPI-UM 和 FAPI 都使用 type 字段
-                p = {
-                    "symbol": symbol,
-                    "side": order_side,
-                    "type": otype,
-                    "stopPrice": price,
-                    "closePosition": True,
-                }
-                if pos_side:
-                    p["positionSide"] = pos_side
-
-                res = self.broker.request("POST", endpoint, params=p, signed=True)
-                results.append(res.json())
-
-        return results
+        # end of place_standard_order
 
     def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
         endpoint = self._order_endpoint()
@@ -262,9 +353,12 @@ class OrderGateway:
         ).json()
 
     def query_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        # 🔥 统一使用 FAPI 端点
-        base = self.broker.FAPI_BASE
-        path = "/fapi/v1/openOrders"
+        # 🔥 根据账户类型选择端点
+        base = self.broker.um_base()
+        if "papi" in base:
+            path = "/papi/v1/um/openOrders"
+        else:
+            path = "/fapi/v1/openOrders"
         params = {"symbol": symbol} if symbol else {}
         url = f"{base}{path}"
         resp = self.broker.request("GET", url, params=params, signed=True)
@@ -283,6 +377,51 @@ class OrderGateway:
             return f"{base}/papi/v1/um/order"
         base = self.broker.FAPI_BASE  # 使用 FAPI 基础路径
         return f"{base}/fapi/v1/order"
+
+    def place_protection_orders(
+        self, symbol: str, side: str, tp: Optional[float], sl: Optional[float]
+    ) -> List[Dict[str, Any]]:
+        """
+        下发止盈/止损保护单（MARKET 型触发单），用于在开仓后快速下保护单。
+
+        返回包含每个创建订单的响应 JSON 列表。
+        """
+        results: List[Dict[str, Any]] = []
+        # 计算下单方向：如果仓位方向为 LONG，则保护单为卖出 (SELL)，反之为 BUY
+        order_side = "SELL" if str(side).upper() == "LONG" else "BUY"
+        # 计算 positionSide（Hedge 模式适配）
+        try:
+            pos_side = self.broker.calculate_position_side(order_side, True)
+        except Exception:
+            pos_side = None
+
+        endpoint = self._order_endpoint()
+
+        for price, otype in [(tp, "TAKE_PROFIT_MARKET"), (sl, "STOP_MARKET")]:
+            if price is None:
+                continue
+            # 🔥 PAPI-UM 和 FAPI 都使用 type 字段
+            p: Dict[str, Any] = {
+                "symbol": symbol,
+                "side": order_side,
+                "type": otype,
+                "stopPrice": price,
+                "closePosition": True,
+            }
+            if pos_side:
+                p["positionSide"] = pos_side
+
+            try:
+                resp = self.broker.request("POST", endpoint, params=p, signed=True)
+                results.append(resp.json())
+            except Exception as e:
+                # 记录并继续尝试下一个保护单
+                try:
+                    self._log_order_reject(symbol, order_side, p, str(e))
+                except Exception:
+                    pass
+
+        return results
 
     def _finalize_params(
         self, params: Dict[str, Any], side: str, reduce_only: bool
@@ -321,27 +460,27 @@ class OrderGateway:
             or str(p.get("closePosition")).lower() == "true"
         ):
             p["closePosition"] = True
-            print("[DEBUG _finalize_params] Before quantity check:")
-            print(p.get("quantity"))
             if "quantity" not in p or not p["quantity"]:
-                print("[DEBUG] quantity missing, fetching position")
                 pos = self.broker.position.get_position(p.get("symbol"), side="BOTH")
                 if pos:
                     p["quantity"] = abs(float(pos.get("positionAmt", 0)))
-                    print("[DEBUG _finalize_params] Fetched quantity")
-                    print(p["quantity"])
                 else:
                     raise ValueError(f"无法获取仓位数量: {p.get('symbol')}")
-            else:
-                print("[DEBUG _finalize_params] Quantity already present:")
-                print(p["quantity"])
             p.pop("reduceOnly", None)
             p.pop("reduce_only", None)
         else:
             # 开仓或部分平仓
             p.pop("closePosition", None)
             if reduce_only:
-                p["reduceOnly"] = True
+                # 对于 PAPI（或统一保证金）端点，部分平仓不要发送 reduceOnly（Binance 会拒绝）
+                try:
+                    if self.broker.is_papi_only():
+                        p.pop("reduceOnly", None)
+                    else:
+                        p["reduceOnly"] = True
+                except Exception:
+                    # 若检查失败，保守行为：不删除已有字段，仍尝试设置
+                    p["reduceOnly"] = True
             else:
                 p.pop("reduceOnly", None)
             if is_hedge and "positionSide" not in p:

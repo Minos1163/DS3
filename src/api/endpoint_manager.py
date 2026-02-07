@@ -145,10 +145,16 @@ class SafeClosePosition:
 
             print(f"   📊 检测到持仓: {close_direction} {close_qty} {symbol}")
 
-            # 第四步：撤销所有挂单 (防止冲突)
-            print("   🗑️  撤销所有挂单...")
+            # 第四步：撤销所有条件单 + 挂单 (防止遗留未触发止盈止损)
+            print("   🗑️  撤销所有条件单与挂单...")
             try:
+                # 先清理条件单（PAPI 条件单不会被 allOpenOrders 删除）
+                if hasattr(self.client, "cancel_all_conditional_orders"):
+                    self.client.cancel_all_conditional_orders(symbol)
+                    print("      ✅ 已撤销条件单")
+                # 再清理普通挂单
                 self.client.cancel_all_orders(symbol)
+                print("      ✅ 已撤销普通挂单")
             except Exception as e:
                 print(f"   ⚠️  撤销挂单失败 (继续): {e}")
 

@@ -49,12 +49,7 @@ def retry_on_failure(
 
                     # 检查是否还有重试机会
                     if i < max_retries - 1:
-                        print(
-                            f"⚠️ {func.__name__} 失败 (尝试 {i + 1}/{max_retries}): {e}"
-                        )
-                        print(f"💤 等待 {delay}秒 后重试...")
                         time.sleep(delay)
-                        print(f"🔄 开始第 {i + 2} 次尝试...")
                     else:
                         # 最后一次重试也失败
                         print(f"❌ {func.__name__} 失败，已重试 {max_retries} 次")
@@ -76,17 +71,9 @@ def log_execution(func: Callable) -> Callable:
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs) -> Any:
-        func_name = func.__name__
-        print(f"📋 执行: {func_name}")
-        start_time = time.time()
         try:
-            result = func(*args, **kwargs)
-            elapsed = time.time() - start_time
-            print(f"✅ 完成: {func_name} (耗时: {elapsed:.2f}s)")
-            return result
+            return func(*args, **kwargs)
         except Exception as e:
-            elapsed = time.time() - start_time
-            print(f"❌ 失败: {func_name} (耗时: {elapsed:.2f}s): {e}")
             raise
 
     return wrapper

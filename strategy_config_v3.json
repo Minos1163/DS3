@@ -1,0 +1,138 @@
+{
+  "strategy_version": "V3",
+  "strategy_name": "RSI-EMA-MA20趋势策略",
+  "optimization_date": "2026-02-01",
+  "backtest_period": "15天 (2026-01-17至2026-02-01)",
+  
+  "parameters": {
+    "risk_management": {
+      "position_percent": 0.3,
+      "stop_loss_pct": 0.015,
+      "take_profit_pct": 0.05,
+      "description": "30%资金开仓，1.5%止损，5%止盈"
+    },
+    "indicators": {
+      "rsi_oversold": 32,
+      "rsi_overbought": 68,
+      "rsi_period": 14,
+      "ema_fast": 5,
+      "ema_slow": 20,
+      "ma_period": 20,
+      "macd_fast": 12,
+      "macd_slow": 26,
+      "macd_signal": 9,
+      "bb_period": 20,
+      "bb_std": 2
+    },
+    "filters": {
+      "use_ma20_trend": true,
+      "use_bb_proximity": true,
+      "bb_proximity_pct": 0.02
+    }
+  },
+  
+  "performance": {
+    "total_return": 551.28,
+    "return_pct": 5.51,
+    "total_trades": 58,
+    "win_rate": 75.86,
+    "profit_ratio": 0.78,
+    "profit_factor": 2.44,
+    "avg_win": 21.23,
+    "avg_loss": -27.34,
+    "max_drawdown": -1.05
+  },
+  
+  "entry_conditions": {
+    "long": [
+      {
+        "id": 1,
+        "conditions": [
+          "RSI < 32",
+          "EMA5 > EMA20",
+          "Close > MA20"
+        ],
+        "description": "RSI超卖 + EMA金叉 + 趋势向上"
+      },
+      {
+        "id": 2,
+        "conditions": [
+          "EMA5 > EMA20",
+          "MACD_hist > 0",
+          "Close <= BB_lower * 1.02",
+          "Close > MA20 * 0.98"
+        ],
+        "description": "强势金叉 + MACD向上 + 接近下轨 + 趋势确认"
+      }
+    ],
+    "short": [
+      {
+        "id": 1,
+        "conditions": [
+          "RSI > 68",
+          "EMA5 < EMA20",
+          "Close < MA20"
+        ],
+        "description": "RSI超买 + EMA死叉 + 趋势向下"
+      },
+      {
+        "id": 2,
+        "conditions": [
+          "EMA5 < EMA20",
+          "MACD_hist < 0",
+          "Close >= BB_upper * 0.98",
+          "Close < MA20 * 1.02"
+        ],
+        "description": "强势死叉 + MACD向下 + 接近上轨 + 趋势确认"
+      }
+    ]
+  },
+  
+  "exit_conditions": {
+    "take_profit": "达到5%盈利",
+    "stop_loss": "达到1.5%亏损",
+    "reverse_signal": "出现反向RSI信号"
+  },
+  
+  "improvements_from_v1": {
+    "total_return": "+10.1%",
+    "profit_ratio": "+9.9%",
+    "profit_factor": "+10.9%",
+    "avg_loss_reduction": "+34.2%"
+  },
+  
+  "recommendations": {
+    "immediate": [
+      "使用V3参数进行实盘测试",
+      "记录每笔交易详情",
+      "监控滑点和手续费影响"
+    ],
+    "short_term": [
+      "用30天以上数据验证稳定性",
+      "在不同市场环境测试",
+      "小额资金测试（建议$1000-$3000）"
+    ],
+    "long_term": [
+      "开发移动止损机制",
+      "根据波动率动态调整参数",
+      "添加仓位管理策略",
+      "优化入场时机"
+    ]
+  },
+  
+  "risk_warnings": [
+    "历史表现不代表未来收益",
+    "回测数据仅15天，需更长时间验证",
+    "实盘需考虑滑点和手续费（约-0.1%/笔）",
+    "建议初期降低仓位到20%",
+    "不同市场环境可能需要调整参数"
+  ],
+  
+  "next_steps": [
+    "下载30-60天历史数据进行长期回测",
+    "在模拟账户测试1-2周",
+    "用小额资金实盘测试",
+    "根据实盘结果微调参数",
+    "建立风险管理和资金管理体系"
+  ]
+}
