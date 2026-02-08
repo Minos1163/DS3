@@ -5,8 +5,10 @@ Usage:
 
 This script imports the backtest logic from `backtest_dca_rotation.py`.
 """
+
+from backtest_dca_rotation import load_run_config, DCARotationBacktester
+
 import argparse
-import json
 import os
 import sys
 
@@ -14,13 +16,13 @@ import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from backtest_dca_rotation import load_run_config, DCARotationBacktester
-
 
 def run_once(config_path: str):
     symbols, interval, days, initial_capital, params = load_run_config(config_path)
     print(f"Loaded params from {config_path}: {params}")
-    bt = DCARotationBacktester(symbols=symbols, interval=interval, days=days, initial_capital=initial_capital, params=params)
+    bt = DCARotationBacktester(
+        symbols=symbols, interval=interval, days=days, initial_capital=initial_capital, params=params
+    )
     bt.run_backtest()
     metrics = bt.metrics()
     summary = bt.summarize()
@@ -60,5 +62,5 @@ def main():
         print(f"{k}: A={v1}  B={v2}  delta={diff}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

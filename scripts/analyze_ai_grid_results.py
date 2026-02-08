@@ -2,18 +2,22 @@
 
 Produces a text report and CSV summaries in `reports/`.
 """
+
 from __future__ import annotations
+
+import pandas as pd
 
 import os
 import glob
 from datetime import datetime
-import pandas as pd
 
 
 def latest_grid_file():
     files = sorted(glob.glob(os.path.join("reports", "ai_param_search_*.csv")), reverse=True)
     # prefer the full results file (not the summary) if both exist
-    files = [f for f in files if "summary" not in os.path.basename(f)] + [f for f in files if "summary" in os.path.basename(f)]
+    files = [f for f in files if "summary" not in os.path.basename(f)] + [
+        f for f in files if "summary" in os.path.basename(f)
+    ]
     return files[0] if files else None
 
 
@@ -40,14 +44,16 @@ def main():
             return
 
         # Correlations
-        numeric = df_nonzero[["min_conf", "min_atr", "max_hold", "final_equity", "expectancy"]].copy()
+        numeric = df_nonzero[["min_con", "min_atr", "max_hold", "final_equity", "expectancy"]].copy()
         corr = numeric.corr()
         f.write("Correlation matrix (numeric params vs final_equity/expectancy):\n")
         f.write(corr.to_string())
         f.write("\n\n")
 
         # Grouped summaries
-        grp = df_nonzero.groupby(["momentum", "ema_field"]).agg({"final_equity": ["mean", "std", "count"], "expectancy": ["mean"]})
+        grp = df_nonzero.groupby(["momentum", "ema_field"]).agg(
+            {"final_equity": ["mean", "std", "count"], "expectancy": ["mean"]}
+        )
         f.write("Grouped summary by momentum and ema_field:\n")
         f.write(grp.to_string())
         f.write("\n\n")
@@ -63,9 +69,11 @@ def main():
         f.write(top_exp.to_string(index=False))
 
     # Also write grouped CSVs for easier inspection
-    df_nonzero.to_csv(os.path.join("reports", f"ai_param_search_nonzero_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"), index=False)
+    df_nonzero.to_csv(
+        os.path.join("reports", f"ai_param_search_nonzero_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"), index=False
+    )
     print("Wrote analysis to", out_txt)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

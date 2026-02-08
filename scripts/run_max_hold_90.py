@@ -1,5 +1,6 @@
 import os
 import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backtest_15m30d_v2 import ConservativeBacktester
 
@@ -18,5 +19,5 @@ def main():
     backtester.analyze_results()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

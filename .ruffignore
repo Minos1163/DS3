@@ -1,0 +1,12 @@
+# Ignore generated or third-party skill code that should not be linted
+.opencode/
+skills/
+tools/
+
+# Additional patterns to ensure windows/backslash paths are ignored
+**/.opencode/**
+**\/.opencode\/**
+**/skills/**
+**\\skills\\**
+**/tools/**
+**\\tools\\**

@@ -71,15 +71,11 @@ class PositionManager:
         """获取持仓信息"""
         return self.client.get_position(symbol)
 
-    def calculate_position_value(
-        self, symbol: str, quantity: float, price: float
-    ) -> float:
+    def calculate_position_value(self, symbol: str, quantity: float, price: float) -> float:
         """计算持仓价值"""
         return quantity * price
 
-    def calculate_required_margin(
-        self, quantity: float, price: float, leverage: int
-    ) -> float:
+    def calculate_required_margin(self, quantity: float, price: float, leverage: int) -> float:
         """
         计算所需保证金
 

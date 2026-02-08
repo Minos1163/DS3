@@ -1,4 +1,3 @@
-import os
 import argparse
 
 from src.data.klines_downloader import download_public_klines

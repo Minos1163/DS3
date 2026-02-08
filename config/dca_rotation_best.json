@@ -21,7 +21,12 @@
     "DOGS",
     "CHILLGUY",
     "DEGEN",
-    "KOMA"
+    "KOMA",
+    "BTC",
+    "ETH",
+    "BNB",
+    "SOL",
+    "XRP"
   ],
   "symbols_comment": "下单币种（自动补USDT），建议: 2-8个",
   "interval": "3m",

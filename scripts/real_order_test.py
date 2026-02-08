@@ -1,3 +1,9 @@
+from src.config.env_manager import EnvManager
+
+from src.api.binance_client import BinanceClient
+
+from src.trading.trade_executor import TradeExecutor
+
 import os
 import sys
 import time
@@ -6,10 +12,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(ROOT))
-
-from src.config.env_manager import EnvManager
-from src.api.binance_client import BinanceClient
-from src.trading.trade_executor import TradeExecutor
 
 
 def _load_env() -> None:

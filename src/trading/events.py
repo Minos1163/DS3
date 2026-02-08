@@ -33,11 +33,7 @@ class ExchangeEvent:
         """从 WebSocket ORDER_TRADE_UPDATE 转换为统一事件"""
         # 这里的 map 逻辑可以根据具体推送格式细化
         return cls(
-            type=(
-                ExchangeEventType.ORDER_FILLED
-                if data.get("X") == "FILLED"
-                else ExchangeEventType.ORDER_CANCELED
-            ),
+            type=(ExchangeEventType.ORDER_FILLED if data.get("X") == "FILLED" else ExchangeEventType.ORDER_CANCELED),
             symbol=data.get("s", ""),
             order_id=data.get("i"),
             side=data.get("S"),

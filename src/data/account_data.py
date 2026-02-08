@@ -4,8 +4,9 @@
 """
 
 from typing import Any, Dict, List, Optional
-import requests
 import time
+import os
+from src.config.config_loader import ConfigLoader
 
 
 class AccountDataManager:
@@ -48,14 +49,14 @@ class AccountDataManager:
         retries = 3
         backoff = 1.0
         account = None
-        last_exc: Optional[BaseException] = None
+        _last_exc: Optional[BaseException] = None
         for attempt in range(retries):
             try:
                 account = self.client.get_account()
                 break
             except Exception as e:
-                last_exc = e
-                print(f"⚠️ 获取账户信息失败（尝试 {attempt+1}/{retries}）：{e}")
+                _last_exc = e
+                print(f"⚠️ 获取账户信息失败（尝试 {attempt + 1}/{retries}）：{e}")
                 try:
                     import traceback
 
@@ -102,12 +103,8 @@ class AccountDataManager:
             # ============ 统一账户 (优先使用 account 顶层字段) ============
             total_wallet_balance = self._extract_float(account, ["totalWalletBalance"])
             total_initial_margin = self._extract_float(account, ["totalInitialMargin"])
-            total_unrealized_profit = self._extract_float(
-                account, ["totalUnrealizedProfit"]
-            )
-            equity = self._extract_float(
-                account, ["equity", "accountEquity", "totalMarginBalance"]
-            )
+            total_unrealized_profit = self._extract_float(account, ["totalUnrealizedProfit"])
+            equity = self._extract_float(account, ["equity", "accountEquity", "totalMarginBalance"])
             available_balance = self._extract_float(
                 account,
                 [
@@ -151,11 +148,7 @@ class AccountDataManager:
 
             # ============ 根据统一账户字段计算可用保证金 ============
             # 统一账户的可用保证金 = 钱包余额 - 占用保证金
-            calculated_available = (
-                total_wallet_balance - total_initial_margin
-                if total_wallet_balance > 0
-                else 0
-            )
+            calculated_available = total_wallet_balance - total_initial_margin if total_wallet_balance > 0 else 0
 
             # 如果API直接返回的available有效，优先使用；否则使用计算值
             if available_balance <= 0 and calculated_available > 0:
@@ -168,15 +161,9 @@ class AccountDataManager:
 
             # ============ 资产级聚合值 (作为备用和验证) ============
             assets: List[Any] = []
-            if (
-                isinstance(account, dict)
-                and isinstance(account.get("assets"), list)
-                and account.get("assets")
-            ):
+            if isinstance(account, dict) and isinstance(account.get("assets"), list) and account.get("assets"):
                 assets = account.get("assets")  # type: ignore[assignment]
-            elif isinstance(raw_data, dict) and isinstance(
-                raw_data.get("assets"), list
-            ):
+            elif isinstance(raw_data, dict) and isinstance(raw_data.get("assets"), list):
                 assets = raw_data.get("assets")  # type: ignore[assignment]
             assets_total_wallet = 0.0
             assets_total_unrealized = 0.0
@@ -187,30 +174,18 @@ class AccountDataManager:
 
             if isinstance(assets, list):
                 for a in assets:
-                    wallet = float(
-                        a.get("walletBalance")
-                        or a.get("crossWalletBalance")
-                        or a.get("balance")
-                        or 0
-                    )
+                    wallet = float(a.get("walletBalance") or a.get("crossWalletBalance") or a.get("balance") or 0)
                     assets_total_wallet += wallet
 
                     unrealized = float(
-                        a.get("unrealizedProfit")
-                        or a.get("crossUnPnl")
-                        or a.get("unRealizedProfit")
-                        or 0
+                        a.get("unrealizedProfit") or a.get("crossUnPnl") or a.get("unRealizedProfit") or 0
                     )
                     assets_total_unrealized += unrealized
 
-                    margin = float(
-                        a.get("initialMargin") or a.get("totalInitialMargin") or 0
-                    )
+                    margin = float(a.get("initialMargin") or a.get("totalInitialMargin") or 0)
                     assets_total_margin += margin
 
-                    asset_symbol = (
-                        a.get("asset") or a.get("currency") or a.get("symbol")
-                    )
+                    asset_symbol = a.get("asset") or a.get("currency") or a.get("symbol")
                     if asset_symbol in ("USDT", "FDUSD"):
                         assets_usdt_wallet += wallet
                         assets_usdt_unrealized += unrealized
@@ -222,9 +197,50 @@ class AccountDataManager:
             if total_initial_margin == 0:
                 total_initial_margin = assets_usdt_margin or assets_total_margin
             if total_unrealized_profit == 0:
-                total_unrealized_profit = (
-                    assets_usdt_unrealized or assets_total_unrealized
-                )
+                # 如果 account 接口没有提供 total_unrealized_profit（返回0），
+                # 尝试从持仓接口聚合未实现盈亏作为回退（某些账户/端点不会在账户快照中包含该字段）
+                total_unrealized_profit = assets_usdt_unrealized or assets_total_unrealized
+                try:
+                    # 支持通过配置文件或环境变量设置阈值（单位 USDT），默认 0.01
+                    threshold = 0.01
+                    try:
+                        cfg = ConfigLoader.load_trading_config()
+                        threshold = ConfigLoader.get_unrealized_pnl_threshold_usdt(cfg)
+                    except Exception:
+                        try:
+                            threshold = float(os.getenv("UNREALIZED_AGGREGATE_THRESHOLD_USDT", "0.01"))
+                        except Exception:
+                            threshold = 0.01
+
+                    # 优先使用 client 提供的持仓查询方法聚合未实现盈亏
+                    positions = []
+                    if hasattr(self.client, "get_all_positions"):
+                        positions = self.client.get_all_positions()
+                    elif hasattr(self.client, "get_positions"):
+                        positions = self.client.get_positions()
+
+                    pos_unrealized_sum = 0.0
+                    for p in positions or []:
+                        # 兼容不同字段名
+                        val = (
+                            p.get("unrealizedProfit")
+                            or p.get("unRealizedProfit")
+                            or p.get("unrealized")
+                            or p.get("unRealized")
+                            or p.get("crossUnPnl")
+                            or 0
+                        )
+                        try:
+                            pos_unrealized_sum += float(val)
+                        except Exception:
+                            continue
+
+                    # 只有当聚合绝对值超过阈值时才覆盖（避免微小波动误报）
+                    if abs(pos_unrealized_sum) >= threshold:
+                        total_unrealized_profit = pos_unrealized_sum
+                except Exception:
+                    # 回退时不阻塞主流程，保持原有值
+                    pass
 
             # 重新计算可用和权益
             if total_wallet_balance > 0:
@@ -252,9 +268,7 @@ class AccountDataManager:
                 "spot_usdt_balance": spot_usdt,
                 "spot_ldusdt_balance": spot_ldusdt,
                 "spot_total_balance": spot_total,
-                "margin_ratio": self._calculate_margin_ratio_v2(
-                    total_wallet_balance, total_initial_margin
-                ),
+                "margin_ratio": self._calculate_margin_ratio_v2(total_wallet_balance, total_initial_margin),
                 "update_time": account.get("updateTime", 0),
                 "note": account.get("note"),
                 "raw_account": account,
@@ -280,9 +294,7 @@ class AccountDataManager:
                 return self._last_account_summary
             return None
 
-    def _calculate_margin_ratio_v2(
-        self, total_wallet: float, total_margin: float
-    ) -> float:
+    def _calculate_margin_ratio_v2(self, total_wallet: float, total_margin: float) -> float:
         """
         计算保证金率 (统一账户版本)
 
@@ -302,15 +314,11 @@ class AccountDataManager:
     def _calculate_margin_ratio(self, account: Dict[str, Any]) -> float:
         """计算保证金率 (旧版本，保留兼容)"""
         try:
-            total_balance = self._extract_float(
-                account, ["totalWalletBalance", "equity", "walletBalance"]
-            )
+            total_balance = self._extract_float(account, ["totalWalletBalance", "equity", "walletBalance"])
             if total_balance == 0:
                 return 0.0
 
-            used_margin = self._extract_float(
-                account, ["totalInitialMargin", "usedMargin"]
-            )
+            used_margin = self._extract_float(account, ["totalInitialMargin", "usedMargin"])
             return (used_margin / total_balance) * 100
         except BaseException:
             return 0.0
@@ -344,27 +352,15 @@ class AccountDataManager:
                 "available": account.get("available"),
             },
             "assets_count": (len(raw_assets) if isinstance(raw_assets, list) else 0),
-            "positions_count": (
-                len(raw_positions) if isinstance(raw_positions, list) else 0
-            ),
+            "positions_count": (len(raw_positions) if isinstance(raw_positions, list) else 0),
             "note": account.get("note"),
             "raw_keys": list(raw.keys()) if isinstance(raw, dict) else None,
             "raw_top_fields": {
-                "totalWalletBalance": (
-                    raw.get("totalWalletBalance") if isinstance(raw, dict) else None
-                ),
-                "totalMarginBalance": (
-                    raw.get("totalMarginBalance") if isinstance(raw, dict) else None
-                ),
-                "totalInitialMargin": (
-                    raw.get("totalInitialMargin") if isinstance(raw, dict) else None
-                ),
-                "totalUnrealizedProfit": (
-                    raw.get("totalUnrealizedProfit") if isinstance(raw, dict) else None
-                ),
-                "accountEquity": (
-                    raw.get("accountEquity") if isinstance(raw, dict) else None
-                ),
+                "totalWalletBalance": (raw.get("totalWalletBalance") if isinstance(raw, dict) else None),
+                "totalMarginBalance": (raw.get("totalMarginBalance") if isinstance(raw, dict) else None),
+                "totalInitialMargin": (raw.get("totalInitialMargin") if isinstance(raw, dict) else None),
+                "totalUnrealizedProfit": (raw.get("totalUnrealizedProfit") if isinstance(raw, dict) else None),
+                "accountEquity": (raw.get("accountEquity") if isinstance(raw, dict) else None),
                 "equity": raw.get("equity") if isinstance(raw, dict) else None,
                 "available": (raw.get("available") if isinstance(raw, dict) else None),
             },

@@ -4,10 +4,10 @@ V5 规则策略（与离线回测一致）
 
 from __future__ import annotations
 
+import pandas as pd
+
 from datetime import datetime
 from typing import Any, Dict, Optional
-
-import pandas as pd
 
 
 class V5Strategy:
@@ -87,7 +87,9 @@ class V5Strategy:
         volume = float(last["volume"])
         volume_ma = float(last["volume_ma"]) if not pd.isna(last["volume_ma"]) else 0.0
         volume_q = float(last["volume_q"]) if not pd.isna(last["volume_q"]) else None
-        volume_q_short = float(last["volume_q_short"]) if "volume_q_short" in last and not pd.isna(last["volume_q_short"]) else None
+        volume_q_short = (
+            float(last["volume_q_short"]) if "volume_q_short" in last and not pd.isna(last["volume_q_short"]) else None
+        )
 
         regime = self._detect_market_regime(market_data) if self.trend_filter_enabled else "NEUTRAL"
         if regime == "BULL":
@@ -281,8 +283,8 @@ class V5Strategy:
 
     def _compute_indicators(self, df: pd.DataFrame) -> None:
         close = df["close"]
-        high = df["high"]
-        low = df["low"]
+        _high = df["high"]
+        _low = df["low"]
         volume = df["volume"]
 
         delta = close.diff()

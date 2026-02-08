@@ -96,14 +96,10 @@ class ConfigMonitor:
             result["symbols_changed"] = True
 
             # 找出被移除的交易对（需要平仓）
-            result["removed_symbols"] = [
-                symbol for symbol in self.current_symbols if symbol not in new_symbols
-            ]
+            result["removed_symbols"] = [symbol for symbol in self.current_symbols if symbol not in new_symbols]
 
             # 找出新增的交易对
-            result["added_symbols"] = [
-                symbol for symbol in new_symbols if symbol not in self.current_symbols
-            ]
+            result["added_symbols"] = [symbol for symbol in new_symbols if symbol not in self.current_symbols]
 
         return result
 

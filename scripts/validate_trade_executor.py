@@ -1,3 +1,9 @@
+from src.trading.trade_executor import TradeExecutor
+
+from src.trading.intent_builder import IntentBuilder
+
+from src.trading.intents import PositionSide as IntentPositionSide
+
 # 验证 TradeExecutor._execute_open 在异常情况下优先以交易所持仓为准
 # 直接调用 _execute_open 避免装饰器导致的长时间重试
 
@@ -7,10 +13,6 @@ from pathlib import Path
 # Ensure project root is in sys.path so `src` package can be imported
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-
-from src.trading.trade_executor import TradeExecutor
-from src.trading.intent_builder import IntentBuilder
-from src.trading.intents import PositionSide as IntentPositionSide
 
 
 class StateMachine:
@@ -39,6 +41,8 @@ class BaseMockClient:
 
 
 # Test 1: execute_intent 抛出 [OPEN BLOCKED]，get_position 返回非 0 -> 应视为成功并创建快照
+
+
 class MockClient1(BaseMockClient):
     def execute_intent(self, intent):
         raise Exception("[OPEN BLOCKED] SOLUSDT already has open position (real check via positionAmt)")
@@ -51,6 +55,8 @@ class MockClient1(BaseMockClient):
 
 
 # Test 2: execute_intent 抛出，[get_position 返回 0]，但 sync_state 会创建本地快照 -> 回退成功
+
+
 class MockClient2(BaseMockClient):
     def execute_intent(self, intent):
         raise Exception("[OPEN BLOCKED] simulated")
@@ -59,6 +65,7 @@ class MockClient2(BaseMockClient):
         return {"positionAmt": "0"}
 
     def sync_state(self):
+
         class Snap:
             def __init__(self):
                 self.side = IntentPositionSide.SHORT
@@ -70,6 +77,8 @@ class MockClient2(BaseMockClient):
 
 
 # Test 3: 正常返回 success
+
+
 class MockClient3(BaseMockClient):
     def execute_intent(self, intent):
         return {"status": "success", "order": {"id": 123}}

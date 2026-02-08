@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Wait for background validations to finish (no new oos_validation_*.json files) then run aggregation.
+
+Usage: python scripts/wait_and_aggregate.py
+"""
+
+import time
+import subprocess
+from pathlib import Path
+import sys
+
+LOGS = Path("logs")
+PAT = "oos_validation_*.json"
+POLL_INTERVAL = 10
+STABLE_CHECKS = 3
+TIMEOUT_SECONDS = 6 * 3600  # 6 hours
+
+
+def list_files():
+    return sorted(LOGS.glob(PAT))
+
+
+def main():
+    start = time.time()
+    last_count = len(list_files())
+    stable = 0
+    print(f"Starting watcher: {last_count} existing files")
+    while True:
+        time.sleep(POLL_INTERVAL)
+        files = list_files()
+        count = len(files)
+        if count == last_count:
+            stable += 1
+            print(f"No change (count={count}), stable={stable}/{STABLE_CHECKS}")
+        else:
+            print(f"Change detected: {last_count} -> {count}")
+            last_count = count
+            stable = 0
+        if stable >= STABLE_CHECKS:
+            print("Directory appears stable. Running aggregation...")
+            cmd = [sys.executable, "scripts/aggregate_oos_validations.py"]
+            try:
+                subprocess.check_call(cmd)
+                print("Aggregation completed.")
+            except subprocess.CalledProcessError as e:
+                print("Aggregation failed:", e)
+            return
+        if time.time() - start > TIMEOUT_SECONDS:
+            print("Timeout reached, exiting without aggregating.")
+            return
+
+
+if __name__ == "__main__":
+    main()

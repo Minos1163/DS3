@@ -6,20 +6,24 @@ Search ranges:
 
 Produces: reports/ai_param_search_dense_<ts>.csv and summary CSV.
 """
+
 from __future__ import annotations
 
-import os
-import sys
-import random
 from datetime import datetime
+
 from typing import Any, Dict, List
 
 import pandas as pd
 
+from src.backtest import BacktestEngine
+
+import os
+import sys
+import random
+
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
-
-from src.backtest import BacktestEngine
 
 
 def idx_of_time(df: pd.DataFrame, time_str: str):
@@ -31,7 +35,15 @@ def idx_of_time(df: pd.DataFrame, time_str: str):
         return idx
 
 
-def simulate_ai_local(df: pd.DataFrame, signals: List[Dict[str, Any]], min_conf: float = 0.6, ema_field: str = "ema_50", momentum_mode: str = "ema_only", min_atr: float = 0.0, max_hold: int = 200):
+def simulate_ai_local(
+    df: pd.DataFrame,
+    signals: List[Dict[str, Any]],
+    min_conf: float = 0.6,
+    ema_field: str = "ema_50",
+    momentum_mode: str = "ema_only",
+    min_atr: float = 0.0,
+    max_hold: int = 200,
+):
     rng = random.Random(123)
     trades = []
 
@@ -49,7 +61,11 @@ def simulate_ai_local(df: pd.DataFrame, signals: List[Dict[str, Any]], min_conf:
         if atr < min_atr:
             continue
         macd_hist = float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else 0.0
-        ema_val = float(df.get(ema_field).iloc[i]) if ema_field in df.columns and pd.notna(df.get(ema_field).iloc[i]) else None
+        ema_val = (
+            float(df.get(ema_field).iloc[i])
+            if ema_field in df.columns and pd.notna(df.get(ema_field).iloc[i])
+            else None
+        )
 
         # momentum checks (we focus on ema_only for dense search but keep logic)
         if momentum_mode == "ema_only":
@@ -74,38 +90,52 @@ def simulate_ai_local(df: pd.DataFrame, signals: List[Dict[str, Any]], min_conf:
 
         stop = entry_price - 3 * atr if sig_type == "BUY" else entry_price + 3 * atr
         pnl = 0.0
-        exit_time = df.index[-1]
         for j in range(i + 1, min(i + max_hold, len(df))):
             close = float(df["close"].iloc[j])
             if sig_type == "BUY":
                 if close <= stop:
-                    exit_time = df.index[j]
-                    pnl = (stop - entry_price)
+                    pnl = stop - entry_price
                     break
                 if float(df["rsi"].iloc[j]) > 70:
-                    exit_time = df.index[j]
-                    pnl = (close - entry_price)
+                    pnl = close - entry_price
                     break
             else:
                 if close >= stop:
-                    exit_time = df.index[j]
-                    pnl = (entry_price - stop)
+                    pnl = entry_price - stop
                     break
                 if float(df["rsi"].iloc[j]) < 30:
-                    exit_time = df.index[j]
-                    pnl = (entry_price - close)
+                    pnl = entry_price - close
                     break
         if pnl == 0.0:
             last = float(df["close"].iloc[min(i + max_hold, len(df) - 1)])
             pnl = (last - entry_price) if sig_type == "BUY" else (entry_price - last)
 
-        trades.append({"entry_time": sig_time, "pnl": pnl, "confidence": confidence, "atr": atr, "macd_hist": macd_hist, "ema": ema_val})
+        trades.append(
+            {
+                "entry_time": sig_time,
+                "pnl": pnl,
+                "confidence": confidence,
+                "atr": atr,
+                "macd_hist": macd_hist,
+                "ema": ema_val,
+            }
+        )
 
     total = len(trades)
     wins = sum(1 for t in trades if t["pnl"] > 0)
     gross = sum(t["pnl"] for t in trades)
     final_equity = 10000.0 + gross
-    return {"min_conf": min_conf, "ema_field": ema_field, "momentum": momentum_mode, "min_atr": min_atr, "max_hold": max_hold, "total": total, "wins": wins, "final_equity": final_equity, "expectancy": (gross / total) if total else 0}
+    return {
+        "min_con": min_conf,
+        "ema_field": ema_field,
+        "momentum": momentum_mode,
+        "min_atr": min_atr,
+        "max_hold": max_hold,
+        "total": total,
+        "wins": wins,
+        "final_equity": final_equity,
+        "expectancy": (gross / total) if total else 0,
+    }
 
 
 def main():
@@ -125,10 +155,18 @@ def main():
     results = []
     for mc in min_confs:
         for mh in max_holds:
-            r = simulate_ai_local(engine.df, signals, min_conf=mc, ema_field=ema_field, momentum_mode=momentum_mode, min_atr=min_atr, max_hold=mh)
+            r = simulate_ai_local(
+                engine.df,
+                signals,
+                min_conf=mc,
+                ema_field=ema_field,
+                momentum_mode=momentum_mode,
+                min_atr=min_atr,
+                max_hold=mh,
+            )
             results.append(r)
 
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out = os.path.join("reports", f"ai_param_search_dense_{ts}.csv")
     os.makedirs("reports", exist_ok=True)
     df = pd.DataFrame(results)
@@ -142,5 +180,5 @@ def main():
     print("Wrote dense summary to", summary_out)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

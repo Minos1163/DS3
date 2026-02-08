@@ -3,6 +3,53 @@ AI交易机器人主程序
 整合所有模块，实现完整的交易流程
 """
 
+import time
+
+from datetime import datetime
+
+from io import StringIO
+
+from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
+
+import csv
+
+import pandas as pd
+
+import tempfile
+
+import shutil
+
+from src.ai.decision_parser import DecisionParser
+
+from src.ai.deepseek_client import DeepSeekClient
+
+from src.ai.prompt_builder import PromptBuilder
+
+from src.api.binance_client import BinanceClient
+
+from src.config.config_loader import ConfigLoader
+
+from src.config.config_monitor import ConfigMonitor
+
+from src.config.env_manager import EnvManager
+
+from src.data.account_data import AccountDataManager
+
+from src.data.market_data import MarketDataManager
+
+from src.data.position_data import PositionDataManager
+
+from src.data.klines_downloader import set_custom_endpoints
+
+from src.trading.position_manager import PositionManager
+
+from src.trading.risk_manager import RiskManager
+
+from src.trading.trade_executor import TradeExecutor
+
+from src.strategy import V5Strategy
+
+
 import os
 import sys
 import json
@@ -10,31 +57,6 @@ import json
 # 添加项目根目录到Python路径（必须在导入src.*之前）
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__ or "")))
 sys.path.insert(0, PROJECT_ROOT)
-
-import time
-from datetime import datetime
-from io import StringIO
-from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
-import csv
-import pandas as pd
-import tempfile
-import shutil
-
-from src.ai.decision_parser import DecisionParser
-from src.ai.deepseek_client import DeepSeekClient
-from src.ai.prompt_builder import PromptBuilder
-from src.api.binance_client import BinanceClient
-from src.config.config_loader import ConfigLoader
-from src.config.config_monitor import ConfigMonitor
-from src.config.env_manager import EnvManager
-from src.data.account_data import AccountDataManager
-from src.data.market_data import MarketDataManager
-from src.data.position_data import PositionDataManager
-from src.data.klines_downloader import set_custom_endpoints
-from src.trading.position_manager import PositionManager
-from src.trading.risk_manager import RiskManager
-from src.trading.trade_executor import TradeExecutor
-from src.strategy import V5Strategy
 
 
 class TerminalOutputLogger:
@@ -270,14 +292,59 @@ class TradingBot:
         print("💡 系统已准备好进行技术分析\n")
 
     def _get_dca_symbols(self) -> List[str]:
+        """返回 DCA 候选交易对，并根据配置过滤低流动性品种。
+
+        支持在配置中设置 `min_daily_volume_usdt`（单位 USDT），当该值大于0时，
+        会调用市场数据获取 24h 成交量与价格，计算估算的 USDT 成交额并过滤掉低于阈值的品种。
+        如果配置中未设置该项或为 0，则不进行过滤。
+        """
         symbols = self.dca_config.get("symbols", [])
-        normalized = []
+        normalized: List[str] = []
         for s in symbols:
             s = s.upper()
             if not s.endswith("USDT"):
                 s = f"{s}USDT"
             normalized.append(s)
-        return normalized
+
+        # 读取阈值（单位 USDT），支持在 dca_config 或 dca_config['params'] 中配置，默认 0 表示不过滤
+        min_vol_usdt = 0.0
+        try:
+            min_vol_usdt = float(self.dca_config.get("min_daily_volume_usdt", 0) or 0)
+        except Exception:
+            min_vol_usdt = 0.0
+        if min_vol_usdt <= 0:
+            try:
+                params = self.dca_config.get("params", {}) or {}
+                min_vol_usdt = float(params.get("min_daily_volume_usdt", 0) or 0)
+            except Exception:
+                min_vol_usdt = 0.0
+        if min_vol_usdt <= 0:
+            return normalized
+
+        # 需要 market_data 可用
+        filtered: List[str] = []
+        for sym in normalized:
+            try:
+                md = self.market_data.get_realtime_market_data(sym)
+                if not md:
+                    print(f"⚠️ 无法获取 {sym} 的实时数据，跳过流动性过滤，保守跳过")
+                    continue
+                price = float(md.get("price", 0) or 0)
+                vol = float(md.get("volume_24h", 0) or 0)
+                vol_usdt = price * vol
+                if vol_usdt >= min_vol_usdt:
+                    filtered.append(sym)
+                else:
+                    print(f"⤫ 过滤低流动性: {sym} 24h≈{vol_usdt:,.2f} USDT < min {min_vol_usdt}")
+            except Exception as e:
+                print(f"⚠️ 评估 {sym} 流动性失败: {e}")
+
+        if not filtered:
+            print("⚠️ 所有候选标的被流动性阈值过滤，返回原始候选列表以避免空列表")
+            return normalized
+
+        print(f"✅ 已过滤低流动性交易对，剩余: {len(filtered)}")
+        return filtered
 
     def _load_dca_rotation_config(self, initial: bool = False) -> None:
         if not os.path.exists(self.dca_config_path):
@@ -559,13 +626,13 @@ class TradingBot:
 </head>
 <body>
     <h2>DCA 实盘看板</h2>
-    <div>更新时间: {payload.get('timestamp')}</div>
+    <div>更新时间: {payload.get("timestamp")}</div>
     {api_probe_line}
     <div class="summary">
-        <div class="card">权益: {payload.get('equity')}</div>
-        <div class="card">峰值权益: {payload.get('peak_equity')}</div>
-        <div class="card">回撤(%): {payload.get('drawdown_pct')}</div>
-        <div class="card">挂单数: {payload.get('open_orders')}</div>
+        <div class="card">权益: {payload.get("equity")}</div>
+        <div class="card">峰值权益: {payload.get("peak_equity")}</div>
+        <div class="card">回撤(%): {payload.get("drawdown_pct")}</div>
+        <div class="card">挂单数: {payload.get("open_orders")}</div>
     </div>
     <table>
         <thead>
@@ -727,8 +794,8 @@ class TradingBot:
         df["bb_upper"] = df["bb_middle"] + (bb_std * 2)
         df["bb_lower"] = df["bb_middle"] - (bb_std * 2)
 
-        df["volume_quantile"] = df["volume"].rolling(window=60).apply(
-            lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
+        df["volume_quantile"] = (
+            df["volume"].rolling(window=60).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
         )
 
         df["quote_volume"] = df["volume"] * df["close"]
@@ -1074,11 +1141,14 @@ class TradingBot:
             if direction != "BOTH" and pos.get("side") != direction:
                 continue
 
-            state = self.dca_state.setdefault(symbol, {
-                "last_dca_price": pos.get("entry_price", 0),
-                "dca_count": 0,
-                "entry_time": now,
-            })
+            state = self.dca_state.setdefault(
+                symbol,
+                {
+                    "last_dca_price": pos.get("entry_price", 0),
+                    "dca_count": 0,
+                    "entry_time": now,
+                },
+            )
 
             realtime = self.market_data.get_realtime_market_data(symbol)
             current_price = realtime.get("price", 0) if realtime else 0
@@ -1215,7 +1285,8 @@ class TradingBot:
 
         # 1. 获取当前实际持仓交易对（最多2个）
         current_position_symbols = [
-            s for s in positions.keys()
+            s
+            for s in positions.keys()
             if positions[s] and abs(float(positions[s].get("amount", positions[s].get("positionAmt", 0)))) > 0
         ][:MAX_POSITIONS]
 
@@ -1288,10 +1359,10 @@ class TradingBot:
                     )
                     resp = ai.analyze_and_decide(prompt)
                     content = resp.get("content", "")
-                    
+
                     # 调试：打印AI返回的内容（截断）
                     print(f"📄 AI返回内容（前500字符）: {content[:500]}...")
-                    
+
                     multi_decisions = dp.parse_multi_symbol_response(content)
                     print(f"✅ AI返回{len(multi_decisions)}个决策")
                 except Exception as e:
@@ -1301,23 +1372,23 @@ class TradingBot:
         # 5. 处理AI决策：先平仓，再开仓
         # 5.1 检查所有当前持仓，看AI是否建议平仓
         min_conf = self._dca_ai_min_confidence()
-        
+
         for symbol in current_position_symbols:
             pos = positions.get(symbol)
             if not pos:
                 continue
-            
+
             # 获取AI决策（应该在multi_decisions中）
             decision = multi_decisions.get(symbol)
-            
+
             # 如果没有AI决策，跳过（保留持仓）
             if not decision:
                 print(f"⚠️ {symbol} 无AI决策，保留持仓")
                 continue
-            
+
             action = decision.get("action", "HOLD")
             confidence = decision.get("confidence", 0.0)
-            
+
             # 标准化confidence
             if isinstance(confidence, str):
                 conf_str = confidence.upper()
@@ -1327,14 +1398,14 @@ class TradingBot:
                 confidence = float(confidence)
             except Exception:
                 confidence = 0.5
-            
+
             # 判断是否执行平仓
             if action == "CLOSE" and confidence >= min_conf:
                 print(f"🔻 AI建议平仓: {symbol} (confidence={confidence:.2f})")
-                
+
                 market_data_for_close = self.get_market_data_for_symbol(symbol)
                 self.save_decision(symbol, decision, market_data_for_close)
-                
+
                 try:
                     # execute_decision会根据action=CLOSE执行平仓
                     self.execute_decision(symbol, decision, market_data_for_close)
@@ -1348,7 +1419,7 @@ class TradingBot:
                             self.trade_executor.close_long(symbol)
                     except Exception as e2:
                         print(f"❌ 直接平仓也失败: {e2}")
-                
+
                 # 清理 DCA 状态并写盘
                 try:
                     self.dca_state.pop(symbol, None)
@@ -1370,10 +1441,15 @@ class TradingBot:
 
         # 统计当前实际持仓数（可能在平仓后已经改变）
         positions_after_close = self.position_data.get_all_positions()
-        current_count = len([
-            s for s in positions_after_close.keys()
-            if positions_after_close[s] and abs(float(positions_after_close[s].get("amount", positions_after_close[s].get("positionAmt", 0)))) > 0
-        ])
+        current_count = len(
+            [
+                s
+                for s in positions_after_close.keys()
+                if positions_after_close[s]
+                and abs(float(positions_after_close[s].get("amount", positions_after_close[s].get("positionAmt", 0))))
+                > 0
+            ]
+        )
 
         if current_count >= MAX_POSITIONS:
             print(f"✋ 已达最大持仓数({current_count}/{MAX_POSITIONS})，不再开新仓")
@@ -1509,9 +1585,7 @@ class TradingBot:
             "multi_timeframe": multi_timeframe,
         }
 
-    def analyze_all_symbols_with_ai(
-        self, all_symbols_data: Dict[str, Any]
-    ) -> Dict[str, Dict[str, Any]]:
+    def analyze_all_symbols_with_ai(self, all_symbols_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         """使用AI一次性分析所有币种"""
         if not self.ai_client or not self.prompt_builder or not self.decision_parser:
             return {}
@@ -1574,9 +1648,7 @@ class TradingBot:
             print(f"{'=' * 60}\n")
 
             # 解析决策
-            decisions = self.decision_parser.parse_multi_symbol_response(
-                response["content"]
-            )
+            decisions = self.decision_parser.parse_multi_symbol_response(response["content"])
 
             # 显示所有决策
             print(f"\n{'=' * 60}")
@@ -1595,9 +1667,7 @@ class TradingBot:
             traceback.print_exc()
             return {}
 
-    def analyze_with_ai(
-        self, symbol: str, market_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def analyze_with_ai(self, symbol: str, market_data: Dict[str, Any]) -> Dict[str, Any]:
         """使用AI分析并获取决策"""
         if not self.ai_client or not self.prompt_builder or not self.decision_parser:
             return DecisionParser._get_default_decision()
@@ -1606,9 +1676,7 @@ class TradingBot:
             position = self.position_data.get_current_position(symbol)
 
             # 获取历史决策（最近3条）
-            history = [d for d in self.decision_history if d.get("symbol") == symbol][
-                -3:
-            ]
+            history = [d for d in self.decision_history if d.get("symbol") == symbol][-3:]
 
             # 构建提示词
             prompt = self.prompt_builder.build_analysis_prompt(
@@ -1645,9 +1713,7 @@ class TradingBot:
             print(f"❌ AI分析失败 {symbol}: {e}")
             return self.decision_parser._get_default_decision()
 
-    def analyze_with_strategy(
-        self, symbol: str, market_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def analyze_with_strategy(self, symbol: str, market_data: Dict[str, Any]) -> Dict[str, Any]:
         """使用规则策略分析并获取决策"""
         if not self.strategy:
             return DecisionParser._get_default_decision()
@@ -1845,9 +1911,7 @@ class TradingBot:
             return
 
         # 计算开仓数量
-        quantity = self._calculate_order_quantity(
-            symbol, position_percent, total_equity, current_price
-        )
+        quantity = self._calculate_order_quantity(symbol, position_percent, total_equity, current_price)
         if quantity <= 0:
             print(f"❌ {symbol} 计算出的数量无效: {quantity}")
             return
@@ -1856,25 +1920,60 @@ class TradingBot:
         # 默认遵循用户建议：建议止盈 +14%，最大止损 0.6%
         take_profit_percent = decision.get("take_profit_percent", 14.0)
         stop_loss_percent = decision.get("stop_loss_percent", -0.6)
+
+        def _normalize_pct(val: Any, default: float) -> float:
+            try:
+                v = float(val)
+            except Exception:
+                return default
+            if v == 0:
+                return 0.0
+            sign = -1.0 if v < 0 else 1.0
+            v = abs(v)
+            if v > 1.0:
+                v = v / 100.0
+            return sign * v
+
+        tp_pct = _normalize_pct(take_profit_percent, 0.14)
+        sl_pct = _normalize_pct(stop_loss_percent, -0.006)
+        # 支持基于 ATR 的止损（使用 ConfigLoader.get_atr_config 统一读取）
+        atr_cfg = ConfigLoader.get_atr_config(self.config)
+        use_atr = bool(atr_cfg.get("use_atr_stop_loss", False))
+        atr_multiplier = float(atr_cfg.get("atr_multiplier", 3.0))
+        atr_tf = str(atr_cfg.get("atr_timeframe", self.config.get("strategy", {}).get("interval", "1h")))
+        if use_atr:
+            try:
+                multi = self.market_data.get_multi_timeframe_data(symbol, [atr_tf])
+                atr_val = None
+                if multi and atr_tf in multi and "indicators" in multi[atr_tf]:
+                    atr_val = multi[atr_tf]["indicators"].get("atr_14")
+                if atr_val and atr_val > 0:
+                    # long: SL = price - atr * mult
+                    sl_price_atr = current_price - atr_val * atr_multiplier
+                    computed_sl_pct = (sl_price_atr / current_price) - 1.0
+                    # only use ATR SL if it's a meaningful move (not tiny)
+                    if abs(computed_sl_pct) > abs(sl_pct):
+                        sl_pct = computed_sl_pct
+                        try:
+                            decision["stop_loss_percent"] = sl_pct
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        # 强制最大止损绝对值（使用 ConfigLoader 统一规范化为分数，例如 0.006 表示 0.6%）
         try:
-            tp_pct = float(take_profit_percent)
+            max_sl_abs = ConfigLoader.get_max_stop_loss_abs(self.config)
         except Exception:
-            tp_pct = 14.0
-        try:
-            sl_pct = float(stop_loss_percent)
-        except Exception:
-            sl_pct = -0.6
-        # 强制最大止损绝对值不超过 0.6%
-        max_sl_abs = float(self.config.get("trading", {}).get("max_stop_loss_abs", 0.6))
+            max_sl_abs = 0.006
         if abs(sl_pct) > max_sl_abs:
-            print(f"⚠️ {symbol} 止损阈值 {sl_pct}% 超过最大允许 {max_sl_abs}%, 已截断")
+            print(f"⚠️ {symbol} 止损阈值 {sl_pct * 100:.2f}% 超过最大允许 {max_sl_abs * 100:.2f}%, 已截断")
             sl_pct = -abs(max_sl_abs)
             try:
                 decision["stop_loss_percent"] = sl_pct
             except Exception:
                 pass
-        take_profit = current_price * (1 + tp_pct / 100)
-        stop_loss = current_price * (1 + sl_pct / 100)
+        take_profit = current_price * (1 + tp_pct)
+        stop_loss = current_price * (1 + sl_pct)
 
         # 风险检查
         ok, errors = self.risk_manager.check_all_risk_limits(
@@ -1939,9 +2038,7 @@ class TradingBot:
             print("   请确保账户有足够的 USDT 余额")
             return
 
-        quantity = self._calculate_order_quantity(
-            symbol, position_percent, total_equity, current_price
-        )
+        quantity = self._calculate_order_quantity(symbol, position_percent, total_equity, current_price)
         if quantity <= 0:
             print(f"❌ {symbol} 计算出的数量无效: {quantity}")
             return
@@ -1950,18 +2047,27 @@ class TradingBot:
         # 默认遵循用户建议：建议止盈 +14%，最大止损 0.6%
         take_profit_percent = decision.get("take_profit_percent", 14.0)
         stop_loss_percent = decision.get("stop_loss_percent", -0.6)
-        try:
-            tp_pct = float(take_profit_percent)
-        except Exception:
-            tp_pct = 14.0
-        try:
-            sl_pct = float(stop_loss_percent)
-        except Exception:
-            sl_pct = -0.6
+
+        def _normalize_pct(val: Any, default: float) -> float:
+            try:
+                v = float(val)
+            except Exception:
+                return default
+            if v == 0:
+                return 0.0
+            sign = -1.0 if v < 0 else 1.0
+            v = abs(v)
+            if v > 1.0:
+                v = v / 100.0
+            return sign * v
+
+        tp_pct = _normalize_pct(take_profit_percent, 0.14)
+        sl_pct = _normalize_pct(stop_loss_percent, -0.006)
         # 对于空头，止损的语义可能为正或负，统一取绝对值并限制在 max_sl_abs
-        max_sl_abs = float(self.config.get("trading", {}).get("max_stop_loss_abs", 0.6))
+        max_sl_abs_raw = self.config.get("trading", {}).get("max_stop_loss_abs", 0.6)
+        max_sl_abs = _normalize_pct(max_sl_abs_raw, 0.006)
         if abs(sl_pct) > max_sl_abs:
-            print(f"⚠️ {symbol} 止损阈值 {sl_pct}% 超过最大允许 {max_sl_abs}%, 已截断")
+            print(f"⚠️ {symbol} 止损阈值 {sl_pct * 100:.2f}% 超过最大允许 {max_sl_abs * 100:.2f}%, 已截断")
             sl_pct = max_sl_abs if sl_pct > 0 else -max_sl_abs
             try:
                 decision["stop_loss_percent"] = sl_pct
@@ -1969,9 +2075,9 @@ class TradingBot:
                 pass
         tp_abs = abs(tp_pct)
         # 做空止盈位在当前价下方
-        take_profit = current_price * (1 - tp_abs / 100)
+        take_profit = current_price * (1 - tp_abs)
         # 做空止损位在当前价上方
-        stop_loss = current_price * (1 + abs(sl_pct) / 100)
+        stop_loss = current_price * (1 + abs(sl_pct))
 
         # 风险检查
         ok, errors = self.risk_manager.check_all_risk_limits(
@@ -2026,9 +2132,7 @@ class TradingBot:
             return 0.0
 
         quantity = self.client.format_quantity(symbol, raw_quantity)
-        quantity = self.client.ensure_min_notional_quantity(
-            symbol, quantity, current_price
-        )
+        quantity = self.client.ensure_min_notional_quantity(symbol, quantity, current_price)
         return quantity
 
     def _calc_tp_sl_prices(
@@ -2294,14 +2398,11 @@ class TradingBot:
             spot_ldusdt = account_summary.get("spot_ldusdt_balance", 0.0)
             if spot_total > 0:
                 spot_line = (
-                    f"   现货余额(含LDUSDT): {spot_total:.6f} USDT "
-                    f"(USDT: {spot_usdt:.6f}, LDUSDT: {spot_ldusdt:.6f})"
+                    f"   现货余额(含LDUSDT): {spot_total:.6f} USDT (USDT: {spot_usdt:.6f}, LDUSDT: {spot_ldusdt:.6f})"
                 )
                 cycle_log.append(spot_line)
                 print(spot_line)
-                note_line = (
-                    "   提示: LDUSDT 为理财资产，需赎回/划转后才能作为合约保证金"
-                )
+                note_line = "   提示: LDUSDT 为理财资产，需赎回/划转后才能作为合约保证金"
                 cycle_log.append(note_line)
                 print(note_line)
 
@@ -2515,7 +2616,9 @@ class TradingBot:
 
         print(f"\n⏱️  交易周期: 每{interval_seconds}秒")
         symbols_list = (
-            self._get_dca_symbols() if self.strategy_mode == "DCA_ROTATION" else ConfigLoader.get_trading_symbols(self.config)
+            self._get_dca_symbols()
+            if self.strategy_mode == "DCA_ROTATION"
+            else ConfigLoader.get_trading_symbols(self.config)
         )
         print(f"📊 交易币种: {', '.join(symbols_list)}")
         print(f"📁 日志目录: {self.logs_dir}")
@@ -2537,12 +2640,8 @@ class TradingBot:
             wait_until = next_boundary + download_delay_seconds
             initial_sleep = max(0, wait_until - now)
             if initial_sleep > 0:
-                next_ts = datetime.fromtimestamp(next_boundary).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                print(
-                    f"⏳ 等待对齐到下一次K线边界 {next_ts}，再延迟 {download_delay_seconds}s 后开始"
-                )
+                next_ts = datetime.fromtimestamp(next_boundary).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"⏳ 等待对齐到下一次K线边界 {next_ts}，再延迟 {download_delay_seconds}s 后开始")
                 time.sleep(initial_sleep)
 
             while True:
@@ -2561,9 +2660,7 @@ class TradingBot:
                 sleep_until = next_boundary + download_delay_seconds
                 sleep_time = sleep_until - time.time()
                 if sleep_time > 0:
-                    next_ts = datetime.fromtimestamp(next_boundary).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
+                    next_ts = datetime.fromtimestamp(next_boundary).strftime("%Y-%m-%d %H:%M:%S")
                     print(
                         f"\n💤 对齐等待：下次K线边界 {next_ts}，在其后 {download_delay_seconds}s 开始 (睡眠 {sleep_time:.0f}s)"
                     )

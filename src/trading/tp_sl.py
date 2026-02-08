@@ -1,9 +1,10 @@
+import time
+
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Literal, Tuple
 import json
 import os
-import time
 
 Side = Literal["BUY", "SELL"]
 PositionSide = Literal["LONG", "SHORT"]
@@ -29,9 +30,7 @@ class PapiTpSlManager:
     def __init__(self, broker: Any) -> None:
         self.broker = broker
         self._tick_size_cache: Dict[str, float] = {}
-        self._tick_cache_path = os.getenv(
-            "BINANCE_TICK_CACHE_PATH", "data/tick_size_cache.json"
-        )
+        self._tick_cache_path = os.getenv("BINANCE_TICK_CACHE_PATH", "data/tick_size_cache.json")
         self._load_tick_cache()
 
     def _load_tick_cache(self) -> None:
@@ -111,7 +110,8 @@ class PapiTpSlManager:
 
         # 先根据 stop_loss_pct 计算止损（如果未显式提供止损价格）
         if sl is None and cfg.stop_loss_pct:
-            sl = self._calc_by_pct(entry, cfg.stop_loss_pct, cfg.position_side, True)
+            sl_pct = self._normalize_pct(cfg.stop_loss_pct)
+            sl = self._calc_by_pct(entry, sl_pct, cfg.position_side, True)
 
         # 决定是否使用 RR 计算 TP：当未提供 take_profit_price 且 take_profit_pct 缺失或接近 0 时，使用 RR
         use_rr = False
@@ -123,24 +123,31 @@ class PapiTpSlManager:
         else:
             # 否则若明确提供了 take_profit_pct，则按百分比计算
             if tp is None and cfg.take_profit_pct:
-                tp = self._calc_by_pct(entry, cfg.take_profit_pct, cfg.position_side, False)
+                tp_pct = self._normalize_pct(cfg.take_profit_pct)
+                tp = self._calc_by_pct(entry, tp_pct, cfg.position_side, False)
 
         return sl, tp
 
-    def _calc_by_pct(
-        self, entry: float, pct: float, pos_side: PositionSide, is_sl: bool
-    ) -> float:
+    def _calc_by_pct(self, entry: float, pct: float, pos_side: PositionSide, is_sl: bool) -> float:
         if pos_side == "LONG":
             return entry * (1 - pct) if is_sl else entry * (1 + pct)
         return entry * (1 + pct) if is_sl else entry * (1 - pct)
 
-    def _calc_by_rr(
-        self, entry: float, sl: float, rr: float, pos_side: PositionSide
-    ) -> float:
+    def _calc_by_rr(self, entry: float, sl: float, rr: float, pos_side: PositionSide) -> float:
         risk = abs(entry - sl)
         if pos_side == "LONG":
             return entry + risk * rr
         return entry - risk * rr
+
+    def _normalize_pct(self, pct: float) -> float:
+        try:
+            val = float(pct)
+        except Exception:
+            return 0.0
+        val = abs(val)
+        if val > 1.0:
+            return val / 100.0
+        return val
 
     def _base_order(self, cfg: TpSlConfig) -> Dict[str, Any]:
         order_side: Side = "SELL" if cfg.position_side == "LONG" else "BUY"
@@ -149,6 +156,7 @@ class PapiTpSlManager:
             "side": order_side,
             "workingType": "MARK_PRICE",
             "timeInForce": "GTC",
+            "closePosition": True,
         }
 
         pos_side = self.broker.calculate_position_side(order_side, True)
@@ -204,8 +212,25 @@ class PapiTpSlManager:
     def _round(self, price: float, symbol: str) -> float:
         tick_size = self._get_tick_size(symbol)
         if tick_size is None:
-            return round(price, 2)
+            return self._round_fallback(price)
         return self._round_to_tick(price, tick_size)
+
+    def _round_fallback(self, price: float) -> float:
+        if price <= 0:
+            return price
+        if price < 0.0001:
+            decimals = 8
+        elif price < 0.01:
+            decimals = 6
+        elif price < 1:
+            decimals = 5
+        elif price < 10:
+            decimals = 4
+        elif price < 100:
+            decimals = 3
+        else:
+            decimals = 2
+        return round(price, decimals)
 
     def _round_to_tick(self, price: float, tick_size: float) -> float:
         if tick_size <= 0:

@@ -1,20 +1,18 @@
-import sys
-from pathlib import Path
-
-# Ensure project root is importable
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-import time
-import pytest
-
 from src.trading.position_state_machine import (
     PositionStateMachineV2,
     PositionSnapshot,
     PositionLifecycle,
     ProtectionState,
 )
+
 from src.trading.intents import PositionSide
+
+import sys
+from pathlib import Path
+
+# Ensure project root is importable
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 
 class DummyClient:

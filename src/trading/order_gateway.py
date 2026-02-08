@@ -1,11 +1,11 @@
+import requests  # type: ignore
+
+import math
+
 import os
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-
-import requests  # type: ignore
-import math
-import json
 
 
 class OrderGateway:
@@ -40,9 +40,7 @@ class OrderGateway:
             os.makedirs(logs_dir, exist_ok=True)
             path = os.path.join(logs_dir, "order_rejects.log")
             ts = datetime.now().isoformat()
-            line = (
-                f"{ts} symbol={symbol} side={side} params={params} error={error}\n"
-            )
+            line = f"{ts} symbol={symbol} side={side} params={params} error={error}\n"
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
         except Exception:
@@ -101,15 +99,7 @@ class OrderGateway:
         if not reduce_only and not is_close_position:
             last_ts = self._open_locks.get(lock_key)
             if last_ts and now - last_ts < delay:
-                msg = (
-                    "[OPEN BLOCKED] "
-                    + symbol
-                    + " "
-                    + side
-                    + " within "
-                    + str(delay)
-                    + "s lock"
-                )
+                msg = "[OPEN BLOCKED] " + symbol + " " + side + " within " + str(delay) + "s lock"
                 raise RuntimeError(msg)
 
         # 计算用于仓位检查的 position side（兼容 BUY/SELL 和 LONG/SHORT）
@@ -125,11 +115,7 @@ class OrderGateway:
         # 对于平仓请求（closePosition）应跳过此检查
         cond_skip_l2 = not reduce_only and not is_close_position
         if cond_skip_l2 and self.has_open_position(symbol, pos_check_side):
-            msg = (
-                "[OPEN BLOCKED] "
-                + symbol
-                + " already has open position (real check via positionAmt)"
-            )
+            msg = "[OPEN BLOCKED] " + symbol + " already has open position (real check via positionAmt)"
             raise RuntimeError(msg)
 
         # 记录锁（先锁，防并发）
@@ -151,9 +137,7 @@ class OrderGateway:
 
             if qty and price and float(price) > 0:
                 try:
-                    adjusted = self.broker.ensure_min_notional_quantity(
-                        symbol, float(qty), float(price)
-                    )
+                    adjusted = self.broker.ensure_min_notional_quantity(symbol, float(qty), float(price))
                     if adjusted != float(qty):
                         # 更新最终参数为符合最小名义量的数量
                         final["quantity"] = adjusted
@@ -180,10 +164,7 @@ class OrderGateway:
 
                 # 🚫 致命权限错误：直接抛出，禁止 retry
                 if self._is_fatal_auth_error(data):
-                    msg = (
-                        "[FATAL AUTH ERROR] API key has no futures permission "
-                        "or invalid IP: " + str(data)
-                    )
+                    msg = "[FATAL AUTH ERROR] API key has no futures permission or invalid IP: " + str(data)
                     raise RuntimeError(msg)
 
                 # 🚫 -1116 Invalid orderType: 检查仓位（按方向），若已变则直接返回 warning
@@ -201,9 +182,7 @@ class OrderGateway:
                         }
 
                 # 🔥 L3: 失败后 → 再查一次仓位（防止已成交）
-                cond_l3 = not reduce_only and self.has_open_position(
-                    symbol, pos_check_side
-                )
+                cond_l3 = not reduce_only and self.has_open_position(symbol, pos_check_side)
                 if cond_l3:
                     print("[WARN] Order failed but position exists")
                     print(data)
@@ -223,15 +202,11 @@ class OrderGateway:
             # 🚫 致命权限错误：直接抛出，禁止 retry
             if self._is_fatal_auth_error(e):
                 raise RuntimeError(
-                    "[FATAL AUTH ERROR] API key has no futures permission or invalid IP: "
-                    + str(e)
+                    "[FATAL AUTH ERROR] API key has no futures permission or invalid IP: " + str(e)
                 ) from e
 
             # 🚫 -1116 Invalid orderType: 检查仓位，若已变則直接返回 warning
-            if (
-                isinstance(e, requests.HTTPError)
-                and getattr(e, "response", None) is not None
-            ):
+            if isinstance(e, requests.HTTPError) and getattr(e, "response", None) is not None:
                 # 尝试解析交易所返回的 JSON 错误
                 try:
                     err_data = e.response.json()
@@ -268,7 +243,12 @@ class OrderGateway:
                             price = final.get("price")
                             if not price:
                                 try:
-                                    t = self.broker.request("GET", f"{self.broker.MARKET_BASE}/fapi/v1/ticker/24hr", params={"symbol": symbol}, allow_error=True)
+                                    t = self.broker.request(
+                                        "GET",
+                                        f"{self.broker.MARKET_BASE}/fapi/v1/ticker/24hr",
+                                        params={"symbol": symbol},
+                                        allow_error=True,
+                                    )
                                     price = float(t.json().get("lastPrice", 0)) if t is not None else None
                                 except Exception:
                                     price = None
@@ -278,7 +258,9 @@ class OrderGateway:
                                 if step_size and step_size > 0:
                                     required_qty = math.ceil(required_qty / step_size) * step_size
                                 required_qty = round(required_qty, 8)
-                                print(f"❗ -4164 最小名义额限制: symbol={symbol} min_notional={min_notional} price={price} -> required_qty~={required_qty}")
+                                print(
+                                    f"❗ -4164 最小名义额限制: symbol={symbol} min_notional={min_notional} price={price} -> required_qty~={required_qty}"
+                                )
 
                                 # 尝试用调整后的数量重试一次下单（仅一次）
                                 try:
@@ -326,9 +308,7 @@ class OrderGateway:
                 self._log_order_reject(symbol, side, final, str(e))
 
             # 🔥 L3: 失败后 → 再查一次仓位（防止已成交）
-            cond_l3_exc = not reduce_only and self.has_open_position(
-                symbol, pos_check_side
-            )
+            cond_l3_exc = not reduce_only and self.has_open_position(symbol, pos_check_side)
             if cond_l3_exc:
                 print("[WARNING] Exception but position exists:")
                 print(e)
@@ -423,9 +403,7 @@ class OrderGateway:
 
         return results
 
-    def _finalize_params(
-        self, params: Dict[str, Any], side: str, reduce_only: bool
-    ) -> Dict[str, Any]:
+    def _finalize_params(self, params: Dict[str, Any], side: str, reduce_only: bool) -> Dict[str, Any]:
         """
         格式化订单参数，兼容 PAPI 实盘：
         - 全仓平仓必须传 closePosition=True + quantity（PAPI 要求）
@@ -455,10 +433,7 @@ class OrderGateway:
             p.pop("positionSide", None)
 
         # 全仓平仓必须带 quantity
-        if (
-            p.get("closePosition") is True
-            or str(p.get("closePosition")).lower() == "true"
-        ):
+        if p.get("closePosition") is True or str(p.get("closePosition")).lower() == "true":
             p["closePosition"] = True
             if "quantity" not in p or not p["quantity"]:
                 pos = self.broker.position.get_position(p.get("symbol"), side="BOTH")

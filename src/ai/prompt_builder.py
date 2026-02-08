@@ -42,7 +42,7 @@ class PromptBuilder:
         prompt = f"""
 # 加密货币期货交易分析
 
-当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+当前时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 ## 交易规则
 
@@ -57,15 +57,15 @@ class PromptBuilder:
 考虑趋势、动量、波动率等因素，合理设置止盈止损。
 
 ### 仓位管理
-- 最小仓位: {self.config['trading'].get('min_position_percent', 10)}%
-- 最大仓位: {self.config['trading'].get('max_position_percent', 30)}%
-- 预留资金: {self.config['trading'].get('reserve_percent', 20)}%
+- 最小仓位: {self.config["trading"].get("min_position_percent", 10)}%
+- 最大仓位: {self.config["trading"].get("max_position_percent", 30)}%
+- 预留资金: {self.config["trading"].get("reserve_percent", 20)}%
 
 - ### 风险控制
-- 最大每日亏损: {self.config['risk'].get('max_daily_loss_percent', 10)}%
-- 最大连续亏损: {self.config['risk'].get('max_consecutive_losses', 5)}次
-- 建议止损: -{self.config['risk'].get('stop_loss_default_percent', 2) * 100}%
-- 建议止盈: +{self.config['risk'].get('take_profit_default_percent', 5) * 100}%
+- 最大每日亏损: {self.config["risk"].get("max_daily_loss_percent", 10)}%
+- 最大连续亏损: {self.config["risk"].get("max_consecutive_losses", 5)}次
+- 建议止损: -{self.config["risk"].get("stop_loss_default_percent", 2) * 100}%
+- 建议止盈: +{self.config["risk"].get("take_profit_default_percent", 5) * 100}%
 
 ## 市场数据
 
@@ -215,7 +215,7 @@ class PromptBuilder:
 
 **【输出格式】你必须以纯JSON格式回复，不要包含任何解释、注释或额外文本。**
 
-当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+当前时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
     ## 交易账户
     - 账户类型: Binance U本位永续合约
@@ -223,13 +223,13 @@ class PromptBuilder:
     - 杠杆范围: 1-100倍（建议3-10倍）
 
     ### 仓位管理
-    - 最小仓位: {self.config['trading'].get('min_position_percent', 10)}%
-    - 最大仓位: {self.config['trading'].get('max_position_percent', 30)}%
+    - 最小仓位: {self.config["trading"].get("min_position_percent", 10)}%
+    - 最大仓位: {self.config["trading"].get("max_position_percent", 30)}%
     - 每个币种独立决策，不受其他币种影响
 
     ### 风险控制
-    - 最大止损: -{self.config['risk'].get('stop_loss_default_percent', 2) * 100}%
-    - 建议止盈: +{self.config['risk'].get('take_profit_default_percent', 5) * 100}%
+    - 最大止损: -{self.config["risk"].get("stop_loss_default_percent", 2) * 100}%
+    - 建议止盈: +{self.config["risk"].get("take_profit_default_percent", 5) * 100}%
 
     ## 市场数据
 
@@ -358,9 +358,7 @@ class PromptBuilder:
                     ema20 = ind.get("ema_20") or 0
                     ema50 = ind.get("ema_50") or 0
                     atr = ind.get("atr_14") or 0
-                    block.append(
-                        f"RSI: {rsi:.1f} | MACD: {macd:.4f} | EMA20: {ema20:.2f} | EMA50: {ema50:.2f}"
-                    )
+                    block.append(f"RSI: {rsi:.1f} | MACD: {macd:.4f} | EMA20: {ema20:.2f} | EMA50: {ema50:.2f}")
                     block.append(f"ATR: {atr:.2f}")
 
             result_lines.append("\n".join(block))

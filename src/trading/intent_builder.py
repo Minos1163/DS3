@@ -47,9 +47,7 @@ class IntentBuilder:
         )
 
     @staticmethod
-    def build_close(
-        symbol: str, side: PositionSide, quantity: Optional[float] = None
-    ) -> TradeIntent:
+    def build_close(symbol: str, side: PositionSide, quantity: Optional[float] = None) -> TradeIntent:
         """
         构建平仓意图
         - quantity=None 或 quantity=0 表示全仓平掉（PAPI 需要同时传 closePosition=True 和 quantity）
@@ -82,9 +80,7 @@ class IntentBuilder:
         return IntentBuilder.build_close(symbol, side, quantity)
 
     @staticmethod
-    def build_set_protection(
-        symbol: str, tp: Optional[float] = None, sl: Optional[float] = None
-    ) -> TradeIntent:
+    def build_set_protection(symbol: str, tp: Optional[float] = None, sl: Optional[float] = None) -> TradeIntent:
         return TradeIntent(
             symbol=symbol,
             action=IntentAction.SET_PROTECTION,

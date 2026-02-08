@@ -36,9 +36,7 @@ class DecisionParser:
 
             # 如果被markdown代码块包裹，提取内容
             if "```" in response:
-                match = re.search(
-                    r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL
-                )
+                match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL)
                 if match:
                     response = match.group(1)
 
@@ -175,9 +173,7 @@ class DecisionParser:
 
             # 如果被markdown代码块包裹，提取内容
             if "```" in response:
-                match = re.search(
-                    r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL
-                )
+                match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL)
                 if match:
                     response = match.group(1)
 
@@ -203,9 +199,7 @@ class DecisionParser:
             for symbol, decision in normalized_decisions.items():
                 if isinstance(decision, dict):
                     # 特殊处理 confidence：如果是字符串，转换为数字
-                    if "confidence" in decision and isinstance(
-                        decision["confidence"], str
-                    ):
+                    if "confidence" in decision and isinstance(decision["confidence"], str):
                         conf_str = decision["confidence"].upper()
                         if conf_str == "HIGH":
                             decision["confidence"] = 0.8

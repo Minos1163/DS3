@@ -9,9 +9,13 @@ import os
 import sys
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
 
-from src.backtest import BacktestEngine
+# Import local BacktestEngine; if import fails, add project root to sys.path and retry
+try:
+  from src.backtest import BacktestEngine
+except Exception:
+  sys.path.insert(0, PROJECT_ROOT)
+  from src.backtest import BacktestEngine
 
 
 def main():
@@ -20,5 +24,5 @@ def main():
     engine.download_data(force_download=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

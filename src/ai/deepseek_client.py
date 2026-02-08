@@ -3,11 +3,12 @@ DeepSeek AI客户端
 调用DeepSeek API进行交易决策
 """
 
+from openai import OpenAI
+
+
 import os
 import warnings
 from typing import Any, Dict, Optional
-
-from openai import OpenAI
 
 
 class DeepSeekClient:
@@ -78,12 +79,8 @@ class DeepSeekClient:
                 reasoning_content = getattr(response, "reasoning_content", None)
 
             # 尝试从 response.choices[0] 获取
-            if not reasoning_content and hasattr(
-                response.choices[0], "reasoning_content"
-            ):
-                reasoning_content = getattr(
-                    response.choices[0], "reasoning_content", None
-                )
+            if not reasoning_content and hasattr(response.choices[0], "reasoning_content"):
+                reasoning_content = getattr(response.choices[0], "reasoning_content", None)
 
             # 打印推理过程（如果有）
             if reasoning_content:
@@ -97,9 +94,7 @@ class DeepSeekClient:
                 "raw_response": response,
                 "usage": {
                     "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(
-                        response.usage, "completion_tokens", 0
-                    ),
+                    "completion_tokens": getattr(response.usage, "completion_tokens", 0),
                     "total_tokens": getattr(response.usage, "total_tokens", 0),
                 },
             }

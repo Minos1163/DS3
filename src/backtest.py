@@ -3,15 +3,12 @@
 下载历史数据并进行回测分析
 """
 
-import os
-import sys
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-
 import pandas as pd
 
 from src.api.binance_client import BinanceClient
+
 from src.config.env_manager import EnvManager
+
 from src.utils.indicators import (
     calculate_atr,
     calculate_bollinger_bands,
@@ -20,6 +17,13 @@ from src.utils.indicators import (
     calculate_rsi,
     calculate_sma,
 )
+
+
+import os
+import sys
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
 
 # 添加项目根目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -86,9 +90,7 @@ class BacktestEngine:
         end_time = datetime.now()
         start_time = end_time - timedelta(days=self.days)
 
-        print(
-            f"时间范围: {start_time.strftime('%Y-%m-%d')} 至 {end_time.strftime('%Y-%m-%d')}"
-        )
+        print(f"时间范围: {start_time.strftime('%Y-%m-%d')} 至 {end_time.strftime('%Y-%m-%d')}")
 
         all_klines = []
         current_time = start_time
@@ -101,9 +103,10 @@ class BacktestEngine:
                 start_ms = int(current_time.timestamp() * 1000)
                 end_ms = int(request_end.timestamp() * 1000)
 
-                print(f"   下载 {
-                    current_time.strftime('%Y-%m-%d %H:%M')} ~ {
-                    request_end.strftime('%Y-%m-%d %H:%M')} ...", end="")
+                print(
+                    f"   下载 {current_time.strftime('%Y-%m-%d %H:%M')} ~ {request_end.strftime('%Y-%m-%d %H:%M')} ...",
+                    end="",
+                )
 
                 # 使用币安API下载K线
                 klines = self.client.get_klines(
@@ -169,12 +172,8 @@ class BacktestEngine:
             print(f"   开始时间: {self.df.index[0]}")
             print(f"   结束时间: {self.df.index[-1]}")
             print(f"   数据点数: {len(self.df)}")
-            print(
-                f"   开盘价范围: {self.df['open'].min():.2f} - {self.df['open'].max():.2f}"
-            )
-            print(
-                f"   收盘价范围: {self.df['close'].min():.2f} - {self.df['close'].max():.2f}"
-            )
+            print(f"   开盘价范围: {self.df['open'].min():.2f} - {self.df['open'].max():.2f}")
+            print(f"   收盘价范围: {self.df['close'].min():.2f} - {self.df['close'].max():.2f}")
 
         return self.df
 
@@ -207,9 +206,7 @@ class BacktestEngine:
             self.df["rsi"] = calculate_rsi(close, period=14)
 
             # MACD
-            macd, macd_signal, macd_hist = calculate_macd(
-                close, fast=12, slow=26, signal=9
-            )
+            macd, macd_signal, macd_hist = calculate_macd(close, fast=12, slow=26, signal=9)
             self.df["macd"] = macd
             self.df["macd_signal"] = macd_signal
             self.df["macd_hist"] = macd_hist
@@ -226,9 +223,7 @@ class BacktestEngine:
             self.df["atr"] = calculate_atr(high, low, close, period=14)
 
             # 布林带
-            bb_middle, bb_upper, bb_lower = calculate_bollinger_bands(
-                close, period=20, num_std=2
-            )
+            bb_middle, bb_upper, bb_lower = calculate_bollinger_bands(close, period=20, num_std=2)
             self.df["bb_upper"] = bb_upper
             self.df["bb_middle"] = bb_middle
             self.df["bb_lower"] = bb_lower
@@ -336,16 +331,14 @@ class BacktestEngine:
         print(f"   总K线数: {analysis['total_candles']}")
         print(f"   买入信号: {analysis['buy_signals']}")
         print(f"   卖出信号: {analysis['sell_signals']}")
-        print(f"   看涨K线: {
-            analysis['bullish_candles']} ({
-            100 *
-            analysis['bullish_candles'] /
-            analysis['total_candles']:.1f}%)")
-        print(f"   看跌K线: {
-            analysis['bearish_candles']} ({
-            100 *
-            analysis['bearish_candles'] /
-            analysis['total_candles']:.1f}%)")
+        print(
+            f"   看涨K线: {analysis['bullish_candles']} ({
+                100 * analysis['bullish_candles'] / analysis['total_candles']:.1f}%)"
+        )
+        print(
+            f"   看跌K线: {analysis['bearish_candles']} ({
+                100 * analysis['bearish_candles'] / analysis['total_candles']:.1f}%)"
+        )
 
         return analysis
 
@@ -449,9 +442,7 @@ class BacktestEngine:
 
             print("\n✅ 回测完成")
             print(f"   交易总数: {len(trades)}")
-            print(
-                f"   胜率: {win_trades}/{len(trades)} ({100 * win_trades / len(trades):.1f}%)"
-            )
+            print(f"   胜率: {win_trades}/{len(trades)} ({100 * win_trades / len(trades):.1f}%)")
             print(f"   总盈亏: {total_pnl:.2f} USDT ({total_return:+.2f}%)")
             print(f"   平均盈亏: {total_pnl / len(trades):.2f} USDT")
         else:
@@ -459,9 +450,7 @@ class BacktestEngine:
 
         return backtest_result
 
-    def generate_report(
-        self, analysis: Dict[str, Any], backtest: Dict[str, Any]
-    ) -> str:
+    def generate_report(self, analysis: Dict[str, Any], backtest: Dict[str, Any]) -> str:
         """生成回测报告"""
         lines: List[str] = []
         lines.append("=" * 60)
@@ -483,16 +472,8 @@ class BacktestEngine:
         lines.append(f"最大回撤: {backtest['max_drawdown_percent']:.2f}%")
         lines.append("")
         lines.append("【K线分析】")
-        bullish_pct = (
-            100 * analysis["bullish_candles"] / analysis["total_candles"]
-            if analysis["total_candles"]
-            else 0
-        )
-        bearish_pct = (
-            100 * analysis["bearish_candles"] / analysis["total_candles"]
-            if analysis["total_candles"]
-            else 0
-        )
+        bullish_pct = 100 * analysis["bullish_candles"] / analysis["total_candles"] if analysis["total_candles"] else 0
+        bearish_pct = 100 * analysis["bearish_candles"] / analysis["total_candles"] if analysis["total_candles"] else 0
         lines.append(f"看涨K线: {analysis['bullish_candles']} ({bullish_pct:.1f}%)")
         lines.append(f"看跌K线: {analysis['bearish_candles']} ({bearish_pct:.1f}%)")
         lines.append("")
@@ -521,12 +502,10 @@ class BacktestEngine:
         if backtest["trades"]:
             report += "\n【最近交易】 (最多显示5条)\n"
             for trade in backtest["trades"][-5:]:
-                pnl_str = f"+{
-                    trade['pnl']:.2f}" if trade["pnl"] > 0 else f"{
-                    trade['pnl']:.2f}"
-                return_str = f"+{
-                    trade['pnl_percent']:.2f}%" if trade["pnl_percent"] > 0 else f"{
-                    trade['pnl_percent']:.2f}%"
+                pnl_str = f"+{trade['pnl']:.2f}" if trade["pnl"] > 0 else f"{trade['pnl']:.2f}"
+                return_str = (
+                    f"+{trade['pnl_percent']:.2f}%" if trade["pnl_percent"] > 0 else f"{trade['pnl_percent']:.2f}%"
+                )
                 report += f"  {trade['entry_time']} 买入 @ {trade['entry_price']:.2f}\n"
                 report += f"  {trade['exit_time']} 卖出 @ {trade['exit_price']:.2f}\n"
                 report += f"  盈亏: {pnl_str} ({return_str})\n\n"
@@ -559,17 +538,13 @@ class BacktestEngine:
             print(report)
 
             # 6. 保存报告
-            report_file = f"backtest_report_{
-                self.symbol}_{
-                datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            report_file = f"backtest_report_{self.symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             with open(report_file, "w", encoding="utf-8") as f:
                 f.write(report)
             print(f"📄 报告已保存到: {report_file}")
 
             # 7. 保存数据
-            csv_file = f"backtest_data_{
-                self.symbol}_{
-                datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            csv_file = f"backtest_data_{self.symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             self.df.to_csv(csv_file)
             print(f"💾 数据已保存到: {csv_file}")
 

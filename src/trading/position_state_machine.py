@@ -1,10 +1,11 @@
+from src.trading.intents import IntentAction, PositionSide, TradeIntent
+
 # position_state_machine.py
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from src.trading.intents import IntentAction, PositionSide, TradeIntent
 
 # =========================
 # 状态枚举
@@ -211,10 +212,7 @@ class PositionStateMachineV2:
                     snap_side = intent.side
 
                 existing_snapshot = self.snapshots.get(intent.symbol)
-                if (
-                    existing_snapshot is not None
-                    and existing_snapshot.side == snap_side
-                ):
+                if existing_snapshot is not None and existing_snapshot.side == snap_side:
                     existing_snapshot.quantity = amt
                     existing_snapshot.last_update_ts = time.time()
                 else:
@@ -383,11 +381,7 @@ class PositionStateMachineV2:
             tp_order_id=tp_id,
             sl_order_id=sl_id,
         )
-        snap.lifecycle = (
-            PositionLifecycle.PROTECTED
-            if snap.protection.is_active()
-            else PositionLifecycle.OPEN
-        )
+        snap.lifecycle = PositionLifecycle.PROTECTED if snap.protection.is_active() else PositionLifecycle.OPEN
         snap.last_update_ts = time.time()
 
         return {"status": "protected", "orders": result, "snapshot": snap}
@@ -414,8 +408,7 @@ class PositionStateMachineV2:
         query_side = intent.side.value if intent.side else None
         pos = self.client.get_position(intent.symbol, side=query_side)
         if not pos:
-            return {"status": "success", "message": f"No {
-                    query_side or ''} position to close"}
+            return {"status": "success", "message": f"No {query_side or ''} position to close"}
 
         amt = float(pos.get("positionAmt", 0))
         p_side = pos.get("positionSide", "BOTH")
@@ -432,11 +425,7 @@ class PositionStateMachineV2:
             order_side = "SELL" if amt > 0 else "BUY"
 
         # 🔥 核心逻辑：全仓平仓必须带 quantity
-        is_full_close = (
-            intent.quantity is None
-            or intent.quantity == 0
-            or abs(intent.quantity - abs(amt)) < 1e-8
-        )
+        is_full_close = intent.quantity is None or intent.quantity == 0 or abs(intent.quantity - abs(amt)) < 1e-8
         if is_full_close:
             # 全仓平仓：带 quantity 和 closePosition=True
             order_type = intent.order_type if intent.order_type else "MARKET"
@@ -598,10 +587,7 @@ class PositionStateMachineV2:
             snap.protection.sl_order_id = None
             snap.protection.stop_loss = None
 
-        if (
-            not snap.protection.is_active()
-            and snap.lifecycle == PositionLifecycle.PROTECTED
-        ):
+        if not snap.protection.is_active() and snap.lifecycle == PositionLifecycle.PROTECTED:
             snap.lifecycle = PositionLifecycle.OPEN
 
     def on_position_update(

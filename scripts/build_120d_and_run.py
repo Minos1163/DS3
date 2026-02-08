@@ -1,61 +1,58 @@
-import os
-import sys
-import pandas as pd
-from datetime import timedelta
+from tools.backtest_15m30d_v2 import ConservativeBacktester
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from backtest_15m30d_v2 import ConservativeBacktester
+import os
+import pandas as pd
+
+# prefer explicit package import so static analyzers (Pylance) can resolve it
 
 
 def resample_5m_to_15m(df5m: pd.DataFrame) -> pd.DataFrame:
     # assume index is DatetimeIndex
     df = df5m.copy()
-    ohlc = {
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }
-    df15 = df.resample('15T').apply(ohlc).dropna()
+    # annotate as mapping to Any to satisfy static type-checkers
+    from typing import Any
+
+    ohlc: dict[str, Any] = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    # use .agg which is the explicit aggregation API
+    df15 = df.resample("15T").agg(ohlc).dropna()
     return df15
 
 
 def build_120d():
-    os.makedirs('data', exist_ok=True)
+    os.makedirs("data", exist_ok=True)
     parts = []
     # candidate files in descending coverage preference
     candidates = [
-        'data/SOLUSDT_15m_60d.csv',
-        'data/SOLUSDT_15m_30d.csv',
-        'data/SOLUSDT_15m_15d.csv',
-        'data/SOLUSDT_5m_15d.csv'
+        "data/SOLUSDT_15m_60d.csv",
+        "data/SOLUSDT_15m_30d.csv",
+        "data/SOLUSDT_15m_15d.csv",
+        "data/SOLUSDT_5m_15d.csv",
     ]
 
     for p in candidates:
         if not os.path.exists(p):
             continue
-        df = pd.read_csv(p, index_col='timestamp', parse_dates=True)
+        df = pd.read_csv(p, index_col="timestamp", parse_dates=True)
         # if 5m file, resample
-        if '5m' in os.path.basename(p):
+        if "5m" in os.path.basename(p):
             df = resample_5m_to_15m(df)
         parts.append(df)
 
     if not parts:
-        print('未找到可用数据文件来构建 120 天样本（请提供数据）。')
+        print("未找到可用数据文件来构建 120 天样本（请提供数据）。")
         return None
 
     df_all = pd.concat(parts)
     # sort, drop duplicates keeping first occurrence
-    df_all = df_all[~df_all.index.duplicated(keep='first')]
+    df_all = df_all[~df_all.index.duplicated(keep="first")]
     df_all = df_all.sort_index()
 
     # check duration; if less than 120 days, warn but still save
     span_days = (df_all.index[-1] - df_all.index[0]).days
     print(f"合并后数据点: {len(df_all)} 行, 覆盖天数: {span_days} 天")
 
-    out = 'data/SOLUSDT_15m_120d.csv'
-    df_all.to_csv(out, index_label='timestamp')
+    out = "data/SOLUSDT_15m_120d.csv"
+    df_all.to_csv(out, index_label="timestamp")
     print(f"已保存: {out}")
     return out
 
@@ -71,9 +68,9 @@ def run_backtest_on_120d(file_path):
     bt.analyze_results()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     out = build_120d()
     if out:
         run_backtest_on_120d(out)
     else:
-        print('构建 120 天数据失败，无法运行回测。')
+        print("构建 120 天数据失败，无法运行回测。")

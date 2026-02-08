@@ -31,9 +31,7 @@ class MarketDataManager:
         """
         self.client = client
 
-    def get_multi_timeframe_data(
-        self, symbol: str, intervals: List[str]
-    ) -> Dict[str, Any]:
+    def get_multi_timeframe_data(self, symbol: str, intervals: List[str]) -> Dict[str, Any]:
         """
         获取多周期K线数据
 
@@ -144,9 +142,7 @@ class MarketDataManager:
         indicators["sma_50"] = sma_50 if sma_50 is not None else 0
 
         # 布林带
-        bb_middle, bb_upper, bb_lower = calculate_bollinger_bands(
-            close, period=20, num_std=2.0
-        )
+        bb_middle, bb_upper, bb_lower = calculate_bollinger_bands(close, period=20, num_std=2.0)
         indicators["bollinger_middle"] = bb_middle if bb_middle is not None else 0
         indicators["bollinger_upper"] = bb_upper if bb_upper is not None else 0
         indicators["bollinger_lower"] = bb_lower if bb_lower is not None else 0
@@ -159,9 +155,7 @@ class MarketDataManager:
         if len(volume) >= 20:
             avg_volume = volume.tail(20).mean()
             current_volume = volume.iloc[-1]
-            indicators["volume_ratio"] = calculate_volume_ratio(
-                current_volume, avg_volume
-            )
+            indicators["volume_ratio"] = calculate_volume_ratio(current_volume, avg_volume)
             indicators["avg_volume"] = avg_volume
 
         return indicators

@@ -1,15 +1,21 @@
+from src.api.binance_client import BinanceClient
+
+from src.trading.intent_builder import IntentBuilder
+
+from src.trading.intent_guard import IntentGuard
+
+from src.trading.intents import IntentAction
+
+from src.trading.intents import PositionSide as IntentPositionSide
+
+from src.trading.intents import TradeIntent
+
+from src.utils.decorators import log_execution, retry_on_failure
+
 import dataclasses
 import os
 from datetime import datetime
 from typing import Any, Dict, Optional
-
-from src.api.binance_client import BinanceClient
-from src.trading.intent_builder import IntentBuilder
-from src.trading.intent_guard import IntentGuard
-from src.trading.intents import IntentAction
-from src.trading.intents import PositionSide as IntentPositionSide
-from src.trading.intents import TradeIntent
-from src.utils.decorators import log_execution, retry_on_failure
 
 
 class TradeExecutor:
@@ -31,6 +37,7 @@ class TradeExecutor:
     # =========================
     # 核心执行入口（私有）
     # =========================
+
     def _has_position(self, symbol: str, side: IntentPositionSide) -> bool:
         """检查状态机中是否存在指定 symbol 和 side 的仓位快照"""
         snapshot = self.state.snapshots.get(symbol)
@@ -296,9 +303,7 @@ class TradeExecutor:
         # 否则部分平仓，使用 reduceOnly=True
         if intent.quantity is None or intent.quantity == 0:
             # 全仓平仓：不设置 reduceOnly，让状态机使用 closePosition
-            intent = dataclasses.replace(
-                intent, quantity=abs(float(pos["positionAmt"]))
-            )
+            intent = dataclasses.replace(intent, quantity=abs(float(pos["positionAmt"])))
         else:
             # 部分平仓：使用 reduceOnly=True
             intent = dataclasses.replace(intent, reduce_only=True)
@@ -363,16 +368,12 @@ class TradeExecutor:
     # =========================
     @log_execution
     @retry_on_failure(max_retries=3, delay=20)
-    def close_long(
-        self, symbol: str, quantity: Optional[float] = None
-    ) -> Dict[str, Any]:
+    def close_long(self, symbol: str, quantity: Optional[float] = None) -> Dict[str, Any]:
         return self._close(symbol, IntentPositionSide.LONG, quantity)
 
     @log_execution
     @retry_on_failure(max_retries=3, delay=20)
-    def close_short(
-        self, symbol: str, quantity: Optional[float] = None
-    ) -> Dict[str, Any]:
+    def close_short(self, symbol: str, quantity: Optional[float] = None) -> Dict[str, Any]:
         return self._close(symbol, IntentPositionSide.SHORT, quantity)
 
     def _close(

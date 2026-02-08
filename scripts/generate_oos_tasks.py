@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Generate targeted OOS validation tasks from Top-N and best-per-file CSVs.
+Outputs:
+ - logs/oos_oos_tasks.csv
+ - logs/oos_oos_tasks.md
+ - run_oos_tasks.ps1 (PowerShell script to run per-file validations)
+"""
+
+import pandas as pd
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+logs = ROOT / "logs"
+logs.mkdir(exist_ok=True)
+
+scan_csv = logs / "oos_grid_scan_results.csv"
+best_csv = logs / "oos_grid_best_per_file.csv"
+OUT_CSV = logs / "oos_oos_tasks.csv"
+OUT_MD = logs / "oos_oos_tasks.md"
+OUT_PS1 = "run_oos_tasks.ps1"
+
+if not scan_csv.exists() or not best_csv.exists():
+    print("Required CSVs missing:", scan_csv, best_csv)
+    raise SystemExit(1)
+
+df_scan = pd.read_csv(scan_csv)
+df_best = pd.read_csv(best_csv)
+
+# Ensure numeric
+for c in ["stop_loss_pct", "position_percent", "final_capital"]:
+    if c in df_scan.columns:
+        df_scan[c] = pd.to_numeric(df_scan[c], errors="coerce")
+for c in ["stop_loss_pct", "position_percent", "final_capital"]:
+    if c in df_best.columns:
+        df_best[c] = pd.to_numeric(df_best[c], errors="coerce")
+
+TOP_N = 10
+topn = df_scan.sort_values(by="final_capital", ascending=False).head(TOP_N)
+
+# Build task list: start with Top-N (high priority), then best_per_file entries not already included (medium)
+tasks = []
+seen = set()
+
+
+def add_task(row, source, priority):
+    key = (row.get("file"), float(row.get("stop_loss_pct")), float(row.get("position_percent")))
+    if key in seen:
+        return
+    seen.add(key)
+    tasks.append(
+        {
+            "file": row.get("file"),
+            "symbol": row.get("symbol"),
+            "stop_loss_pct": float(row.get("stop_loss_pct")),
+            "position_percent": float(row.get("position_percent")),
+            "final_capital": float(row.get("final_capital"))
+            if "final_capital" in row and pd.notna(row.get("final_capital"))
+            else None,
+            "source": source,
+            "priority": priority,
+            "cmd": ".venv\\Scripts\\python.exe scripts\\validate_single_best.py --file \"{row.get('file')}\" --stop_loss {row.get('stop_loss_pct')} --position {row.get('position_percent')}",
+        }
+    )
+
+
+for _, r in topn.iterrows():
+    add_task(r, "topN", "high")
+
+for _, r in df_best.sort_values(by="final_capital", ascending=False).iterrows():
+    add_task(r, "best_per_file", "medium")
+
+# Save CSV
+df_tasks = pd.DataFrame(tasks)
+df_tasks.to_csv(OUT_CSV, index=False)
+
+# Save MD summary
+lines = []
+lines.append("# OOS 验证任务清单\n")
+lines.append(f"生成时间: {pd.Timestamp.now()}\n")
+lines.append("\n")
+lines.append("| id | file | symbol | stop_loss_pct | position_percent | final_capital | source | priority | cmd |\n")
+lines.append("|---:|---|---|---:|---:|---:|---|---|---|\n")
+for i, t in enumerate(tasks, start=1):
+    lines.append(
+        f"| {i} | `{t['file']}` | {t['symbol']} | {t['stop_loss_pct']:.4f} | {t['position_percent']:.3f} | {t.get('final_capital', '') or ''} | {t['source']} | {t['priority']} | `{t['cmd']}` |\n"
+    )
+
+with open(OUT_MD, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+
+# Write a PowerShell runner to validate each task sequentially
+ps_lines = []
+ps_lines.append("# Run generated OOS validation tasks\n")
+ps_lines.append("$ErrorActionPreference = 'Stop'\n")
+for t in tasks:
+    cmd = t["cmd"]
+    ps_lines.append(f"Write-Host 'Running: {t['symbol']} {t['stop_loss_pct']} {t['position_percent']}'\n")
+    ps_lines.append(f"& {cmd} \n")
+
+with open(OUT_PS1, "w", encoding="utf-8") as f:
+    f.writelines(ps_lines)
+
+print("WROTE:", OUT_CSV)
+print("WROTE:", OUT_MD)
+print("WROTE:", OUT_PS1)

@@ -1,3 +1,5 @@
+from api.market_gateway import MarketGateway
+
 import os
 import sys
 
@@ -6,8 +8,6 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
-
-from api.market_gateway import MarketGateway
 
 
 def make_gateway_with_symbol(symbol, step_size=0.001, min_notional=5.0):

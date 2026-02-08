@@ -1,18 +1,21 @@
 """复现并验证：当下单返回 order_failed_but_position_exists 时，PositionStateMachine 应将其视为成功并建立快照。"""
-import os, sys
+
+from src.trading.position_state_machine import PositionStateMachineV2
+
+from src.trading.intent_builder import IntentBuilder
+
+import os
+import sys
+
 # ensure project root on sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
-
-from src.trading.position_state_machine import PositionStateMachineV2
-from src.trading.intent_builder import IntentBuilder
-from src.trading.intents import PositionSide
-import time
 
 
 class FakeBroker:
     def __init__(self, hedge_mode=False):
         self._hedge = hedge_mode
+
     def get_hedge_mode(self):
         return self._hedge
 
@@ -35,12 +38,11 @@ class FakeClient:
             "symbol": params.get("symbol"),
             "side": side,
             "error": {"code": -1116, "msg": "Invalid orderType."},
-            "position_exists": True
+            "position_exists": True,
         }
 
     def get_position(self, symbol, side=None):
         # 返回一个模拟的持仓（positionAmt 表示数量）
-        ps = side if side else "BOTH"
         return {"symbol": symbol, "positionAmt": str(self._position_amt), "positionSide": "SHORT"}
 
     def _execute_protection_v2(self, symbol, side, tp, sl):
@@ -60,5 +62,5 @@ def run():
     print("Snapshots:", sm.snapshots)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run()

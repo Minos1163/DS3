@@ -1,0 +1,140 @@
+import argparse
+
+import multiprocessing
+
+import os
+import glob
+import pandas as pd
+from pathlib import Path
+import importlib.util
+
+
+def import_backtester_class():
+    script_path = os.path.join(os.path.dirname(__file__), "..", "tools", "backtest", "backtest_15m30d_v2.py")
+    script_path = os.path.abspath(script_path)
+    spec = importlib.util.spec_from_file_location("backtest_15m30d_v2", script_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.ConservativeBacktester
+
+
+def make_candidate_list(min_rows=1000):
+    files = sorted(glob.glob("data/*_15m_*.csv") + glob.glob("data/*_5m_*.csv"))
+    cand = []
+    for f in files:
+        try:
+            if "_5m_" in os.path.basename(f):
+                df5 = pd.read_csv(f, index_col="timestamp", parse_dates=True)
+                df15 = (
+                    df5.resample("15T")
+                    .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+                    .dropna()
+                )
+                if len(df15) < min_rows:
+                    continue
+                tmp = os.path.join("data", f"tmp_resampled_{Path(f).stem}_15m.csv")
+                df15.to_csv(tmp, index_label="timestamp")
+                cand.append(tmp)
+            else:
+                df = pd.read_csv(f, index_col="timestamp", parse_dates=True)
+                if len(df) >= min_rows:
+                    cand.append(f)
+        except Exception:
+            continue
+    return cand
+
+
+def run_grid_on_file(filepath, stop_losses, positions):
+    ConservativeBacktester = import_backtester_class()
+    results = []
+    # preload raw data
+    raw_df = pd.read_csv(filepath, index_col="timestamp", parse_dates=True)
+    for sl in stop_losses:
+        for pos in positions:
+            bt = ConservativeBacktester(initial_capital=100.0, leverage=10.0)
+            bt.stop_loss_pct = sl
+            bt.position_percent = pos
+            df = bt.calculate_indicators(raw_df)
+            bt.run_backtest(df)
+            bt.analyze_results()
+            trades = pd.DataFrame(bt.trades)
+            total_pnl = trades["pnl"].sum() if not trades.empty else 0.0
+            # compute drawdown from trades
+            if trades.empty:
+                draw = 0.0
+            else:
+                cum = bt.initial_capital + trades["pnl"].cumsum()
+                draw = ((cum.cummax() - cum) / cum.cummax()).max() * 100
+
+            results.append(
+                {
+                    "file": filepath,
+                    "symbol": Path(filepath).stem,
+                    "stop_loss_pct": sl,
+                    "position_percent": pos,
+                    "final_capital": float(bt.capital),
+                    "total_pnl": float(total_pnl),
+                    "trades": int(len(trades)),
+                    "max_drawdown_pct": float(draw),
+                }
+            )
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--min-rows", type=int, default=1000)
+    parser.add_argument("--stop-losses", type=float, nargs="*", default=[0.006, 0.01, 0.015, 0.02, 0.025, 0.03])
+    parser.add_argument("--positions", type=float, nargs="*", default=[0.2, 0.3, 0.4, 0.5])
+    parser.add_argument("--workers", type=int, default=1, help="number of worker processes to parallelize across files")
+    args = parser.parse_args()
+
+    cand = make_candidate_list(min_rows=args.min_rows)
+    if not cand:
+        print("No suitable files")
+        return 1
+
+    Path("logs").mkdir(parents=True, exist_ok=True)
+    all_results = []
+    if args.workers > 1:
+        # parallelize across files: each worker loads its file and computes grid
+        print(f"Parallelizing across files with {args.workers} workers")
+        with multiprocessing.Pool(processes=args.workers) as pool:
+            jobs = [pool.apply_async(run_grid_on_file, (f, args.stop_losses, args.positions)) for f in cand]
+            for j, f in zip(jobs, cand):
+                print("Collecting results for", f)
+                res = j.get()
+                if res:
+                    all_results.extend(res)
+                    dff = pd.DataFrame(res)
+                    safe = Path(f).stem
+                    out = f"logs/oos_grid_{safe}.csv"
+                    dff.to_csv(out, index=False)
+                    print("Saved", out)
+    else:
+        for f in cand:
+            print("Running grid on", f)
+            res = run_grid_on_file(f, args.stop_losses, args.positions)
+            all_results.extend(res)
+            # save per-file results
+            dff = pd.DataFrame(res)
+            safe = Path(f).stem
+            out = f"logs/oos_grid_{safe}.csv"
+            dff.to_csv(out, index=False)
+            print("Saved", out)
+
+    df_all = pd.DataFrame(all_results)
+    out_all = "logs/oos_grid_scan_results.csv"
+    df_all.to_csv(out_all, index=False)
+
+    # compute best per file (by final_capital)
+    best = df_all.sort_values("final_capital", ascending=False).groupby("file").first().reset_index()
+    best_out = "logs/oos_grid_best_per_file.csv"
+    best.to_csv(best_out, index=False)
+    print("Saved aggregate results to", out_all)
+    print("Saved best-per-file to", best_out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

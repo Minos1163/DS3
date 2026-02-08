@@ -22,3 +22,6 @@ colorlog==6.8.0
 
 # Optional typing stubs to improve mypy results
 types-requests==2.31.0
+
+# Test runner
+pytest==7.4.0

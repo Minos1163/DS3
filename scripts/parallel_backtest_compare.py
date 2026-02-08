@@ -5,26 +5,33 @@ Usage:
 
 Outputs saved to logs/: comparison CSV and equity-curve PNG
 """
+
 from __future__ import annotations
 
-import os
-import random
-from datetime import datetime
 from typing import Any, Dict, List
 
 import matplotlib
-matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
+
 import pandas as pd
 
 import sys
+
 import os
+
+from src.backtest import BacktestEngine
+
+import random
+from datetime import datetime
+
+matplotlib.use("Agg")
+
 
 # ensure project root is on path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from src.backtest import BacktestEngine
 
 # Filtering / risk tuning defaults
 MAX_HOLD_CANDLES = 200  # max candles to hold a trade (defaults to 200)
@@ -43,7 +50,13 @@ def idx_of_time(df: pd.DataFrame, time_str: str):
         return idx
 
 
-def simulate_atr_risk(df: pd.DataFrame, signals: List[Dict[str, Any]], initial: float = 10000.0, risk_pct: float = 0.25, atr_mult: float = 3.0):
+def simulate_atr_risk(
+    df: pd.DataFrame,
+    signals: List[Dict[str, Any]],
+    initial: float = 10000.0,
+    risk_pct: float = 0.25,
+    atr_mult: float = 3.0,
+):
     equity = initial
     equity_curve = [equity]
     trades = []
@@ -89,18 +102,24 @@ def simulate_atr_risk(df: pd.DataFrame, signals: List[Dict[str, Any]], initial: 
 
             pnl = (exit_price - entry_price) * qty
             equity += pnl
-            trades.append({
-                "entry_time": sig_time,
-                "exit_time": exit_time,
-                "pnl": pnl,
-                "entry_price": entry_price,
-                "atr": atr,
-                "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
-                "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
-                "ema_20": float(df.get("ema_20").iloc[i]) if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i]) else None,
-                "ema_50": float(df.get("ema_50").iloc[i]) if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i]) else None,
-                "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
-            })
+            trades.append(
+                {
+                    "entry_time": sig_time,
+                    "exit_time": exit_time,
+                    "pnl": pnl,
+                    "entry_price": entry_price,
+                    "atr": atr,
+                    "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
+                    "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
+                    "ema_20": float(df.get("ema_20").iloc[i])
+                    if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i])
+                    else None,
+                    "ema_50": float(df.get("ema_50").iloc[i])
+                    if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i])
+                    else None,
+                    "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
+                }
+            )
             equity_curve.append(equity)
 
         elif sig_type == "SELL":
@@ -131,24 +150,32 @@ def simulate_atr_risk(df: pd.DataFrame, signals: List[Dict[str, Any]], initial: 
 
             pnl = (entry_price - exit_price) * qty
             equity += pnl
-            trades.append({
-                "entry_time": sig_time,
-                "exit_time": exit_time,
-                "pnl": pnl,
-                "entry_price": entry_price,
-                "atr": atr,
-                "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
-                "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
-                "ema_20": float(df.get("ema_20").iloc[i]) if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i]) else None,
-                "ema_50": float(df.get("ema_50").iloc[i]) if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i]) else None,
-                "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
-            })
+            trades.append(
+                {
+                    "entry_time": sig_time,
+                    "exit_time": exit_time,
+                    "pnl": pnl,
+                    "entry_price": entry_price,
+                    "atr": atr,
+                    "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
+                    "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
+                    "ema_20": float(df.get("ema_20").iloc[i])
+                    if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i])
+                    else None,
+                    "ema_50": float(df.get("ema_50").iloc[i])
+                    if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i])
+                    else None,
+                    "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
+                }
+            )
             equity_curve.append(equity)
 
     return equity_curve, trades
 
 
-def simulate_random(df: pd.DataFrame, n_entries: int, initial: float = 10000.0, risk_pct: float = 0.25, atr_mult: float = 3.0):
+def simulate_random(
+    df: pd.DataFrame, n_entries: int, initial: float = 10000.0, risk_pct: float = 0.25, atr_mult: float = 3.0
+):
     equity = initial
     equity_curve = [equity]
     trades = []
@@ -183,24 +210,32 @@ def simulate_random(df: pd.DataFrame, n_entries: int, initial: float = 10000.0, 
 
         pnl = (exit_price - entry_price) * qty
         equity += pnl
-        trades.append({
-            "entry_time": df.index[i],
-            "exit_time": exit_time,
-            "pnl": pnl,
-            "entry_price": entry_price,
-            "atr": atr,
-            "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
-            "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
-            "ema_20": float(df.get("ema_20").iloc[i]) if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i]) else None,
-            "ema_50": float(df.get("ema_50").iloc[i]) if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i]) else None,
-            "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
-        })
+        trades.append(
+            {
+                "entry_time": df.index[i],
+                "exit_time": exit_time,
+                "pnl": pnl,
+                "entry_price": entry_price,
+                "atr": atr,
+                "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
+                "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
+                "ema_20": float(df.get("ema_20").iloc[i])
+                if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i])
+                else None,
+                "ema_50": float(df.get("ema_50").iloc[i])
+                if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i])
+                else None,
+                "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
+            }
+        )
         equity_curve.append(equity)
 
     return equity_curve, trades
 
 
-def simulate_fixed_position(df: pd.DataFrame, signals: List[Dict[str, Any]], initial: float = 10000.0, position_pct: float = 10.0):
+def simulate_fixed_position(
+    df: pd.DataFrame, signals: List[Dict[str, Any]], initial: float = 10000.0, position_pct: float = 10.0
+):
     equity = initial
     equity_curve = [equity]
     trades = []
@@ -239,18 +274,24 @@ def simulate_fixed_position(df: pd.DataFrame, signals: List[Dict[str, Any]], ini
             pnl = (entry_price - exit_price) * qty
 
         equity += pnl
-        trades.append({
-            "entry_time": sig_time,
-            "exit_time": exit_time,
-            "pnl": pnl,
-            "entry_price": entry_price,
-            "atr": float(df["atr"].iloc[i]) if pd.notna(df["atr"].iloc[i]) else None,
-            "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
-            "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
-            "ema_20": float(df.get("ema_20").iloc[i]) if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i]) else None,
-            "ema_50": float(df.get("ema_50").iloc[i]) if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i]) else None,
-            "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
-        })
+        trades.append(
+            {
+                "entry_time": sig_time,
+                "exit_time": exit_time,
+                "pnl": pnl,
+                "entry_price": entry_price,
+                "atr": float(df["atr"].iloc[i]) if pd.notna(df["atr"].iloc[i]) else None,
+                "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
+                "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
+                "ema_20": float(df.get("ema_20").iloc[i])
+                if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i])
+                else None,
+                "ema_50": float(df.get("ema_50").iloc[i])
+                if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i])
+                else None,
+                "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
+            }
+        )
         equity_curve.append(equity)
 
     return equity_curve, trades
@@ -276,7 +317,16 @@ def summarize_trades(trades: List[Dict[str, Any]], equity_curve: List[float], in
     }
 
 
-def simulate_ai(df: pd.DataFrame, signals: List[Dict[str, Any]], initial: float = 10000.0, base_risk_pct: float = 0.5, atr_mult: float = 3.0, min_conf: float = AI_MIN_CONF_DEFAULT, ema_field: str = "ema_50", momentum_mode: str = "ema_and_macd"):
+def simulate_ai(
+    df: pd.DataFrame,
+    signals: List[Dict[str, Any]],
+    initial: float = 10000.0,
+    base_risk_pct: float = 0.5,
+    atr_mult: float = 3.0,
+    min_conf: float = AI_MIN_CONF_DEFAULT,
+    ema_field: str = "ema_50",
+    momentum_mode: str = "ema_and_macd",
+):
     """Simulate AI decisions by assigning a confidence to each signal and sizing risk by confidence.
     - base_risk_pct: percentage of equity at confidence==1.0 (e.g., 0.5 means 0.5% per trade at conf=1.0)
     - final risk_pct_per_trade = base_risk_pct * confidence
@@ -304,7 +354,11 @@ def simulate_ai(df: pd.DataFrame, signals: List[Dict[str, Any]], initial: float 
             continue
 
         macd_hist = float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else 0.0
-        ema_val = float(df.get(ema_field).iloc[i]) if ema_field in df.columns and pd.notna(df.get(ema_field).iloc[i]) else None
+        ema_val = (
+            float(df.get(ema_field).iloc[i])
+            if ema_field in df.columns and pd.notna(df.get(ema_field).iloc[i])
+            else None
+        )
 
         # require minimum ATR relative to price to avoid tiny-stop trades
         if atr / entry_price < MIN_ATR_PCT:
@@ -362,20 +416,28 @@ def simulate_ai(df: pd.DataFrame, signals: List[Dict[str, Any]], initial: float 
 
             pnl = (exit_price - entry_price) * qty
             equity += pnl
-            trades.append({
-                "entry_time": sig_time,
-                "exit_time": exit_time,
-                "pnl": pnl,
-                "confidence": confidence,
-                "entry_price": entry_price,
-                "atr": atr,
-                "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
-                "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
-                "ema_20": float(df.get("ema_20").iloc[i]) if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i]) else None,
-                "ema_50": float(df.get("ema_50").iloc[i]) if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i]) else None,
-                "chosen_ema": float(df.get(ema_field).iloc[i]) if ema_field in df.columns and pd.notna(df.get(ema_field).iloc[i]) else None,
-                "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
-            })
+            trades.append(
+                {
+                    "entry_time": sig_time,
+                    "exit_time": exit_time,
+                    "pnl": pnl,
+                    "confidence": confidence,
+                    "entry_price": entry_price,
+                    "atr": atr,
+                    "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
+                    "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
+                    "ema_20": float(df.get("ema_20").iloc[i])
+                    if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i])
+                    else None,
+                    "ema_50": float(df.get("ema_50").iloc[i])
+                    if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i])
+                    else None,
+                    "chosen_ema": float(df.get(ema_field).iloc[i])
+                    if ema_field in df.columns and pd.notna(df.get(ema_field).iloc[i])
+                    else None,
+                    "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
+                }
+            )
             equity_curve.append(equity)
 
         elif sig_type == "SELL":
@@ -406,26 +468,42 @@ def simulate_ai(df: pd.DataFrame, signals: List[Dict[str, Any]], initial: float 
 
             pnl = (entry_price - exit_price) * qty
             equity += pnl
-            trades.append({
-                "entry_time": sig_time,
-                "exit_time": exit_time,
-                "pnl": pnl,
-                "confidence": confidence,
-                "entry_price": entry_price,
-                "atr": atr,
-                "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
-                "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
-                "ema_20": float(df.get("ema_20").iloc[i]) if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i]) else None,
-                "ema_50": float(df.get("ema_50").iloc[i]) if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i]) else None,
-                "chosen_ema": float(df.get(ema_field).iloc[i]) if ema_field in df.columns and pd.notna(df.get(ema_field).iloc[i]) else None,
-                "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
-            })
+            trades.append(
+                {
+                    "entry_time": sig_time,
+                    "exit_time": exit_time,
+                    "pnl": pnl,
+                    "confidence": confidence,
+                    "entry_price": entry_price,
+                    "atr": atr,
+                    "rsi": float(df["rsi"].iloc[i]) if pd.notna(df["rsi"].iloc[i]) else None,
+                    "macd_hist": float(df["macd_hist"].iloc[i]) if pd.notna(df["macd_hist"].iloc[i]) else None,
+                    "ema_20": float(df.get("ema_20").iloc[i])
+                    if "ema_20" in df.columns and pd.notna(df.get("ema_20").iloc[i])
+                    else None,
+                    "ema_50": float(df.get("ema_50").iloc[i])
+                    if "ema_50" in df.columns and pd.notna(df.get("ema_50").iloc[i])
+                    else None,
+                    "chosen_ema": float(df.get(ema_field).iloc[i])
+                    if ema_field in df.columns and pd.notna(df.get(ema_field).iloc[i])
+                    else None,
+                    "volume": float(df["volume"].iloc[i]) if pd.notna(df["volume"].iloc[i]) else None,
+                }
+            )
             equity_curve.append(equity)
 
     return equity_curve, trades
 
 
-def run_for_symbol(symbol: str, interval: str = "15m", days: int = 15, min_conf: float = AI_MIN_CONF_DEFAULT, max_hold: int = MAX_HOLD_CANDLES, ema_field: str = "ema_50", momentum_mode: str = "ema_only"):
+def run_for_symbol(
+    symbol: str,
+    interval: str = "15m",
+    days: int = 15,
+    min_conf: float = AI_MIN_CONF_DEFAULT,
+    max_hold: int = MAX_HOLD_CANDLES,
+    ema_field: str = "ema_50",
+    momentum_mode: str = "ema_only",
+):
     """Run the parallel backtest comparison for a single symbol and return report dict and paths."""
     global MAX_HOLD_CANDLES
     old_max_hold = MAX_HOLD_CANDLES
@@ -440,21 +518,34 @@ def run_for_symbol(symbol: str, interval: str = "15m", days: int = 15, min_conf:
     initial = 10000.0
 
     atr_eq, atr_trades = simulate_atr_risk(engine.df, signals, initial=initial, risk_pct=0.25, atr_mult=3.0)
-    rnd_eq, rnd_trades = simulate_random(engine.df, n_entries=len(signals), initial=initial, risk_pct=0.25, atr_mult=3.0)
+    rnd_eq, rnd_trades = simulate_random(
+        engine.df, n_entries=len(signals), initial=initial, risk_pct=0.25, atr_mult=3.0
+    )
     fix_eq, fix_trades = simulate_fixed_position(engine.df, signals, initial=initial, position_pct=10.0)
-    ai_eq, ai_trades = simulate_ai(engine.df, signals, initial=initial, base_risk_pct=0.5, atr_mult=3.0, min_conf=min_conf, ema_field=ema_field, momentum_mode=momentum_mode)
+    ai_eq, ai_trades = simulate_ai(
+        engine.df,
+        signals,
+        initial=initial,
+        base_risk_pct=0.5,
+        atr_mult=3.0,
+        min_conf=min_conf,
+        ema_field=ema_field,
+        momentum_mode=momentum_mode,
+    )
 
     now_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
     os.makedirs(logs_dir, exist_ok=True)
 
     # save equity CSV
-    df_out = pd.DataFrame({
-        "atr_equity": atr_eq + [None] * (max(len(rnd_eq), len(fix_eq)) - len(atr_eq)),
-        "random_equity": rnd_eq + [None] * (max(len(atr_eq), len(fix_eq)) - len(rnd_eq)),
-        "fixed_equity": fix_eq + [None] * (max(len(atr_eq), len(rnd_eq)) - len(fix_eq)),
-        "ai_equity": ai_eq + [None] * (max(len(atr_eq), len(rnd_eq), len(fix_eq)) - len(ai_eq)),
-    })
+    df_out = pd.DataFrame(
+        {
+            "atr_equity": atr_eq + [None] * (max(len(rnd_eq), len(fix_eq)) - len(atr_eq)),
+            "random_equity": rnd_eq + [None] * (max(len(atr_eq), len(fix_eq)) - len(rnd_eq)),
+            "fixed_equity": fix_eq + [None] * (max(len(atr_eq), len(rnd_eq)) - len(fix_eq)),
+            "ai_equity": ai_eq + [None] * (max(len(atr_eq), len(rnd_eq), len(fix_eq)) - len(ai_eq)),
+        }
+    )
     out_csv = os.path.join(logs_dir, f"parallel_backtest_{symbol}_{now_ts}.csv")
     df_out.to_csv(out_csv, index=False)
     # save per-strategy trades
@@ -468,16 +559,16 @@ def run_for_symbol(symbol: str, interval: str = "15m", days: int = 15, min_conf:
             return None
         rows = []
         for t in trades:
-            rows.append({k: (t.get(k) if not hasattr(t.get(k), 'strftime') else t.get(k).isoformat()) for k in t})
+            rows.append({k: (t.get(k) if not hasattr(t.get(k), "strftime") else t.get(k).isoformat()) for k in t})
         df_t = _pd.DataFrame(rows)
         path = os.path.join(trades_dir, f"trades_{name}.csv")
         df_t.to_csv(path, index=False)
         return path
 
-    p_atr = save_trades(atr_trades, "atr")
-    p_rnd = save_trades(rnd_trades, "random")
-    p_fix = save_trades(fix_trades, "fixed")
-    p_ai = save_trades(ai_trades, "ai")
+    _p_atr = save_trades(atr_trades, "atr")
+    _p_rnd = save_trades(rnd_trades, "random")
+    _p_fix = save_trades(fix_trades, "fixed")
+    _p_ai = save_trades(ai_trades, "ai")
 
     # plot
     plt.figure(figsize=(8, 4))
@@ -496,6 +587,7 @@ def run_for_symbol(symbol: str, interval: str = "15m", days: int = 15, min_conf:
 
     # Detailed plots: drawdown and pnl distribution
     import numpy as _np
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     # equity curves
     axes[0, 0].plot(atr_eq, label="ATR")
@@ -506,6 +598,7 @@ def run_for_symbol(symbol: str, interval: str = "15m", days: int = 15, min_conf:
     axes[0, 0].legend()
 
     # drawdowns
+
     def drawdown(eq):
         a = _np.array(eq)
         peak = _np.maximum.accumulate(a)
@@ -520,6 +613,7 @@ def run_for_symbol(symbol: str, interval: str = "15m", days: int = 15, min_conf:
     axes[0, 1].legend()
 
     # pnl histograms (use trades)
+
     def pnl_list(trades):
         return [t["pnl"] for t in trades] if trades else []
 
@@ -570,17 +664,37 @@ def run_for_symbol(symbol: str, interval: str = "15m", days: int = 15, min_conf:
     return report, out_csv, out_png, out_detail_png, trades_dir, report_path
 
 
-def run_batch(symbols: List[str], interval: str = "15m", days: int = 15, min_conf: float = AI_MIN_CONF_DEFAULT, max_hold: int = MAX_HOLD_CANDLES, ema_field: str = "ema_50", momentum_mode: str = "ema_only"):
+def run_batch(
+    symbols: List[str],
+    interval: str = "15m",
+    days: int = 15,
+    min_conf: float = AI_MIN_CONF_DEFAULT,
+    max_hold: int = MAX_HOLD_CANDLES,
+    ema_field: str = "ema_50",
+    momentum_mode: str = "ema_only",
+):
     """Run the comparison for multiple symbols and save a combined summary CSV."""
     all_reports = []
     for s in symbols:
         print(f"Running for {s} (interval={interval}, days={days})...")
-        rep, csvp, pngp, detpng, trades_dir, rpt = run_for_symbol(s, interval=interval, days=days, min_conf=min_conf, max_hold=max_hold, ema_field=ema_field, momentum_mode=momentum_mode)
+        rep, csvp, pngp, detpng, trades_dir, rpt = run_for_symbol(
+            s,
+            interval=interval,
+            days=days,
+            min_conf=min_conf,
+            max_hold=max_hold,
+            ema_field=ema_field,
+            momentum_mode=momentum_mode,
+        )
         rec = {"symbol": s, "report_path": rpt, "csv": csvp, "png": pngp}
         rec.update(rep.get("ai", {}))
         all_reports.append(rec)
 
-    out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports", f"parallel_batch_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    out = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "reports",
+        f"parallel_batch_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+    )
     pd.DataFrame(all_reports).to_csv(out, index=False)
     print("Wrote batch summary to", out)
     return out
@@ -594,7 +708,7 @@ def main():
     parser.add_argument("--symbols", type=str, default="SOLUSDT", help="comma-separated symbol list for batch")
     parser.add_argument("--interval", type=str, default="15m")
     parser.add_argument("--days", type=int, default=15)
-    parser.add_argument("--min_conf", type=float, default=AI_MIN_CONF_DEFAULT)
+    parser.add_argument("--min_con", type=float, default=AI_MIN_CONF_DEFAULT)
     parser.add_argument("--max_hold", type=int, default=MAX_HOLD_CANDLES)
     args = parser.parse_args()
 
@@ -604,22 +718,58 @@ def main():
         return
 
     # default single run for backwards compatibility
-    rep = run_for_symbol("SOLUSDT", interval=args.interval, days=args.days, min_conf=args.min_conf, max_hold=args.max_hold)
+    rep, out_csv, out_png, out_detail_png, trades_dir, report_path = run_for_symbol(
+        "SOLUSDT", interval=args.interval, days=args.days, min_conf=args.min_conf, max_hold=args.max_hold
+    )
     print("Single run complete.")
 
     now_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
     os.makedirs(logs_dir, exist_ok=True)
 
-    # save equity CSV
-    df_out = pd.DataFrame({
-        "atr_equity": atr_eq + [None] * (max(len(rnd_eq), len(fix_eq)) - len(atr_eq)),
-        "random_equity": rnd_eq + [None] * (max(len(atr_eq), len(fix_eq)) - len(rnd_eq)),
-        "fixed_equity": fix_eq + [None] * (max(len(atr_eq), len(rnd_eq)) - len(fix_eq)),
-        "ai_equity": ai_eq + [None] * (max(len(atr_eq), len(rnd_eq), len(fix_eq)) - len(ai_eq)),
-    })
-    out_csv = os.path.join(logs_dir, f"parallel_backtest_{now_ts}.csv")
-    df_out.to_csv(out_csv, index=False)
+    # load equity CSV produced by run_for_symbol
+    try:
+        df_out = pd.read_csv(out_csv)
+    except Exception:
+        # fall back to empty frame if not present
+        df_out = pd.DataFrame()
+
+    # extract equity lists (drop NaNs)
+    atr_eq = df_out.get("atr_equity")
+    rnd_eq = df_out.get("random_equity")
+    fix_eq = df_out.get("fixed_equity")
+    ai_eq = df_out.get("ai_equity")
+    if atr_eq is not None:
+        atr_eq = [x for x in atr_eq.tolist() if pd.notna(x)]
+    else:
+        atr_eq = []
+    if rnd_eq is not None:
+        rnd_eq = [x for x in rnd_eq.tolist() if pd.notna(x)]
+    else:
+        rnd_eq = []
+    if fix_eq is not None:
+        fix_eq = [x for x in fix_eq.tolist() if pd.notna(x)]
+    else:
+        fix_eq = []
+    if ai_eq is not None:
+        ai_eq = [x for x in ai_eq.tolist() if pd.notna(x)]
+    else:
+        ai_eq = []
+
+    # load trades if saved
+    def load_trades_csv(path):
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            df_t = pd.read_csv(path)
+            return df_t.to_dict(orient="records")
+        except Exception:
+            return []
+
+    atr_trades = load_trades_csv(os.path.join(trades_dir, "trades_atr.csv"))
+    rnd_trades = load_trades_csv(os.path.join(trades_dir, "trades_random.csv"))
+    fix_trades = load_trades_csv(os.path.join(trades_dir, "trades_fixed.csv"))
+    ai_trades = load_trades_csv(os.path.join(trades_dir, "trades_ai.csv"))
     # save per-strategy trades
     trades_dir = os.path.join(logs_dir, f"parallel_trades_{now_ts}")
     os.makedirs(trades_dir, exist_ok=True)
@@ -631,16 +781,16 @@ def main():
             return None
         rows = []
         for t in trades:
-            rows.append({k: (t.get(k) if not hasattr(t.get(k), 'strftime') else t.get(k).isoformat()) for k in t})
+            rows.append({k: (t.get(k) if not hasattr(t.get(k), "strftime") else t.get(k).isoformat()) for k in t})
         df_t = _pd.DataFrame(rows)
         path = os.path.join(trades_dir, f"trades_{name}.csv")
         df_t.to_csv(path, index=False)
         return path
 
-    p_atr = save_trades(atr_trades, "atr")
-    p_rnd = save_trades(rnd_trades, "random")
-    p_fix = save_trades(fix_trades, "fixed")
-    p_ai = save_trades(ai_trades, "ai")
+    _p_atr = save_trades(atr_trades, "atr")
+    _p_rnd = save_trades(rnd_trades, "random")
+    _p_fix = save_trades(fix_trades, "fixed")
+    _p_ai = save_trades(ai_trades, "ai")
 
     # plot
     plt.figure(figsize=(8, 4))
@@ -659,6 +809,7 @@ def main():
 
     # Detailed plots: drawdown and pnl distribution
     import numpy as _np
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     # equity curves
     axes[0, 0].plot(atr_eq, label="ATR")
@@ -669,6 +820,7 @@ def main():
     axes[0, 0].legend()
 
     # drawdowns
+
     def drawdown(eq):
         a = _np.array(eq)
         peak = _np.maximum.accumulate(a)
@@ -683,6 +835,7 @@ def main():
     axes[0, 1].legend()
 
     # pnl histograms (use trades)
+
     def pnl_list(trades):
         return [t["pnl"] for t in trades] if trades else []
 
@@ -703,6 +856,9 @@ def main():
     # (report and notebook generation moved below after summaries are computed)
 
     # summaries
+    # default initial equity for single-run reporting (matches run_for_symbol default)
+    initial = 10000.0
+
     s_atr = summarize_trades(atr_trades, atr_eq, initial)
     s_rnd = summarize_trades(rnd_trades, rnd_eq, initial)
     s_fix = summarize_trades(fix_trades, fix_eq, initial)
@@ -741,7 +897,7 @@ def main():
                     "metadata": {},
                     "source": [
                         f"# Parallel Backtest Report ({now_ts})\n",
-                        "This notebook loads CSVs and displays equity curves and PnL distributions."
+                        "This notebook loads CSVs and displays equity curves and PnL distributions.",
                     ],
                 },
                 {

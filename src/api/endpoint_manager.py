@@ -236,9 +236,7 @@ class SafeClosePosition:
                 raise ValueError(f"❌ 平仓数量无效: {free} → {formatted_qty}")
 
             # 执行现货卖出
-            order = self.client.create_market_order(
-                symbol=symbol, side="SELL", quantity=formatted_qty
-            )
+            order = self.client.create_market_order(symbol=symbol, side="SELL", quantity=formatted_qty)
 
             print(f"   ✅ 现货平仓成功: 卖出 {formatted_qty} {symbol}\n")
             return order
@@ -255,9 +253,7 @@ class EndpointDiagnostics:
     """端点诊断工具"""
 
     @staticmethod
-    def diagnose_order_failure(
-        error_message: str, symbol: str, endpoint_used: str
-    ) -> str:
+    def diagnose_order_failure(error_message: str, symbol: str, endpoint_used: str) -> str:
         """
         诊断订单失败原因
 

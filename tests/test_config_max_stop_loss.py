@@ -1,0 +1,36 @@
+from src.config.config_loader import ConfigLoader
+
+import os
+import sys
+import pytest
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+
+@pytest.mark.parametrize(
+    "cfg,expected_fraction,note",
+    [
+        ({"trading": {"max_stop_loss_abs": None}}, 0.006, "none -> default"),
+        ({"trading": {"max_stop_loss_abs": 0.006}}, 0.006, "fraction small"),
+        ({"trading": {"max_stop_loss_abs": 0.6}}, 0.006, "0.6 -> 0.006"),
+        ({"trading": {"max_stop_loss_abs": 60}}, 0.6, "60 -> 0.6"),
+        ({"risk": {"max_stop_loss_abs": 1}}, 0.01, "1 -> 0.01"),
+        ({}, 0.006, "empty config -> default"),
+    ],
+)
+def test_get_max_stop_loss_abs_parametrized(cfg, expected_fraction, note):
+    v = ConfigLoader.get_max_stop_loss_abs(cfg)
+    assert pytest.approx(v, rel=1e-6) == expected_fraction, note
+
+
+def test_get_max_stop_loss_abs_from_env(monkeypatch):
+    # env as percentage
+    monkeypatch.setenv("MAX_STOP_LOSS_ABS", "0.6")
+    v = ConfigLoader.get_max_stop_loss_abs({})
+    assert pytest.approx(v, rel=1e-6) == 0.006
+
+    # env as fraction
+    monkeypatch.setenv("MAX_STOP_LOSS_ABS", "0.006")
+    v = ConfigLoader.get_max_stop_loss_abs({})
+    assert pytest.approx(v, rel=1e-6) == 0.006

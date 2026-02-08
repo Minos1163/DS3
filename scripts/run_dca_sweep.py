@@ -1,13 +1,16 @@
+from datetime import datetime
+
+from itertools import product
+
+from backtest_dca_rotation import DCARotationBacktester, DCAParams
+
 import os
 import sys
 import csv
 import argparse
 import time
-from datetime import datetime
-from itertools import product
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from backtest_dca_rotation import DCARotationBacktester, DCAParams
 
 
 def run_sweep(max_runs: int | None = None, progress_every: int = 5):
@@ -32,18 +35,20 @@ def run_sweep(max_runs: int | None = None, progress_every: int = 5):
 
     with open(out_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "leverage",
-            "take_profit_pct",
-            "max_positions",
-            "rsi_entry",
-            "score_threshold",
-            "total_return_pct",
-            "max_drawdown_pct",
-            "total_trades",
-            "win_rate_pct",
-            "trades_per_day",
-        ])
+        writer.writerow(
+            [
+                "leverage",
+                "take_profit_pct",
+                "max_positions",
+                "rsi_entry",
+                "score_threshold",
+                "total_return_pct",
+                "max_drawdown_pct",
+                "total_trades",
+                "win_rate_pct",
+                "trades_per_day",
+            ]
+        )
 
         for idx, (lev, tp, max_pos, rsi_entry, score_th) in enumerate(combos, start=1):
             params = DCAParams(
@@ -54,21 +59,25 @@ def run_sweep(max_runs: int | None = None, progress_every: int = 5):
                 score_threshold=score_th,
                 cooldown_seconds=0,
             )
-            bt = DCARotationBacktester(symbols=symbols, interval=interval, days=days, initial_capital=100.0, params=params)
+            bt = DCARotationBacktester(
+                symbols=symbols, interval=interval, days=days, initial_capital=100.0, params=params
+            )
             bt.run_backtest()
             m = bt.metrics()
-            writer.writerow([
-                lev,
-                tp,
-                max_pos,
-                rsi_entry,
-                score_th,
-                round(m["total_return_pct"], 2),
-                round(m["max_drawdown_pct"], 2),
-                int(m["total_trades"]),
-                round(m["win_rate_pct"], 2),
-                round(m["trades_per_day"], 2),
-            ])
+            writer.writerow(
+                [
+                    lev,
+                    tp,
+                    max_pos,
+                    rsi_entry,
+                    score_th,
+                    round(m["total_return_pct"], 2),
+                    round(m["max_drawdown_pct"], 2),
+                    int(m["total_trades"]),
+                    round(m["win_rate_pct"], 2),
+                    round(m["trades_per_day"], 2),
+                ]
+            )
             f.flush()
             if idx % progress_every == 0 or idx == total:
                 elapsed = time.time() - start_ts

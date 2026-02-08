@@ -35,9 +35,7 @@ def calculate_rsi(prices: pd.Series, period: int = 14) -> Optional[float]:
         return None
 
 
-def calculate_macd(
-    prices: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
-) -> tuple:
+def calculate_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
     """
     计算MACD指标
 
@@ -88,9 +86,7 @@ def calculate_ema(prices: pd.Series, period: int) -> Optional[float]:
         return None
 
 
-def calculate_atr(
-    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
-) -> Optional[float]:
+def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> Optional[float]:
     """
     计算ATR（真实波动幅度）
 
@@ -164,9 +160,7 @@ def calculate_sma(prices: pd.Series, period: int) -> Optional[float]:
         return None
 
 
-def calculate_bollinger_bands(
-    prices: pd.Series, period: int = 20, num_std: float = 2.0
-) -> tuple:
+def calculate_bollinger_bands(prices: pd.Series, period: int = 20, num_std: float = 2.0) -> tuple:
     """
     计算布林带
 

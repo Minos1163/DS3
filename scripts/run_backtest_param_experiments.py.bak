@@ -1,0 +1,102 @@
+import importlib.util
+import os
+import time
+
+
+def build_120d():
+    os.makedirs('data', exist_ok=True)
+    parts = []
+    candidates = [
+        'data/SOLUSDT_15m_60d.csv',
+        'data/SOLUSDT_15m_30d.csv',
+        'data/SOLUSDT_15m_15d.csv',
+        'data/SOLUSDT_5m_15d.csv'
+    ]
+
+    for p in candidates:
+        if not os.path.exists(p):
+            continue
+        df = __import__('pandas').read_csv(p, index_col='timestamp', parse_dates=True)
+        if '5m' in os.path.basename(p):
+            # resample 5m->15m
+            df = df.resample('15T').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+        parts.append(df)
+
+    if not parts:
+        print('未找到可用数据文件来构建 120 天样本（请提供数据）。')
+        return None
+
+    import pandas as pd
+    df_all = pd.concat(parts)
+    df_all = df_all[~df_all.index.duplicated(keep='first')]
+    df_all = df_all.sort_index()
+    span_days = (df_all.index[-1] - df_all.index[0]).days
+    print(f"合并后数据点: {len(df_all)} 行, 覆盖天数: {span_days} 天")
+    out = 'data/SOLUSDT_15m_120d.csv'
+    df_all.to_csv(out, index_label='timestamp')
+    print(f"已保存: {out}")
+    return out
+
+
+def import_backtester_class():
+    script_path = os.path.join(os.path.dirname(__file__), '..', 'tools', 'backtest', 'backtest_15m30d_v2.py')
+    script_path = os.path.abspath(script_path)
+    spec = importlib.util.spec_from_file_location('backtest_15m30d_v2', script_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.ConservativeBacktester
+
+
+def run_experiment(name: str, stop_loss_pct: float = None):
+    print(f"\n--- Experiment: {name} (stop_loss_pct={stop_loss_pct}) ---")
+    ConservativeBacktester = import_backtester_class()
+    bt = ConservativeBacktester(initial_capital=100.0, leverage=10.0)
+    if stop_loss_pct is not None:
+        bt.stop_loss_pct = stop_loss_pct
+
+    data_file = 'data/SOLUSDT_15m_120d.csv'
+    if not os.path.exists(data_file):
+        print('Building 120d data...')
+        out = build_120d()
+        if out is None:
+            print('Failed to build data; aborting')
+            return None
+        data_file = out
+
+    df = bt.load_data(data_file)
+    if df is None:
+        return None
+    df = bt.calculate_indicators(df)
+    bt.run_backtest(df)
+    # analyze_results already saves files and prints summary
+    bt.analyze_results()
+    # return a brief summary dict
+    total_pnl = bt.capital - bt.initial_capital
+    return {
+        'name': name,
+        'final_capital': bt.capital,
+        'total_pnl': total_pnl,
+        'trades': len(bt.trades)
+    }
+
+
+def main():
+    # ensure data exists
+    print('Preparing data and running experiments...')
+    build_120d()
+
+    results = []
+    # baseline
+    results.append(run_experiment('baseline_default', None))
+    # experiment: relax max stop loss to 2% (0.02)
+    results.append(run_experiment('stop_loss_2pct', 0.02))
+
+    print('\n=== Summary of experiments ===')
+    for r in results:
+        if r is None:
+            continue
+        print(f"{r['name']}: final_capital={r['final_capital']:.2f}, total_pnl={r['total_pnl']:.2f}, trades={r['trades']}")
+
+
+if __name__ == '__main__':
+    main()

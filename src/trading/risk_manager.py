@@ -23,9 +23,7 @@ class RiskManager:
         self.consecutive_losses = 0  # 连续亏损次数
         self.last_reset_date = datetime.now().date()
 
-    def check_position_size(
-        self, symbol: str, quantity: float, price: float, total_equity: float
-    ) -> tuple[bool, str]:
+    def check_position_size(self, symbol: str, quantity: float, price: float, total_equity: float) -> tuple[bool, str]:
         """
         检查仓位大小是否超限
 
@@ -48,16 +46,12 @@ class RiskManager:
         # 为了避免浮点运算的微小误差导致等于边界时被误判为过小，加入微小容差
         tol = 1e-6
         if position_percent + tol < min_percent:
-            return False, (
-                f"仓位过小（{position_percent * 100:.1f}% < 最小要求{min_percent * 100:.0f}%）"
-            )
+            return False, (f"仓位过小（{position_percent * 100:.1f}% < 最小要求{min_percent * 100:.0f}%）")
 
         # 检查最大仓位
         # 检查最大仓位（也加入容差以避免边界误判）
         if position_percent > max_percent + tol:
-            return False, (
-                f"仓位过大（{position_percent * 100:.1f}% > 最大限制{max_percent * 100:.0f}%）"
-            )
+            return False, (f"仓位过大（{position_percent * 100:.1f}% > 最大限制{max_percent * 100:.0f}%）")
 
         # 检查预留资金
         used_margin = position_value  # 简化
@@ -104,14 +98,10 @@ class RiskManager:
 
         # 计算今日亏损
         daily_loss = self.daily_start_balance - current_balance
-        loss_percent = (
-            daily_loss / self.daily_start_balance if self.daily_start_balance > 0 else 0
-        )
+        loss_percent = daily_loss / self.daily_start_balance if self.daily_start_balance > 0 else 0
 
         if loss_percent >= max_loss_percent:
-            return False, f"触发每日最大亏损限制（{loss_percent *
-                                        100:.2f}% >= {max_loss_percent *
-                                                      100}%）"
+            return False, f"触发每日最大亏损限制（{loss_percent * 100:.2f}% >= {max_loss_percent * 100}%）"
 
         return True, ""
 
@@ -126,8 +116,7 @@ class RiskManager:
         max_consecutive = risk_config.get("max_consecutive_losses", 5)
 
         if self.consecutive_losses >= max_consecutive:
-            return False, f"触发最大连续亏损限制（{
-                self.consecutive_losses}次 >= {max_consecutive}次）"
+            return False, f"触发最大连续亏损限制（{self.consecutive_losses}次 >= {max_consecutive}次）"
 
         return True, ""
 
@@ -178,9 +167,7 @@ class RiskManager:
 
         return len(errors) == 0, errors
 
-    def should_close_position(
-        self, position: Dict[str, Any], total_equity: float
-    ) -> tuple[bool, str]:
+    def should_close_position(self, position: Dict[str, Any], total_equity: float) -> tuple[bool, str]:
         """
         判断是否应该平仓（风控触发）
 

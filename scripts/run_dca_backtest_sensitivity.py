@@ -1,17 +1,19 @@
 """
 Run sensitivity test with extreme multipliers and analyze entry times by hour/date and regime.
 """
+
+from backtest_dca_rotation import load_run_config, DCARotationBacktester
+
+from collections import defaultdict
+
+import pandas as pd
+
 import argparse
 import os
 import sys
-import json
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
-
-from backtest_dca_rotation import load_run_config, DCARotationBacktester
-from collections import defaultdict
-import pandas as pd
 
 
 def run_with_overrides(config_path: str, overrides: dict):
@@ -20,7 +22,9 @@ def run_with_overrides(config_path: str, overrides: dict):
     for k, v in overrides.items():
         setattr(params, k, v)
     print(f"Running with params: {params}")
-    bt = DCARotationBacktester(symbols=symbols, interval=interval, days=days, initial_capital=initial_capital, params=params)
+    bt = DCARotationBacktester(
+        symbols=symbols, interval=interval, days=days, initial_capital=initial_capital, params=params
+    )
     bt.run_backtest()
     # persist results and candidate logs to logs/ for later inspection
     try:
@@ -35,20 +39,20 @@ def analyze_trades(bt: DCARotationBacktester):
     by_hour = defaultdict(lambda: defaultdict(int))  # hour -> side -> count
     by_regime_hour = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # date -> hour -> regime_side -> count
     for t in trades:
-        entry_time = t.get('entry_time')
+        entry_time = t.get("entry_time")
         if entry_time is None:
             continue
         # ensure pandas Timestamp
         ts = pd.to_datetime(entry_time)
         hour = int(ts.hour)
         date = ts.date().isoformat()
-        side = t.get('direction', bt.params.direction)
-        symbol = t.get('symbol')
+        side = t.get("direction", bt.params.direction)
+        symbol = t.get("symbol")
         if symbol is None:
             continue
         # get regime at that timestamp from data
         df = bt.data.get(symbol)
-        regime = 'NEUTRAL'
+        regime = "NEUTRAL"
         if df is not None and ts in pd.DatetimeIndex(df.index):
             row = bt._row_at_timestamp(df, ts)
             regime = bt._detect_market_regime(row)
@@ -73,33 +77,34 @@ def print_analysis(title, by_hour, by_regime_hour):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='config/dca_rotation_best.json')
+    parser.add_argument("--config", default="config/dca_rotation_best.json")
     args = parser.parse_args()
 
-    neutral_cfg = 'config/dca_rotation_best_neutral.json'
+    neutral_cfg = "config/dca_rotation_best_neutral.json"
     current_cfg = args.config
 
     # run neutral
     bt_neutral = run_with_overrides(neutral_cfg, {})
     by_hour_n, by_regime_hour_n = analyze_trades(bt_neutral)
-    print_analysis('Neutral', by_hour_n, by_regime_hour_n)
+    print_analysis("Neutral", by_hour_n, by_regime_hour_n)
 
     # run extreme overrides
     overrides = {
-        'bull_short_threshold_mult': 2.0,
-        'bear_long_threshold_mult': 1.5,
+        "bull_short_threshold_mult": 2.0,
+        "bear_long_threshold_mult": 1.5,
     }
     bt_extreme = run_with_overrides(current_cfg, overrides)
     by_hour_e, by_regime_hour_e = analyze_trades(bt_extreme)
-    print_analysis('Extreme', by_hour_e, by_regime_hour_e)
+    print_analysis("Extreme", by_hour_e, by_regime_hour_e)
 
     # quick comparison by hour
-    print('\n== Hourly comparison (extreme - neutral) by side ==')
+    print("\n== Hourly comparison (extreme - neutral) by side ==")
     hours = sorted(set(list(by_hour_n.keys()) + list(by_hour_e.keys())))
     for h in hours:
         sides = set(list(by_hour_n.get(h, {}).keys()) + list(by_hour_e.get(h, {}).keys()))
-        diffs = {s: by_hour_e.get(h, {}).get(s,0) - by_hour_n.get(h, {}).get(s,0) for s in sides}
+        diffs = {s: by_hour_e.get(h, {}).get(s, 0) - by_hour_n.get(h, {}).get(s, 0) for s in sides}
         print(f"{h:02d}: {diffs}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

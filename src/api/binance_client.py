@@ -1,21 +1,30 @@
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests  # type: ignore
+
+from requests.adapters import HTTPAdapter
+
+from urllib3.util.retry import Retry
+
+from src.api.market_gateway import MarketGateway
+
+from src.trading import position_state_machine
+
+from src.trading.event_router import ExchangeEventRouter
+
+from src.trading.intents import PositionSide as IntentPositionSide
+
+from src.trading.intents import TradeIntent
+
+from src.trading.order_gateway import OrderGateway
+
+from src.trading.tp_sl import PapiTpSlManager, TpSlConfig
+
 import hashlib
 import hmac
 import os
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
-
-import requests  # type: ignore
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-from src.api.market_gateway import MarketGateway
-from src.trading import position_state_machine
-from src.trading.event_router import ExchangeEventRouter
-from src.trading.intents import PositionSide as IntentPositionSide
-from src.trading.intents import TradeIntent
-from src.trading.order_gateway import OrderGateway
-from src.trading.tp_sl import PapiTpSlManager, TpSlConfig
 
 
 class ApiCapability(Enum):
@@ -58,7 +67,7 @@ class BinanceBroker:
         self._time_offset_ms: int = 0
         self._time_offset_updated_at: float = 0.0
         self._TIME_OFFSET_TTL = 60.0
-        
+
         # 设置 requests 会话重试策略
         self._session = requests.Session()
         self._proxies = self._load_proxies()
@@ -206,10 +215,7 @@ class BinanceBroker:
 
         # 兜底：如果存在 closePosition，则物理移除 reduceOnly（PAPI 要求）
         # 注意：根据实际测试，PAPI 全仓平仓也需要 quantity 参数，所以不移除 quantity
-        if (
-            input_params.get("closePosition") is True
-            or str(input_params.get("closePosition")).lower() == "true"
-        ):
+        if input_params.get("closePosition") is True or str(input_params.get("closePosition")).lower() == "true":
             input_params.pop("reduceOnly", None)
             input_params.pop("reduce_only", None)
             # 保持 quantity 字段，PAPI 全仓平仓需要这个参数
@@ -227,7 +233,7 @@ class BinanceBroker:
         headers = self._headers()
         is_papi = url.startswith(self.PAPI_BASE)
         method_upper = method.upper()
-        
+
         # 自动重试连接错误和超时
         max_retries = 3
         retry_delay = 1
@@ -235,7 +241,7 @@ class BinanceBroker:
         fallback_used = False
         timestamp_retry_limit = 3
         timestamp_retry_count = 0
-        
+
         for attempt in range(max_retries):
             # recompute payload on each attempt to refresh timestamp/signature
             payload = self._signed_params(input_params) if signed else dict(input_params)
@@ -307,9 +313,7 @@ class BinanceBroker:
                         if current_recv_val < 60000:
                             input_params["recvWindow"] = 60000
                         if timestamp_retry_count >= timestamp_retry_limit:
-                            raise RuntimeError(
-                                "时间戳偏差(-1021)仍然存在，已重试多次。"
-                            )
+                            raise RuntimeError("时间戳偏差(-1021)仍然存在，已重试多次。")
                         continue
                     if resp.status_code >= 400:
                         # 避免一行过长，分开打印状态码和消息
@@ -326,11 +330,7 @@ class BinanceBroker:
                 requests.exceptions.ProxyError,
             ) as e:
                 last_exception = e
-                if (
-                    self._proxy_fallback
-                    and not fallback_used
-                    and self._is_proxy_related_error(e)
-                ):
+                if self._proxy_fallback and not fallback_used and self._is_proxy_related_error(e):
                     fallback_used = True
                     print("⚠️ 代理异常，尝试直连重试一次...")
                     trust_env_original = self._session.trust_env
@@ -409,26 +409,18 @@ class BinanceBroker:
         return AccountMode.CLASSIC
 
     def um_base(self) -> str:
-        if (
-            self.capability == ApiCapability.PAPI_ONLY
-            or self.account_mode == AccountMode.UNIFIED
-        ):
+        if self.capability == ApiCapability.PAPI_ONLY or self.account_mode == AccountMode.UNIFIED:
             return self.PAPI_BASE
         return self.FAPI_BASE
 
     def is_papi_only(self) -> bool:
         """是否为 PAPI_ONLY 能力或统一保证金账户（需要使用 PAPI-UM 下单）"""
-        return (
-            self.capability == ApiCapability.PAPI_ONLY
-            or self.account_mode == AccountMode.UNIFIED
-        )
+        return self.capability == ApiCapability.PAPI_ONLY or self.account_mode == AccountMode.UNIFIED
 
     def get_hedge_mode(self) -> bool:
         """查询持仓模式 (缓存 10s)"""
         now = time.time()
-        if self._hedge_mode_cache and (
-            now - self._hedge_mode_cache[1] < self._HEDGE_MODE_CACHE_TTL
-        ):
+        if self._hedge_mode_cache and (now - self._hedge_mode_cache[1] < self._HEDGE_MODE_CACHE_TTL):
             return self._hedge_mode_cache[0]
         try:
             url = f"{self.PAPI_BASE}/papi/v1/um/positionSide/dual"
@@ -463,9 +455,7 @@ class PositionGateway:
         resp = self.broker.request("GET", url, signed=True)
         return resp.json()
 
-    def get_position(
-        self, symbol: str, side: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
+    def get_position(self, symbol: str, side: Optional[str] = None) -> Optional[Dict[str, Any]]:
         for p in self.get_positions():
             if p.get("symbol") == symbol:
                 if side:
@@ -504,11 +494,7 @@ class PositionGateway:
 
     def set_hedge_mode(self, enabled: bool = True) -> Dict[str, Any]:
         base = self.broker.um_base()
-        path = (
-            "/papi/v1/um/positionSide/dual"
-            if "papi" in base
-            else "/fapi/v1/positionSide/dual"
-        )
+        path = "/papi/v1/um/positionSide/dual" if "papi" in base else "/fapi/v1/positionSide/dual"
         params = {"dualSidePosition": "true" if enabled else "false"}
         url = f"{base}{path}"
         res = self.broker.request(
@@ -540,9 +526,7 @@ class BalanceEngine:
         data = resp.json()
         # 统一标准化字段，确保兼容 AccountDataManager
         if is_papi:
-            available = float(data.get("totalMarginBalance", 0)) - float(
-                data.get("accountInitialMargin", 0)
-            )
+            available = float(data.get("totalMarginBalance", 0)) - float(data.get("accountInitialMargin", 0))
             total_wallet = float(data.get("totalWalletBalance", 0))
             available_balance = available
             total_margin = float(data.get("totalMarginBalance", 0))
@@ -638,11 +622,7 @@ class BinanceClient:
         # 1. 如果是 WebSocket 的订单成交推送 (e: 'ORDER_TRADE_UPDATE')
         if event_data.get("e") == "ORDER_TRADE_UPDATE":
             o = event_data.get("o", {})
-            event_type = (
-                ExchangeEventType.ORDER_FILLED
-                if o.get("X") == "FILLED"
-                else ExchangeEventType.ORDER_CANCELED
-            )
+            event_type = ExchangeEventType.ORDER_FILLED if o.get("X") == "FILLED" else ExchangeEventType.ORDER_CANCELED
             event = ExchangeEvent(
                 type=event_type,
                 symbol=o.get("s", ""),
@@ -666,6 +646,7 @@ class BinanceClient:
                 self.event_router.dispatch(event)
 
     # 行情 (委托)
+
     def get_klines(self, *args, **kwargs):
         return self.market.get_klines(*args, **kwargs)
 
@@ -681,21 +662,18 @@ class BinanceClient:
     def format_quantity(self, symbol: str, qty: float) -> float:
         return self.market.format_quantity(symbol, qty)
 
-    def ensure_min_notional_quantity(
-        self, symbol: str, quantity: float, price: float
-    ) -> float:
+    def ensure_min_notional_quantity(self, symbol: str, quantity: float, price: float) -> float:
         return self.market.ensure_min_notional_quantity(symbol, quantity, price)
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         return self.market.get_symbol_info(symbol)
 
     # 账户 (委托)
+
     def get_account(self) -> Dict[str, Any]:
         return self.balance_engine.get_balance()
 
-    def get_position(
-        self, symbol: str, side: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
+    def get_position(self, symbol: str, side: Optional[str] = None) -> Optional[Dict[str, Any]]:
         return self.position_gateway.get_position(symbol, side)
 
     def get_all_positions(self) -> List[Dict[str, Any]]:
@@ -705,6 +683,7 @@ class BinanceClient:
         return self.position_gateway.set_hedge_mode(enabled)
 
     # 订单 (委托)
+
     def cancel_order(self, symbol: str, order_id: int):
         return self._order_gateway.cancel_order(symbol, order_id)
 
@@ -743,6 +722,7 @@ class BinanceClient:
         return self._order_gateway.query_open_orders(symbol)
 
     # 内部执行逻辑 (供状态机调用)
+
     def _execute_order_v2(
         self,
         params: Dict[str, Any],
@@ -801,7 +781,7 @@ class BinanceClient:
             return {
                 "status": "error",
                 "message": f"Invalid entry_price for {symbol}: {entry_price}. Cannot place protection orders.",
-                "orders": []
+                "orders": [],
             }
 
         if self.broker.is_papi_only():

@@ -1,10 +1,10 @@
+import requests  # type: ignore
+
 import hashlib
 import hmac
 import os
 import time
-from typing import Any, Dict, Optional
-
-import requests  # type: ignore
+from typing import Any, Dict
 
 
 class BinanceApiKeyProbe:
@@ -100,13 +100,9 @@ class BinanceApiKeyProbe:
                 "BINANCE_FUTURES_ENDPOINTS", "https://fapi.binance.com"
             )
         elif result["spot"]:
-            result["recommended_base_url"] = self._first_endpoint(
-                "BINANCE_SPOT_ENDPOINTS", "https://api.binance.com"
-            )
+            result["recommended_base_url"] = self._first_endpoint("BINANCE_SPOT_ENDPOINTS", "https://api.binance.com")
 
         if not any([result["spot"], result["usdt_futures"], result["papi"]]):
-            raise RuntimeError(
-                "❌ API Key 无法访问任何 Binance 市场（检查：Key/Secret/IP/权限）"
-            )
+            raise RuntimeError("❌ API Key 无法访问任何 Binance 市场（检查：Key/Secret/IP/权限）")
 
         return result

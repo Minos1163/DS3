@@ -8,9 +8,7 @@ import time
 from typing import Any, Callable
 
 
-def retry_on_failure(
-    max_retries: int = 3, delay: float = 1.0, exceptions: tuple = (Exception,)
-):
+def retry_on_failure(max_retries: int = 3, delay: float = 1.0, exceptions: tuple = (Exception,)):
     """
     失败重试装饰器
 
@@ -42,9 +40,7 @@ def retry_on_failure(
                             "-2014",
                         )
                     ):
-                        print(
-                            f"🚫 {func.__name__} 遇到致命权限错误，立即终止（不重试）: {e}"
-                        )
+                        print(f"🚫 {func.__name__} 遇到致命权限错误，立即终止（不重试）: {e}")
                         raise
 
                     # 检查是否还有重试机会
@@ -56,9 +52,7 @@ def retry_on_failure(
 
             # 确保有异常可抛出（理论上不可能，但为了类型检查）
             if last_exception is None:
-                raise RuntimeError(
-                    f"{func.__name__} 重试逻辑错误：last_exception 不应为 None"
-                )
+                raise RuntimeError(f"{func.__name__} 重试逻辑错误：last_exception 不应为 None")
             raise last_exception
 
         return wrapper
@@ -73,7 +67,7 @@ def log_execution(func: Callable) -> Callable:
     def wrapper(*args, **kwargs) -> Any:
         try:
             return func(*args, **kwargs)
-        except Exception as e:
+        except Exception:
             raise
 
     return wrapper

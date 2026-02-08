@@ -184,9 +184,7 @@ def download_public_klines(
         for item in data:
             all_rows.append(
                 {
-                    "timestamp": datetime.utcfromtimestamp(item[0] / 1000).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
+                    "timestamp": datetime.utcfromtimestamp(item[0] / 1000).strftime("%Y-%m-%d %H:%M:%S"),
                     "open": float(item[1]),
                     "high": float(item[2]),
                     "low": float(item[3]),
@@ -216,9 +214,7 @@ def download_public_klines(
     rows.sort(key=lambda x: x["timestamp"])
 
     with open(out_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["timestamp", "open", "high", "low", "close", "volume"]
-        )
+        writer = csv.DictWriter(f, fieldnames=["timestamp", "open", "high", "low", "close", "volume"])
         writer.writeheader()
         writer.writerows(rows)
 

@@ -3,9 +3,9 @@
 Usage:
   .venv\Scripts\python.exe scripts\fetch_15m_7d.py
 """
+
 from __future__ import annotations
 
-import os
 from src.backtest import BacktestEngine
 
 

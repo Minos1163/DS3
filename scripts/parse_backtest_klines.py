@@ -8,17 +8,17 @@ backtest_summary_*.txt and produce:
   - logs/trade_log_parsed_<ts>.csv
   - logs/equity_curve_<ts>.png (if matplotlib available)
 """
+
 from __future__ import annotations
 
+import sys
 import glob
 import os
 import re
-import sys
-from datetime import datetime
 
 try:
     import pandas as pd
-except Exception as exc:  # pragma: no cover
+except Exception:  # pragma: no cover
     print("请先安装 pandas: pip install pandas")
     raise
 
@@ -103,10 +103,10 @@ def main():
     win_rate = wins / total * 100
     gross_profit = df.loc[df["pnl"] > 0, "pnl"].sum()
     gross_loss = -df.loc[df["pnl"] < 0, "pnl"].sum()
-    avg_win = df.loc[df["pnl"] > 0, "pnl"].mean() if wins else 0.0
-    avg_loss = df.loc[df["pnl"] < 0, "pnl"].mean() if losses else 0.0
+    _avg_win = df.loc[df["pnl"] > 0, "pnl"].mean() if wins else 0.0
+    _avg_loss = df.loc[df["pnl"] < 0, "pnl"].mean() if losses else 0.0
     expectancy = df["pnl"].sum() / total
-    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    pf = gross_profit / gross_loss if gross_loss > 0 else float("in")
 
     print("\n回测逐笔统计:")
     print(f"  交易总数: {total}")
@@ -127,7 +127,7 @@ def main():
 
         plt.figure(figsize=(8, 4))
         plt.plot(df["cumulative_equity"], marker="o")
-        plt.title(f"Equity Curve ({info.get('symbol','')})")
+        plt.title(f"Equity Curve ({info.get('symbol', '')})")
         plt.xlabel("Trade #")
         plt.ylabel("Equity")
         plt.grid(True)

@@ -1,18 +1,19 @@
+from src.trading.position_state_machine import PositionStateMachineV2
+
+from src.trading.intent_builder import IntentBuilder
+
 import os
 import sys
-import time
 
 # ensure project root on sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from src.trading.position_state_machine import PositionStateMachineV2
-from src.trading.intent_builder import IntentBuilder
-
 
 class FakeBroker:
     def __init__(self, hedge_mode=False):
         self._hedge = hedge_mode
+
     def get_hedge_mode(self):
         return self._hedge
 
@@ -32,7 +33,7 @@ class FakeClient:
             "symbol": params.get("symbol"),
             "side": side,
             "error": {"code": -1116, "msg": "Invalid orderType."},
-            "position_exists": True
+            "position_exists": True,
         }
 
     def get_position(self, symbol, side=None):

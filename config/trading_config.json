@@ -11,16 +11,22 @@
     "reserve_percent": 20,
     "max_stop_loss_abs": 0.6
   },
-  "risk": {
+    "risk": {
     "max_daily_loss_percent": 10,
     "max_consecutive_losses": 2,
     "stop_loss_default_percent": 0.006,
-    "take_profit_default_percent": 0.14
+    "take_profit_default_percent": 0.14,
+    "use_atr_stop_loss": true,
+    "atr_multiplier": 3.0,
+    "atr_timeframe": "1h"
   },
+    "monitoring": {
+      "unrealized_pnl_threshold_usdt": 0.05
+    },
   "strategy": {
     "mode": "DCA_ROTATION",
     "version": "V5",
-    "interval": "15m",
+    "interval": "5m",
     "position_percent": 0.3,
     "leverage": 3,
     "stop_loss_percent": 0.006,
@@ -96,7 +102,7 @@
     "allow_force_min_position": true
   },
   "schedule": {
-    "interval_seconds": 900,
+    "interval_seconds": 300,
     "retry_times": 3,
     "retry_delay_seconds": 20,
     "download_delay_seconds": 5
@@ -124,9 +130,19 @@
       "DOGS",
       "CHILLGUY",
       "DEGEN",
-      "KOMA"
+      "KOMA",
+      "BTC",
+      "SOLUSDT",
+      "ETH",
+      "BNB",
+      "SOL",
+      "XRP",
+      "ADA",
+      "DOT",
+      "LTC"
+      
     ],
-    "interval": "3m",
+    "interval": "5m",
     "account": "H52",
     "force_close_unknown_symbols": true,
     "force_close_non_short": true,
@@ -166,7 +182,7 @@
       "add_price_multiplier": 1.0,
       "add_amount_multiplier": 1.08,
       "max_hold_days": 2,
-      "min_daily_volume_usdt": 0.5,
+      "min_daily_volume_usdt": 1000000,
       "symbol_stop_loss_pct": 0.15,
       "profit_reinvest_pct": 100,
       "total_stop_loss_pct": 0.3,

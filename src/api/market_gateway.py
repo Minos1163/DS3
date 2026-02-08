@@ -41,9 +41,7 @@ class MarketGateway:
 
     def get_funding_rate(self, symbol: str) -> Optional[float]:
         url = f"{self.broker.MARKET_BASE}/fapi/v1/fundingRate"
-        response = self.broker.request(
-            "GET", url, params={"symbol": symbol, "limit": 1}
-        )
+        response = self.broker.request("GET", url, params={"symbol": symbol, "limit": 1})
         data = response.json()
         if data:
             rate = data[0].get("fundingRate") or data[0].get("rate")
@@ -85,9 +83,7 @@ class MarketGateway:
                         tick_size = float(f["tickSize"])
                         price_precision = self._get_precision(tick_size)
                     elif f["filterType"] in ["MIN_NOTIONAL", "NOTIONAL"]:
-                        min_notional = float(
-                            f.get("minNotional") or f.get("notional") or 5.0
-                        )
+                        min_notional = float(f.get("minNotional") or f.get("notional") or 5.0)
 
                 res = {
                     "symbol": symbol,
@@ -113,9 +109,7 @@ class MarketGateway:
         val = float(math.floor(quantity / step_size) * step_size)
         return round(val, precision)
 
-    def ensure_min_notional_quantity(
-        self, symbol: str, quantity: float, price: float
-    ) -> float:
+    def ensure_min_notional_quantity(self, symbol: str, quantity: float, price: float) -> float:
         info = self.get_symbol_info(symbol)
         if not info or quantity <= 0 or price <= 0:
             return quantity
