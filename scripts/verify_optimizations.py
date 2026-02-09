@@ -43,9 +43,11 @@ def test_mainstream_filter():
         filtered = list(mainstream_symbols)
         print(f"⚠️ 配置中无主流币，自动使用白名单: {', '.join(filtered)}")
     
-    # 验证逻辑：只要最终filtered包含主流币且数量<=3即通过
+    # 验证逻辑：最终filtered包含主流币且数量<=3即通过
+    # 注意：实际运行时，如果成交量不足，filtered可能为空（这是正确行为）
     passed = len(set(filtered)) <= 3 and all(s in mainstream_symbols for s in set(filtered))
     print(f"\n{'✅ 测试通过' if passed else '❌ 测试失败'}: 最终选择 {len(set(filtered))} 个主流币")
+    print("💡 提示: 实际运行时，如果成交量不足，系统会返回空列表并跳过交易")
     return passed
 
 

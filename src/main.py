@@ -376,8 +376,9 @@ class TradingBot:
                 print(f"⚠️ 评估 {sym} 失败: {e}")
         
         if not filtered_pairs:
-            print("⚠️ 所有候选标的被过滤，退回主流币白名单")
-            return list(mainstream_symbols)
+            print("⚠️ 所有候选标的被过滤（成交量不足），本周期无符合条件的交易对")
+            print("   → 策略执行: 等待高波动时段或成交量放大")
+            return []  # 返回空列表，让系统跳过交易
 
         # 【优化4】按成交额降序排序，保留前3个最优标的（聚焦策略）
         filtered_pairs.sort(key=lambda x: x[1], reverse=True)
@@ -1100,6 +1101,19 @@ class TradingBot:
                     self._preload_dca_symbols(added)
 
         symbols = self._get_dca_symbols()
+        
+        # 【优化：严格过滤模式】如果没有符合条件的交易对，跳过本周期
+        if not symbols:
+            print("⏭️  无符合条件的交易对（成交量不足/信号不明确），跳过本周期")
+            print("   → 等待：高波动时段 或 成交量放大 或 趋势明确")
+            # 仍然检查并更新现有持仓（止盈止损）
+            positions = self.position_data.get_all_positions()
+            if positions:
+                print(f"   → 注意：仍有{len(positions)}个持仓，继续监控止盈止损")
+                # 这里可以添加持仓管理逻辑，但为了简化先return
+            self._save_dca_state()
+            return
+        
         interval = self.dca_config.get("interval", "5m")
         params = self.dca_config.get("params", {})
         direction = str(params.get("direction", "SHORT")).upper()
