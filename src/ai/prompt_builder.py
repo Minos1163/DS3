@@ -214,6 +214,13 @@ class PromptBuilder:
 # 高胜率交易决策系统 (目标: 80%+)
 
 时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+## 优化策略 (提升胜率至80%+)
+1. ✅ 只交易BTC/ETH/SOL主流币（高流动性、低噪音）
+2. ✅ 成交量放大确认（15m成交量比>150%）
+3. ✅ 移动止损保护（盈利>5%后止损上移到成本价）
+4. ✅ 避开低波动时段（UTC 00:00-08:00）
+
 仓位: 单币最大{self.config["trading"].get("max_position_percent", 30)}% | 杠杆: 3-10x | 止损: 严格-0.6% | 止盈: 趋势反转时
 
 ## 市场数据
@@ -229,13 +236,15 @@ class PromptBuilder:
 1. 1d EMA20>EMA50 且 4h EMA20>EMA50 (主趋势向上)
 2. 1h/4h RSI均未超买(<70) 且15m RSI在30-50区间(回调完成)
 3. 4h MACD柱转正 或 持续为正
-4. confidence: HIGH
+4. ✅ 15m成交量比>150% (放量确认)
+5. confidence: HIGH
 
 **SELL_OPEN (做空):**
 1. 1d EMA20<EMA50 且 4h EMA20<EMA50 (主趋势向下)
 2. 1h/4h RSI均未超卖(>30) 且15m RSI在50-70区间(反弹完成)
 3. 4h MACD柱转负 或 持续为负
-4. confidence: HIGH
+4. ✅ 15m成交量比>150% (放量确认)
+5. confidence: HIGH
 
 ### 【出场信号】
 **CLOSE (平仓):**
@@ -243,18 +252,20 @@ class PromptBuilder:
 2. 主趋势反转: 4h EMA20穿越EMA50反向
 3. 4h MACD柱颜色反转 (多单MACD转负 / 空单MACD转正)
 4. ⚠️ 禁止在盈利<5%时因小幅回调就平仓
+5. ℹ️ 盈利>5%会自动启动移动止损保护
 
 **HOLD (观望):**
 1. 任一入场条件不满足
 2. 信号矛盾 (如1d上升但4h下降)
 3. RSI处于50附近区间 (45-55震荡)
+4. 15m成交量比<=150% (缺乏放量确认)
 
 ## 输出格式 (纯JSON,无任何额外文本)
 
 {{
     "BTCUSDT": {{
         "action": "BUY_OPEN",
-        "reason": "1d/4h上升趋势,4h MACD转正,15m RSI 42回调到位",
+        "reason": "1d/4h上升趋势,4h MACD转正,15m RSI 42回调到位,成交量比180%放量",
         "confidence": "HIGH",
         "leverage": 8,
         "position_percent": 25,
@@ -273,10 +284,11 @@ class PromptBuilder:
 }}
 
 ⚠️ 关键要求:
-- JSON键: 完整交易对名称 (TRUMPUSDT不是TRUMP/USDT)
-- reason: 简洁说明周期趋势+关键指标,不要冗长推理
+- JSON键: 完整交易对名称 (BTCUSDT/ETHUSDT/SOLUSDT)
+- reason: 简洁说明周期趋势+关键指标+成交量比,不要冗长推理
 - 严格执行规则: 条件不满足=HOLD,不要强行交易
 - 止损统一-0.6%, 止盈建议+14.0% (趋势结束前不提前出场)
+- 成交量确认: 入场必须15m成交量比>150%
 """
         return prompt.strip()
 
