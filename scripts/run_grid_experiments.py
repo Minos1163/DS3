@@ -1,13 +1,8 @@
-from backtest_15m30d_v2 import ConservativeBacktester
+from tools.backtest_15m30d_v2 import ConservativeBacktester
 
 import os
-import sys
 import csv
 from datetime import datetime
-
-# ensure project root is on path so we can import the backtest module when running from scripts/
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
 
 
 OUTPUT_DIR = "logs"
@@ -22,6 +17,18 @@ def run_experiment(stop_loss_pct, cooldown_bars):
     bt.max_consecutive_losses = 2
 
     df = bt.load_data("data/SOLUSDT_15m_30d.csv")
+    if df is None:
+        # load_data may return None if file missing or corrupted — return a neutral result
+        print("数据加载失败：无法找到或解析 data/SOLUSDT_15m_30d.csv，跳过该实验。")
+        return {
+            "stop_loss_pct": stop_loss_pct,
+            "cooldown_bars": cooldown_bars,
+            "final_capital": bt.capital,
+            "total_pnl": 0,
+            "max_drawdown": 0,
+            "total_trades": 0,
+            "win_rate": 0,
+        }
     df = bt.calculate_indicators(df)
     bt.run_backtest(df)
     # after run, compute summary

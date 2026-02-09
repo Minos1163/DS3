@@ -10,11 +10,15 @@ def resample_5m_to_15m(df5m: pd.DataFrame) -> pd.DataFrame:
     # assume index is DatetimeIndex
     df = df5m.copy()
     # annotate as mapping to Any to satisfy static type-checkers
-    from typing import Any
+    # use a concrete mapping of str->str (aggregation keywords) so static
+    # type checkers (Pylance) accept the argument to DataFrame.agg
+    from typing import Mapping, Any, cast
 
-    ohlc: dict[str, Any] = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    # annotate as Mapping[str, Any] to document intent
+    ohlc: Mapping[str, Any] = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     # use .agg which is the explicit aggregation API
-    df15 = df.resample("15T").agg(ohlc).dropna()
+    # pandas typing can be strict; cast to Any to satisfy static type checkers
+    df15 = df.resample("15T").agg(cast(Any, ohlc)).dropna()
     return df15
 
 

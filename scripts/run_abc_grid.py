@@ -1,12 +1,8 @@
-from backtest_15m30d_v2 import ConservativeBacktester
+from tools.backtest_15m30d_v2 import ConservativeBacktester
 
 import os
-import sys
 import csv
 from datetime import datetime
-
-# ensure project root is importable
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def run_grid():
