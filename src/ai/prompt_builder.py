@@ -211,99 +211,77 @@ class PromptBuilder:
             完整的多币种提示词
         """
         prompt = f"""
-你是一位专业的日内交易员，需要同时分析多个币种并给出每个币种的独立交易决策。
+# 高胜率交易决策系统 (目标: 80%+)
 
-**【输出格式】你必须以纯JSON格式回复，不要包含任何解释、注释或额外文本。**
+时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+仓位: 单币最大{self.config["trading"].get("max_position_percent", 30)}% | 杠杆: 3-10x | 止损: 严格-0.6% | 止盈: 趋势反转时
 
-当前时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+## 市场数据
+{self._format_all_symbols_data(all_symbols_data)}
 
-    ## 交易账户
-    - 账户类型: Binance U本位永续合约
-    - 支持双向交易: 可以做多(买入)或做空(卖出)
-    - 杠杆范围: 1-100倍（建议3-10倍）
+## 账户状态
+{self._format_account_summary(account_summary) if account_summary else ""}
 
-    ### 仓位管理
-    - 最小仓位: {self.config["trading"].get("min_position_percent", 10)}%
-    - 最大仓位: {self.config["trading"].get("max_position_percent", 30)}%
-    - 每个币种独立决策，不受其他币种影响
+## 决策规则 (严格执行)
 
-    ### 风险控制
-    - 最大止损: -{self.config["risk"].get("stop_loss_default_percent", 2) * 100}%
-    - 建议止盈: +{self.config["risk"].get("take_profit_default_percent", 5) * 100}%
+### 【入场信号 - 必须全部满足】
+**BUY_OPEN (做多):**
+1. 1d EMA20>EMA50 且 4h EMA20>EMA50 (主趋势向上)
+2. 1h/4h RSI均未超买(<70) 且15m RSI在30-50区间(回调完成)
+3. 4h MACD柱转正 或 持续为正
+4. confidence: HIGH
 
-    ## 市场数据
+**SELL_OPEN (做空):**
+1. 1d EMA20<EMA50 且 4h EMA20<EMA50 (主趋势向下)
+2. 1h/4h RSI均未超卖(>30) 且15m RSI在50-70区间(反弹完成)
+3. 4h MACD柱转负 或 持续为负
+4. confidence: HIGH
 
-    {self._format_all_symbols_data(all_symbols_data)}
+### 【出场信号】
+**CLOSE (平仓):**
+1. 持仓浮亏接近-0.6% (距离止损20%以内即-0.48%时)
+2. 主趋势反转: 4h EMA20穿越EMA50反向
+3. 4h MACD柱颜色反转 (多单MACD转负 / 空单MACD转正)
+4. ⚠️ 禁止在盈利<5%时因小幅回调就平仓
 
-    ## 账户状态
+**HOLD (观望):**
+1. 任一入场条件不满足
+2. 信号矛盾 (如1d上升但4h下降)
+3. RSI处于50附近区间 (45-55震荡)
 
-    {self._format_account_summary(account_summary) if account_summary else ""}
+## 输出格式 (纯JSON,无任何额外文本)
 
-    ## 历史决策
-
-    {self._format_history(history) if history else "无历史记录"}
-
-    ## 决策要求
-
-    请综合分析市场数据，为每个币种给出独立决策。
-
-    **【关键】请直接输出JSON，不要有任何前缀、后缀、解释或markdown代码块标记。**
-
-    JSON格式示例：
-    {{
-        "BTCUSDT": {{
-            "action": "BUY_OPEN",
-            "reason": "多周期上升趋势，RSI44未超买，4hMACD转正",
-            "confidence": "HIGH",
-            "leverage": 8,
-            "position_percent": 20,
-            "take_profit_percent": 5.0,
-            "stop_loss_percent": -2.0
-        }},
-        "ETHUSDT": {{
-            "action": "SELL_OPEN",
-            "reason": "4h RSI超买80，MACD转负，顶部信号",
-            "confidence": "MEDIUM",
-            "leverage": 5,
-            "position_percent": 15,
-            "take_profit_percent": 3.0,
-            "stop_loss_percent": -1.5
-        }},
-        "SOLUSDT": {{
-            "action": "HOLD",
-            "reason": "震荡整理，等待方向突破",
-            "confidence": "LOW",
-            "leverage": 0,
-            "position_percent": 0,
-            "take_profit_percent": 0,
-            "stop_loss_percent": 0
-        }}
+{{
+    "BTCUSDT": {{
+        "action": "BUY_OPEN",
+        "reason": "1d/4h上升趋势,4h MACD转正,15m RSI 42回调到位",
+        "confidence": "HIGH",
+        "leverage": 8,
+        "position_percent": 25,
+        "take_profit_percent": 14.0,
+        "stop_loss_percent": -0.6
+    }},
+    "ETHUSDT": {{
+        "action": "HOLD",
+        "reason": "1d上升但4h下降,信号矛盾",
+        "confidence": "LOW",
+        "leverage": 0,
+        "position_percent": 0,
+        "take_profit_percent": 0,
+        "stop_loss_percent": 0
     }}
+}}
 
-    ⚠️ 重要格式要求：
-    1. JSON的键必须是完整的交易对名称（如TRUMPUSDT），不要使用TRUMP/USDT或TRUMP这种格式
-    2. 确保响应只包含纯JSON，不要有任何额外的文本、说明或推理过程
-    3. 必须为每个输入的交易对都返回决策
-
-    ### 字段说明
-    - action: BUY_OPEN(开多) | SELL_OPEN(开空) | CLOSE(平仓) | HOLD(观望)
-    - reason: 1-2句话说明决策理由，包含关键指标和值
-    - confidence: HIGH / MEDIUM / LOW
-    - leverage: 杠杆倍数 1-100
-    - position_percent: 仓位百分比 0-30
-    - take_profit_percent: 止盈百分比（如5.0表示止盈5%）
-    - stop_loss_percent: 止损百分比（如-2.0表示止损2%）
-
-    注意：
-    1. 根据市场趋势灵活选择BUY_OPEN（做多）或SELL_OPEN（做空），不要只做单向交易
-    2. 如果action是BUY_OPEN或SELL_OPEN，必须给出合理的止盈止损百分比
-    3. BUY_OPEN：take_profit > 0 > stop_loss（上涨止盈，下跌止损）
-    4. SELL_OPEN：take_profit < 0 < stop_loss（下跌止盈，上涨止损）
-    """
+⚠️ 关键要求:
+- JSON键: 完整交易对名称 (TRUMPUSDT不是TRUMP/USDT)
+- reason: 简洁说明周期趋势+关键指标,不要冗长推理
+- 严格执行规则: 条件不满足=HOLD,不要强行交易
+- 止损统一-0.6%, 止盈建议+14.0% (趋势结束前不提前出场)
+"""
         return prompt.strip()
 
     def _format_all_symbols_data(self, all_symbols_data: Dict[str, Any]) -> str:
-        """格式化所有币种的市场数据"""
+        """格式化所有币种的市场数据 (优化版 - 突出关键周期+指标)"""
         result_lines: List[str] = []
 
         for symbol, symbol_data in all_symbols_data.items():
@@ -311,55 +289,51 @@ class PromptBuilder:
             position = symbol_data.get("position")
 
             coin_name = symbol.replace("USDT", "")
-
             realtime = market_data.get("realtime", {}) or {}
             price = realtime.get("price") or 0
             change_24h = realtime.get("change_24h") or 0
-            change_15m = realtime.get("change_15m") or 0
-            funding_rate = realtime.get("funding_rate") or 0
-            open_interest = realtime.get("open_interest") or 0
-
-            if funding_rate > 0.0001:
-                funding_text = f"多头付费({funding_rate * 100:.4f}%)"
-            elif funding_rate < -0.0001:
-                funding_text = f"空头付费({abs(funding_rate) * 100:.4f}%)"
-            else:
-                funding_text = ""
 
             block = [f"=== {coin_name}/USDT ==="]
-            block.append(f"价格: ${price:,.2f} | 24h: {change_24h:+.2f}%")
-            block.append(f"15m: {change_15m:+.2f}% | 持仓量: {open_interest:,.0f}")
-            block.append(f"资金费率: {funding_rate:.6f} ({funding_text})")
+            block.append(f"价格: ${price:,.2f} | 24h变化: {change_24h:+.2f}%")
 
-            # 持仓
+            # 持仓信息
             if position:
                 pos = position
                 pnl_percent = pos.get("pnl_percent") or 0
                 side = pos.get("side", "N/A")
-                amount = pos.get("amount") or 0
                 entry_price = pos.get("entry_price") or 0
-                unrealized_pnl = pos.get("unrealized_pnl") or 0
-                block.append(f"持仓: {side} {amount:.3f} @ ${entry_price:.2f}")
-                block.append(f"盈亏: {unrealized_pnl:+.2f} USDT ({pnl_percent:+.2f}%)")
+                mark_price = pos.get("mark_price") or 0
+                block.append(f"✅ 持仓 {side} @ ${entry_price:.2f} → ${mark_price:.2f} (盈亏{pnl_percent:+.2f}%)")
             else:
-                block.append("持仓: 无仓位")
+                block.append("⭕ 无持仓")
 
-            # 多周期指标（简要）
+            # 关键周期指标 (1d/4h/1h/15m)
             multi_data = market_data.get("multi_timeframe", {}) or {}
-            for interval in ["15m", "30m", "1h", "4h", "1d"]:
+            key_intervals = ["1d", "4h", "1h", "15m"]
+            
+            for interval in key_intervals:
                 data = multi_data.get(interval) or {}
                 ind = data.get("indicators") or {}
-                block.append(f"[{interval}] ")
+                
                 if not ind:
-                    block.append("指标: 暂无数据")
-                else:
-                    rsi = ind.get("rsi") or 0
-                    macd = ind.get("macd") or 0
-                    ema20 = ind.get("ema_20") or 0
-                    ema50 = ind.get("ema_50") or 0
-                    atr = ind.get("atr_14") or 0
-                    block.append(f"RSI: {rsi:.1f} | MACD: {macd:.4f} | EMA20: {ema20:.2f} | EMA50: {ema50:.2f}")
-                    block.append(f"ATR: {atr:.2f}")
+                    block.append(f"[{interval}] 数据缺失")
+                    continue
+                
+                rsi = ind.get("rsi") or 0
+                macd = ind.get("macd") or 0
+                macd_hist = ind.get("macd_histogram") or 0
+                ema20 = ind.get("ema_20") or 0
+                ema50 = ind.get("ema_50") or 0
+                
+                # 判断趋势
+                trend = "📈上升" if ema20 > ema50 else "📉下降" if ema20 < ema50 else "➡️横盘"
+                macd_signal = "✅转正" if macd_hist > 0 else "❌转负"
+                rsi_status = "🔴超买" if rsi > 70 else "🟢超卖" if rsi < 30 else "⚪中性"
+                
+                block.append(
+                    f"[{interval}] {trend} | RSI {rsi:.1f}{rsi_status} | "
+                    f"MACD {macd:.4f}{macd_signal} | EMA20/50: {ema20:.2f}/{ema50:.2f}"
+                )
 
             result_lines.append("\n".join(block))
 
