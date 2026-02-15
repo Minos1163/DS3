@@ -108,6 +108,11 @@ class TradingBot:
     dca_halt: bool
     api_probe_info: Optional[Dict[str, Any]]
 
+    def _is_dual_engine_mode(self) -> bool:
+        """双引擎交易模式：兼容旧值 DCA_ROTATION 与新值 DUAL_ENGINE。"""
+        mode = str(getattr(self, "strategy_mode", "") or "").upper()
+        return mode in ("DCA_ROTATION", "DUAL_ENGINE")
+
     def __init__(self, config_path: Optional[str] = None):
         """初始化交易机器人"""
         print("=" * 60)
@@ -178,7 +183,7 @@ class TradingBot:
         self.api_probe_info = None
 
         # 策略模式
-        self.strategy_mode = self.config.get("strategy", {}).get("mode", "AI")
+        self.strategy_mode = str(self.config.get("strategy", {}).get("mode", "AI")).upper()
         self.ai_enabled = self.config.get("ai", {}).get("enabled", True)
         self.ai_client = None
         self.prompt_builder = None
@@ -201,7 +206,17 @@ class TradingBot:
         self.dca_day_open_tz: Optional[str] = None
         self.dca_initial_equity: Optional[float] = None
         self.dca_peak_equity: Optional[float] = None
+        # 兼容历史状态字段：不再作为永久停机开关使用
         self.dca_halt: bool = False
+        # 双引擎调度：1m 执行层 + N 分钟方向刷新
+        self._dual_engine_exec_interval_seconds: int = 60
+        self._dual_engine_direction_interval_seconds: int = 300
+        self._dual_engine_direction_bucket: Optional[int] = None
+        self._dual_engine_refresh_direction_this_cycle: bool = True
+        # 严格 5m 决策 + 1m 执行：缓存上一轮方向刷新得到的开仓计划
+        self._dca_open_plan_cache: List[Dict[str, Any]] = []
+        self._dca_open_plan_cache_bucket: Optional[int] = None
+        self._dca_open_plan_cache_created_at: Optional[str] = None
         self.dca_state_path = os.path.join(self.logs_dir, "dca_state.json")
         self.dca_dashboard_path = os.path.join(self.logs_dir, "dca_dashboard.json")
         self.dca_dashboard_csv_path = os.path.join(self.logs_dir, "dca_dashboard.csv")
@@ -279,18 +294,18 @@ class TradingBot:
         print("✅ 交易执行器初始化完成")
 
         # AI组件 / 规则策略
-        if self.strategy_mode == "DCA_ROTATION":
+        if self._is_dual_engine_mode():
             self.strategy = None
             if self.ai_enabled:
                 self.ai_client = self._init_ai_client()
                 self.prompt_builder = PromptBuilder(self.config)
                 self.decision_parser = DecisionParser()
-                print("✅ DCA轮动策略已启用（AI门禁已开启）")
+                print("✅ 双引擎策略已启用（震荡套利 + 趋势跟随，AI门禁已开启）")
             else:
                 self.ai_client = None
                 self.prompt_builder = None
                 self.decision_parser = None
-                print("✅ DCA轮动策略已启用（AI未启用）")
+                print("✅ 双引擎策略已启用（震荡套利 + 趋势跟随，AI未启用）")
             self._load_dca_rotation_config(initial=True)
             self._load_dca_state()
         elif self.strategy_mode == "V5_RULE":
@@ -440,7 +455,7 @@ class TradingBot:
         预加载历史K线数据
         在启动时为所有交易对下载200根K线，确保有足够的历史数据用于技术分析
         """
-        if self.strategy_mode == "DCA_ROTATION":
+        if self._is_dual_engine_mode():
             symbols = self._get_dca_symbols()
             interval = self.dca_config.get("interval", "5m")
             intervals = [interval]
@@ -887,6 +902,8 @@ class TradingBot:
         if not isinstance(risk_cfg, dict):
             risk_cfg = {}
         osc_cfg = risk_cfg.get("oscillation", {}) if isinstance(risk_cfg.get("oscillation", {}), dict) else {}
+        trend_cfg = risk_cfg.get("trend", {}) if isinstance(risk_cfg.get("trend", {}), dict) else {}
+        trend_exit = trend_cfg.get("exit", {}) if isinstance(trend_cfg.get("exit", {}), dict) else {}
 
         # Score 过滤阈值
         min_score_long = float(params.get("min_score_long", 0.1))
@@ -905,6 +922,10 @@ class TradingBot:
         take_profit_pct = float(params.get("take_profit_pct", 0.012))
         symbol_stop_loss_pct = float(params.get("symbol_stop_loss_pct", 0.03))
         total_stop_loss_pct = float(params.get("total_stop_loss_pct", 0.12))
+        total_stop_loss_cooldown_seconds = self._dca_get_total_stop_loss_cooldown_seconds(params)
+        exec_cfg = params.get("execution_layer", {}) if isinstance(params.get("execution_layer", {}), dict) else {}
+        exec_enabled = self._coerce_bool(exec_cfg.get("enabled", True), True)
+        exec_tf = str(exec_cfg.get("timeframe", "1m") or "1m")
 
         # p_win 阈值
         min_p_win_short = float(params.get("min_p_win_short", 0.56))
@@ -932,6 +953,7 @@ class TradingBot:
 
         osc_entry_src = "risk.oscillation.entry_gate" if osc_cfg.get("entry_gate") else "dca_rotation.params"
         osc_exit_src = "risk.oscillation.exit" if osc_cfg.get("exit") else "dca_rotation.params"
+        trend_exit_src = "risk.trend.exit" if trend_exit else "params(base)"
 
         print("\n" + "=" * 50)
         print("📊 RISK SUMMARY - 风险摘要")
@@ -947,6 +969,9 @@ class TradingBot:
         print(f"  take_profit_pct     = {take_profit_pct * 100:.2f}%")
         print(f"  symbol_stop_loss    = {symbol_stop_loss_pct * 100:.2f}%")
         print(f"  total_stop_loss     = {total_stop_loss_pct * 100:.1f}%")
+        print(f"  total_stop_cooldown = {total_stop_loss_cooldown_seconds}s")
+        print(f"{'[执行层]':<20}")
+        print(f"  execution_layer     = {'on' if exec_enabled else 'off'} ({exec_tf})")
         print(f"{'[开仓门槛]':<20}")
         print(f"  min_p_win_short     = {min_p_win_short:.2f}")
         print(f"  min_p_win_long      = {min_p_win_long:.2f}")
@@ -964,6 +989,13 @@ class TradingBot:
         print(f"  trailing_trig_ratio = {_ratio_text('trailing_trigger_ratio')}")
         print(f"  trailing_stop_ratio = {_ratio_text('trailing_stop_ratio')}")
         print(f"  trail_after_be      = {_ratio_text('trailing_stop_after_be_ratio')}")
+        print(f"{'[趋势出场基线]':<20}")
+        print(f"  trend_exit_source   = {trend_exit_src}")
+        print(f"  trend_tp_pct        = {trend_exit.get('take_profit_pct', '(fallback)')}")
+        print(f"  trend_sl_pct        = {trend_exit.get('symbol_stop_loss_pct', '(fallback)')}")
+        print(f"  trend_be_trig_pct   = {trend_exit.get('break_even_trigger_pct', '(fallback)')}")
+        print(f"  trend_trig_pct      = {trend_exit.get('trailing_stop_trigger_pct', '(fallback)')}")
+        print(f"  trend_trail_pct     = {trend_exit.get('trailing_stop_pct', '(fallback)')}")
         print("=" * 50 + "\n")
 
     def _load_dca_state(self) -> None:
@@ -973,6 +1005,10 @@ class TradingBot:
             with open(self.dca_state_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.dca_halt = bool(data.get("dca_halt", False))
+            if self.dca_halt:
+                # 旧版本曾将总回撤止损写为永久停机。迁移到新版后自动清理，避免持续锁死。
+                print("⚠️ 检测到旧状态 dca_halt=True，已自动清理并改为冷却恢复模式")
+                self.dca_halt = False
             # 恢复连续亏损计数和冷却信息（由亏损触发的冷却）
             self.consecutive_losses = int(data.get("consecutive_losses", 0) or 0)
             cooldown_expires = data.get("dca_cooldown_expires")
@@ -1069,6 +1105,8 @@ class TradingBot:
                 entry_price = float(pos.get("entry_price", 0))
                 self.dca_state[symbol] = {
                     "side": side,
+                    "engine": "UNKNOWN",
+                    "entry_regime": None,
                     "last_dca_price": entry_price,
                     "dca_count": 0,
                     "entry_time": datetime.now(),
@@ -1077,6 +1115,17 @@ class TradingBot:
                 }
             else:
                 self.dca_state[symbol]["side"] = side
+                # 兼容历史 state，确保字段齐全
+                st2 = self.dca_state.get(symbol)
+                if isinstance(st2, dict):
+                    st2.setdefault("last_dca_price", float(pos.get("entry_price", 0) or 0))
+                    st2.setdefault("dca_count", 0)
+                    st2.setdefault("entry_time", datetime.now())
+                    st2.setdefault("peak_pnl_pct", 0.0)
+                    st2.setdefault("be_active", False)
+                    st2.setdefault("entry_regime", None)
+                    if str(st2.get("engine", "")).upper() not in ("RANGE", "TREND"):
+                        st2["engine"] = "UNKNOWN"
 
     def _write_dca_dashboard(
         self,
@@ -1114,6 +1163,7 @@ class TradingBot:
                     {
                         "symbol": symbol,
                         "side": pos.get("side"),
+                        "engine": state.get("engine"),
                         "entry_price": pos.get("entry_price"),
                         "mark_price": pos.get("mark_price"),
                         "pnl_percent": pos.get("pnl_percent"),
@@ -1138,6 +1188,7 @@ class TradingBot:
             "drawdown_pct",
             "symbol",
             "side",
+            "engine",
             "entry_price",
             "mark_price",
             "pnl_percent",
@@ -1183,6 +1234,7 @@ class TradingBot:
                     payload.get("drawdown_pct"),
                     pos.get("symbol"),
                     pos.get("side"),
+                    pos.get("engine"),
                     pos.get("entry_price"),
                     pos.get("mark_price"),
                     pos.get("pnl_percent"),
@@ -1207,6 +1259,7 @@ class TradingBot:
                     payload.get("equity"),
                     payload.get("peak_equity"),
                     payload.get("drawdown_pct"),
+                    "",
                     "",
                     "",
                     "",
@@ -1306,7 +1359,7 @@ class TradingBot:
         reason: str = "",
     ) -> None:
         """开仓/平仓后立刻写入一次 DCA 看板快照事件。"""
-        if self.strategy_mode != "DCA_ROTATION":
+        if not self._is_dual_engine_mode():
             return
         try:
             latest_positions = self.position_data.get_all_positions() or {}
@@ -1335,6 +1388,7 @@ class TradingBot:
                 "<tr>"
                 f"<td>{pos.get('symbol')}</td>"
                 f"<td>{pos.get('side')}</td>"
+                f"<td>{pos.get('engine')}</td>"
                 f"<td>{pos.get('entry_price')}</td>"
                 f"<td>{pos.get('mark_price')}</td>"
                 f"<td class='{pnl_class}'>{pos.get('pnl_percent')}</td>"
@@ -1343,7 +1397,7 @@ class TradingBot:
                 f"<td>{pos.get('entry_time')}</td>"
                 "</tr>"
             )
-        table_rows = "\n".join(rows) if rows else "<tr><td colspan='8'>无持仓</td></tr>"
+        table_rows = "\n".join(rows) if rows else "<tr><td colspan='9'>无持仓</td></tr>"
         api_probe = payload.get("api_probe") or {}
         api_probe_line = ""
         if api_probe:
@@ -1385,6 +1439,7 @@ class TradingBot:
             <tr>
                 <th>交易对</th>
                 <th>方向</th>
+                <th>引擎</th>
                 <th>入场价</th>
                 <th>标记价</th>
                 <th>盈亏%</th>
@@ -1883,6 +1938,100 @@ class TradingBot:
         df["ema_fast_20"] = close.ewm(span=20, adjust=False).mean()
         df["ema_slow_50"] = close.ewm(span=50, adjust=False).mean()
         return df
+
+    @staticmethod
+    def _tf_to_bar_minutes(timeframe: str) -> int:
+        """将 K 线周期字符串转换为分钟数。"""
+        s = str(timeframe or "").strip().lower()
+        if not s:
+            return 1
+        try:
+            if s.endswith("m") and s[:-1].isdigit():
+                return max(1, int(s[:-1]))
+            if s.endswith("h") and s[:-1].isdigit():
+                return max(1, int(s[:-1]) * 60)
+            if s.endswith("d") and s[:-1].isdigit():
+                return max(1, int(s[:-1]) * 24 * 60)
+            if s.isdigit():
+                return max(1, int(s))
+        except Exception:
+            pass
+        return 1
+
+    def _dca_execution_layer_confirm(
+        self,
+        symbol: str,
+        action: str,
+        params: Dict[str, Any],
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        执行层微观确认（默认 1m）：
+        - 决策仍来自上层周期（如 5m）
+        - 仅在下单前过滤明显逆向的 1m 结构
+        """
+        if str(action or "").upper() not in ("BUY_OPEN", "SELL_OPEN"):
+            return True, "non_open_action", {}
+
+        exec_cfg = params.get("execution_layer", {}) if isinstance(params.get("execution_layer", {}), dict) else {}
+        enabled = self._coerce_bool(exec_cfg.get("enabled", True), True)
+        if not enabled:
+            return True, "execution_layer_disabled", {}
+
+        tf = str(exec_cfg.get("timeframe", "1m") or "1m").strip().lower()
+        bar_minutes = self._tf_to_bar_minutes(tf)
+        allow_no_data_pass = self._coerce_bool(exec_cfg.get("allow_no_data_pass", True), True)
+        min_bars = max(60, int(exec_cfg.get("min_bars", 80) or 80))
+        block_score = max(1, int(exec_cfg.get("opposite_block_score", 2) or 2))
+        pullback_eps = max(0.0, float(exec_cfg.get("pullback_eps", 0.0015) or 0.0015))
+        long_rsi_overbought = float(exec_cfg.get("long_rsi_overbought", 65) or 65)
+        short_rsi_oversold = float(exec_cfg.get("short_rsi_oversold", 35) or 35)
+
+        df = self._dca_get_klines_df(symbol, tf, limit=min_bars)
+        if df is None or len(df) < min_bars:
+            reason = f"execution_{tf}_data_insufficient"
+            return (allow_no_data_pass, reason, {"timeframe": tf, "bars": 0 if df is None else len(df)})
+
+        ind = self._dca_calc_indicators(df, bar_minutes)
+        if ind is None or len(ind) < 50:
+            reason = f"execution_{tf}_indicators_insufficient"
+            return (allow_no_data_pass, reason, {"timeframe": tf, "bars": 0 if ind is None else len(ind)})
+
+        row = ind.iloc[-1]
+        price = self._to_float(row.get("close"), 0.0)
+        ema_fast = self._to_float(row.get("ema_fast_20"), 0.0)
+        ema_slow = self._to_float(row.get("ema_slow_50"), 0.0)
+        rsi = self._to_float(row.get("rsi"), 50.0)
+
+        opposite_flags: List[str] = []
+        act = str(action).upper()
+
+        if act == "BUY_OPEN":
+            if ema_fast > 0 and ema_slow > 0 and ema_fast < ema_slow:
+                opposite_flags.append("ema_down")
+            if price > 0 and ema_fast > 0 and price < ema_fast * (1.0 - pullback_eps):
+                opposite_flags.append("below_ema_fast")
+            if rsi >= long_rsi_overbought:
+                opposite_flags.append("rsi_hot")
+        else:  # SELL_OPEN
+            if ema_fast > 0 and ema_slow > 0 and ema_fast > ema_slow:
+                opposite_flags.append("ema_up")
+            if price > 0 and ema_fast > 0 and price > ema_fast * (1.0 + pullback_eps):
+                opposite_flags.append("above_ema_fast")
+            if rsi <= short_rsi_oversold:
+                opposite_flags.append("rsi_cold")
+
+        details = {
+            "timeframe": tf,
+            "price": round(price, 8),
+            "ema_fast": round(ema_fast, 8),
+            "ema_slow": round(ema_slow, 8),
+            "rsi": round(rsi, 4),
+            "opposite_flags": opposite_flags,
+            "block_score": block_score,
+        }
+        if len(opposite_flags) >= block_score:
+            return False, f"execution_{tf}_opposite({','.join(opposite_flags)})", details
+        return True, f"execution_{tf}_ok", details
 
     def _oscillation_entry_signal(self, symbol: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -2578,7 +2727,12 @@ class TradingBot:
         """
         details: Dict[str, Any] = {"pullback": 0.0, "volatility": 0.0}
         try:
-            df = self._dca_get_klines_df(symbol, "15m", limit=50)
+            # ATR timeframe：优先读取 risk.atr_timeframe，其次 position_sizing.atr_timeframe，默认 15m
+            risk_cfg = params.get("risk", {}) if isinstance(params, dict) else {}
+            sizing_cfg = params.get("position_sizing", {}) if isinstance(params, dict) else {}
+            atr_tf = str(risk_cfg.get("atr_timeframe") or sizing_cfg.get("atr_timeframe") or "15m")
+            df = self._dca_get_klines_df(symbol, atr_tf, limit=50)
+            details["atr_timeframe"] = atr_tf
             if df is None or len(df) < 30:
                 return 0.0, details
 
@@ -2857,6 +3011,20 @@ class TradingBot:
             atr_mult = float(sizing_cfg.get("atr_stop_multiplier", 2.0))
             meme_mult = float(sizing_cfg.get("meme_stop_multiplier", 3.0))
             meme_risk_mult = float(sizing_cfg.get("meme_risk_mult", 1.0))
+            # risk 层配置兼容：优先 self.config.risk，其次 params.risk（如存在）
+            risk_cfg: Dict[str, Any] = {}
+            if isinstance(getattr(self, "config", {}), dict):
+                risk_raw = self.config.get("risk", {})
+                if isinstance(risk_raw, dict):
+                    risk_cfg = risk_raw
+            params_risk = params.get("risk", {}) if isinstance(params, dict) else {}
+            if isinstance(params_risk, dict):
+                merged_risk = dict(risk_cfg)
+                merged_risk.update(params_risk)
+                risk_cfg = merged_risk
+            # 若启用 risk.use_atr_stop_loss，则使用 risk.atr_multiplier 覆盖
+            if bool(risk_cfg.get("use_atr_stop_loss", False)):
+                atr_mult = float(risk_cfg.get("atr_multiplier", atr_mult))
 
             # 【关键】状态机风险倍数 - 直接作用在 risk_amount 层
             risk_mult_cfg = params.get("risk_mult", {})
@@ -2877,8 +3045,10 @@ class TradingBot:
             equity = float(account_summary.get("equity", 100))
             details["equity"] = equity
 
-            # 获取 ATR
-            df = self._dca_get_klines_df(symbol, "15m", limit=50)
+            # 获取 ATR：优先 risk.atr_timeframe，其次 position_sizing.atr_timeframe
+            atr_tf = str(risk_cfg.get("atr_timeframe") or sizing_cfg.get("atr_timeframe") or "15m")
+            details["atr_timeframe"] = atr_tf
+            df = self._dca_get_klines_df(symbol, atr_tf, limit=50)
             if df is None or len(df) < 30:
                 # 默认仓位（保守）
                 details["fallback"] = True
@@ -2923,8 +3093,14 @@ class TradingBot:
             # 【关键修正】把 quantity 转换成名义价值（USDT）
             atr_notional = atr_qty * last_close
 
-            # 限制仓位大小（不超过权益的 30%）
-            atr_notional = max(1.0, min(atr_notional, equity * 0.3))
+            # 限制仓位大小：对齐 max_position_pct（优先 params，其次 risk）
+            max_pos_raw = self._to_float(params.get("max_position_pct"), default=0.0)
+            if max_pos_raw <= 0:
+                max_pos_raw = self._to_float(risk_cfg.get("max_position_pct"), default=0.30)
+            max_pos_ratio = max_pos_raw if 0 < max_pos_raw <= 1.0 else max_pos_raw / 100.0
+            max_pos_ratio = max(0.01, min(0.95, max_pos_ratio))
+            details["max_position_pct_cap"] = round(max_pos_ratio, 4)
+            atr_notional = max(1.0, min(atr_notional, equity * max_pos_ratio))
             details["atr_notional"] = round(atr_notional, 2)
 
             return round(atr_notional, 2), details
@@ -3516,13 +3692,28 @@ class TradingBot:
         return float(risk_mult_config.get(regime, default_mult.get(regime, 1.0)))
 
     def _map_regime_to_engine(self, regime: str) -> str:
-        """将状态机 regime 映射为交易引擎：RANGE / SWING / TREND。"""
+        """将状态机 regime 映射为交易引擎：RANGE / TREND。"""
         r = str(regime or "").upper()
-        if r in ("RANGE", "RANGE_LOCK"):
+        if r in ("RANGE", "RANGE_LOCK", "NEUTRAL", "UNKNOWN", ""):
             return "RANGE"
-        if r in ("BULL_STRONG", "BEAR_STRONG", "STRONG_BULL", "STRONG_BEAR", "TREND"):
+        if (
+            "BULL" in r
+            or "BEAR" in r
+            or r in ("STRONG_BULL", "STRONG_BEAR", "WEAK_BULL", "WEAK_BEAR", "TREND")
+        ):
             return "TREND"
-        return "SWING"
+        return "RANGE"
+
+    @staticmethod
+    def _resolve_dual_engine(engine: Any, fallback: str = "TREND") -> str:
+        """双引擎模式归一化：支持 RANGE/TREND/UNKNOWN。"""
+        e = str(engine or "").upper()
+        if e in ("RANGE", "TREND", "UNKNOWN"):
+            return e
+        fb = str(fallback or "TREND").upper()
+        if fb in ("RANGE", "TREND", "UNKNOWN"):
+            return fb
+        return "TREND"
 
     def _get_engine_params(
         self,
@@ -3616,10 +3807,26 @@ class TradingBot:
         return out
 
     def _direction_allowed_by_engine(self, *, engine: str, regime: str, side: str) -> bool:
-        """TREND 引擎强制顺势；RANGE/SWING 允许双向。"""
+        """方向约束：
+        - TREND 引擎强制顺势
+        - 弱趋势(BULL_WEAK/BEAR_WEAK)默认也强制顺势（可配置关闭）
+        - 其他状态允许双向
+        """
         e = str(engine or "").upper()
         r = str(regime or "").upper()
         s = str(side or "").upper()
+        if r in ("BULL_WEAK", "BEAR_WEAK"):
+            weak_lock_enabled = True
+            try:
+                dca_params = self.dca_config.get("params", {}) if isinstance(getattr(self, "dca_config", {}), dict) else {}
+                weak_lock_enabled = bool(dca_params.get("weak_trend_direction_lock", True))
+            except Exception:
+                weak_lock_enabled = True
+            if weak_lock_enabled:
+                if r == "BULL_WEAK" and s != "LONG":
+                    return False
+                if r == "BEAR_WEAK" and s != "SHORT":
+                    return False
         if e != "TREND":
             return True
         if "BULL" in r and s != "LONG":
@@ -3660,6 +3867,8 @@ class TradingBot:
         params: Dict[str, Any],
         sm_regime: str,
         *,
+        engine_override: Optional[str] = None,
+        entry_regime: Optional[str] = None,
         verbose: bool = False,
     ) -> Dict[str, Any]:
         """
@@ -3669,7 +3878,9 @@ class TradingBot:
         - RANGE/RANGE_LOCK 下应用 oscillation_mode 的 ratio
         """
         # ---------- base ----------
-        engine = self._map_regime_to_engine(sm_regime)
+        engine = self._resolve_dual_engine(engine_override or self._map_regime_to_engine(sm_regime))
+        if engine == "UNKNOWN":
+            engine = self._resolve_dual_engine(self._map_regime_to_engine(sm_regime))
         engine_params = self._get_engine_params(params, regime=sm_regime, engine=engine)
         base_tp = float(params.get("take_profit_pct", 0.015))
         base_sl = float(params.get("symbol_stop_loss_pct", 0.15))
@@ -3681,6 +3892,50 @@ class TradingBot:
             base_tr_trig_raw = params.get("trailing_start_pct", 0.0)
         base_tr_trig = float(base_tr_trig_raw)
         base_tr_sl = float(params.get("trailing_stop_pct", 0.0))
+
+        # ---------- risk-level exit overrides ----------
+        risk_cfg = self.config.get("risk", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(risk_cfg, dict):
+            risk_cfg = {}
+        osc_cfg = risk_cfg.get("oscillation", {}) if isinstance(risk_cfg.get("oscillation", {}), dict) else {}
+        trend_cfg = risk_cfg.get("trend", {}) if isinstance(risk_cfg.get("trend", {}), dict) else {}
+        osc_exit_cfg = osc_cfg.get("exit", {}) if isinstance(osc_cfg.get("exit", {}), dict) else {}
+        trend_exit_cfg = trend_cfg.get("exit", {}) if isinstance(trend_cfg.get("exit", {}), dict) else {}
+        exit_source = "params"
+
+        def _pick_exit_val(cfg: Dict[str, Any], key: str, default_val: float) -> float:
+            if not isinstance(cfg, dict):
+                return default_val
+            raw = cfg.get(key, default_val)
+            if raw is None:
+                return default_val
+            try:
+                return float(raw)
+            except Exception:
+                return default_val
+
+        if engine == "TREND" and trend_exit_cfg:
+            base_tp = _pick_exit_val(trend_exit_cfg, "take_profit_pct", base_tp)
+            base_sl = _pick_exit_val(trend_exit_cfg, "symbol_stop_loss_pct", base_sl)
+            base_be_trig = _pick_exit_val(trend_exit_cfg, "break_even_trigger_pct", base_be_trig)
+            base_tr_trig = _pick_exit_val(
+                trend_exit_cfg,
+                "trailing_stop_trigger_pct",
+                _pick_exit_val(trend_exit_cfg, "trailing_start_pct", base_tr_trig),
+            )
+            base_tr_sl = _pick_exit_val(trend_exit_cfg, "trailing_stop_pct", base_tr_sl)
+            exit_source = "risk.trend.exit"
+        elif engine == "RANGE" and osc_exit_cfg:
+            base_tp = _pick_exit_val(osc_exit_cfg, "take_profit_pct", base_tp)
+            base_sl = _pick_exit_val(osc_exit_cfg, "symbol_stop_loss_pct", base_sl)
+            base_be_trig = _pick_exit_val(osc_exit_cfg, "break_even_trigger_pct", base_be_trig)
+            base_tr_trig = _pick_exit_val(
+                osc_exit_cfg,
+                "trailing_stop_trigger_pct",
+                _pick_exit_val(osc_exit_cfg, "trailing_start_pct", base_tr_trig),
+            )
+            base_tr_sl = _pick_exit_val(osc_exit_cfg, "trailing_stop_pct", base_tr_sl)
+            exit_source = "risk.oscillation.exit"
 
         fee = float(params.get("round_trip_fee_pct", 0.0))
         slip = float(params.get("round_trip_slippage_pct", 0.0))
@@ -3695,14 +3950,16 @@ class TradingBot:
         tr_sl_ratio = 1.0
         tr_sl_after_be_ratio = 1.0
 
-        if sm_regime in ("RANGE", "RANGE_LOCK"):
-            tp_ratio = self._pick_regime_ratio(osc_mode.get("take_profit_ratio"), sm_regime, 1.0)
-            sl_ratio = self._pick_regime_ratio(osc_mode.get("stop_loss_ratio"), sm_regime, 1.0)
-            be_ratio = self._pick_regime_ratio(osc_mode.get("break_even_trigger_ratio"), sm_regime, 1.0)
-            tr_trig_ratio = self._pick_regime_ratio(osc_mode.get("trailing_trigger_ratio"), sm_regime, 1.0)
-            tr_sl_ratio = self._pick_regime_ratio(osc_mode.get("trailing_stop_ratio"), sm_regime, 1.0)
+        if engine == "RANGE":
+            reg_for_ratio = str(entry_regime or sm_regime or "").upper()
+            ratio_regime = "RANGE_LOCK" if reg_for_ratio == "RANGE_LOCK" else "RANGE"
+            tp_ratio = self._pick_regime_ratio(osc_mode.get("take_profit_ratio"), ratio_regime, 1.0)
+            sl_ratio = self._pick_regime_ratio(osc_mode.get("stop_loss_ratio"), ratio_regime, 1.0)
+            be_ratio = self._pick_regime_ratio(osc_mode.get("break_even_trigger_ratio"), ratio_regime, 1.0)
+            tr_trig_ratio = self._pick_regime_ratio(osc_mode.get("trailing_trigger_ratio"), ratio_regime, 1.0)
+            tr_sl_ratio = self._pick_regime_ratio(osc_mode.get("trailing_stop_ratio"), ratio_regime, 1.0)
             tr_sl_after_be_ratio = self._pick_regime_ratio(
-                osc_mode.get("trailing_stop_after_be_ratio"), sm_regime, 1.0
+                osc_mode.get("trailing_stop_after_be_ratio"), ratio_regime, 1.0
             )
 
         # ---------- effective ----------
@@ -3749,10 +4006,11 @@ class TradingBot:
             "score_exit_sensitivity": float(engine_params.get("score_exit_sensitivity", 1.0)),
             "engine_max_dca_cap": int(engine_params.get("max_dca_cap", 3)),
             "engine_position_mult": float(engine_params.get("position_mult", 1.0)),
+            "exit_base_source": exit_source,
 
             # debug string（同层）
             "debug_string": (
-                f"🎚 exit regime={sm_regime} engine={engine} | "
+                f"🎚 exit regime={sm_regime} engine={engine} src={exit_source} | "
                 f"TP={tp:.4f} (base={base_tp:.4f}×{tp_ratio:.2f}) | "
                 f"SL={sl:.4f} (base={base_sl:.4f}×{sl_ratio:.2f}) | "
                 f"BE_trig={be_trig:.4f} (base={base_be_trig:.4f}×{be_ratio:.2f}) "
@@ -3776,6 +4034,7 @@ class TradingBot:
         now: datetime,
         side: Optional[str] = None,
         current_price: Optional[float] = None,
+        engine: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         确保 dca_state[symbol] 存在且字段齐全
@@ -3816,8 +4075,62 @@ class TradingBot:
         if "be_active" not in state:
             state["be_active"] = False
 
+        current_engine = str(state.get("engine", "") or "").upper()
+        requested_engine = str(engine or "").upper()
+        if current_engine not in ("RANGE", "TREND"):
+            if requested_engine in ("RANGE", "TREND"):
+                state["engine"] = requested_engine
+            else:
+                state["engine"] = "UNKNOWN"
+        elif requested_engine in ("RANGE", "TREND"):
+            state["engine"] = requested_engine
+        state.setdefault("entry_regime", None)
+
         self.dca_state[symbol] = state
         return state
+
+    def _tag_dca_engine_on_open(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        decision: Optional[Dict[str, Any]] = None,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """在开仓成功后写入 dca_state 的 engine/entry_regime，保证双引擎出入场一致。"""
+        try:
+            if now is None:
+                now = datetime.now()
+            st = self.dca_state.get(symbol)
+            if not isinstance(st, dict):
+                st = {}
+            st["side"] = str(side or "").upper()
+            st.setdefault("entry_time", now)
+            st.setdefault("last_dca_price", float(entry_price or 0))
+            st.setdefault("dca_count", 0)
+            st.setdefault("peak_pnl_pct", 0.0)
+            st.setdefault("be_active", False)
+
+            eng = None
+            entry_reg = None
+            if isinstance(decision, dict):
+                eng = decision.get("engine")
+                entry_reg = decision.get("entry_regime") or decision.get("regime")
+            eng_up = str(eng or "").upper()
+            if eng_up not in ("RANGE", "TREND"):
+                eng_up = self._map_regime_to_engine(str(entry_reg or "").upper() or "RANGE")
+            if eng_up not in ("RANGE", "TREND"):
+                eng_up = "RANGE"
+            st["engine"] = eng_up
+            if entry_reg is not None:
+                st["entry_regime"] = str(entry_reg).upper()
+            else:
+                st.setdefault("entry_regime", None)
+
+            self.dca_state[symbol] = st
+            self._save_dca_state()
+        except Exception:
+            return
 
     def _update_peak_pnl_pct(self, state: Dict[str, Any], pnl_pct: float) -> float:
         """
@@ -4194,6 +4507,21 @@ class TradingBot:
     def _clamp_value(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
 
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return value != 0
+        s = str(value).strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off", ""):
+            return False
+        return default
+
     def _dca_get_live_funding_rate(self, symbol: str, params: Dict[str, Any]) -> Optional[float]:
         if not bool(params.get("edge_use_live_funding", False)):
             return None
@@ -4348,16 +4676,28 @@ class TradingBot:
             cooldown_seconds = 60
         return max(0, cooldown_seconds)
 
+    def _dca_get_total_stop_loss_cooldown_seconds(self, params: Dict[str, Any]) -> int:
+        """获取总回撤止损触发后的冷却秒数；默认 4 小时。"""
+        try:
+            cooldown_seconds = int(params.get("total_stop_loss_cooldown_seconds", 4 * 3600))
+        except Exception:
+            cooldown_seconds = 4 * 3600
+        return max(0, cooldown_seconds)
+
     def _is_dca_cooldown_active(self, params: Dict[str, Any]) -> bool:
         """判断当前是否处于冷却中。"""
-        cooldown_seconds = self._dca_get_cooldown_seconds(params)
-        if cooldown_seconds <= 0:
-            # 冷却被禁用时，清理历史冷却状态，避免误阻止开仓
-            self.dca_cooldown_expires = None
-            self.dca_cooldown_reason = None
+        if self.dca_cooldown_expires is None:
             return False
 
-        if self.dca_cooldown_expires is None:
+        cooldown_reason = str(self.dca_cooldown_reason or "").strip().lower()
+        if cooldown_reason == "total_stop_loss":
+            cooldown_enabled = self._dca_get_total_stop_loss_cooldown_seconds(params) > 0
+        else:
+            cooldown_enabled = self._dca_get_cooldown_seconds(params) > 0
+        if not cooldown_enabled:
+            # 对应冷却被禁用时，清理历史冷却状态，避免误阻止开仓
+            self.dca_cooldown_expires = None
+            self.dca_cooldown_reason = None
             return False
 
         now_ts = datetime.now()
@@ -4391,11 +4731,6 @@ class TradingBot:
         top_n = max(1, int(ai_cfg.get("dca_top_n", 4)))
         sorted_candidates = sorted(candidates, key=lambda x: x[1], reverse=True)[:top_n]
         params = self.dca_config.get("params", {}) or {}
-        
-        # 获取基础 p_win 阈值
-        min_p_win_default = float(params.get("min_p_win_threshold", 0.50) or 0.50)
-        min_p_win_short_base = float(params.get("min_p_win_short", min_p_win_default) or min_p_win_default)
-        min_p_win_long_base = float(params.get("min_p_win_long", min_p_win_default) or min_p_win_default)
 
         # 准备批量请求 AI：构建多币种数据（只包含候选币种 + 当前持仓信息）
         all_symbols_data: Dict[str, Any] = {}
@@ -4445,20 +4780,9 @@ class TradingBot:
                     except Exception:
                         confidence = 0.5
 
-            # 【统一】根据方向和综合牛熊状态动态计算阈值
-            combined_regime, _, _ = self._dca_get_combined_regime(symbol, params)
-            if side == "SHORT":
-                min_conf = min_p_win_short_base
-                if combined_regime == "BULL":
-                    min_conf = float(params.get("bull_min_p_win_short", min_conf * 1.2) or min_conf * 1.2)
-            else:  # LONG
-                min_conf = min_p_win_long_base
-                if combined_regime == "BEAR":
-                    min_conf = float(params.get("bear_min_p_win_long", min_conf * 1.2) or min_conf * 1.2)
-
-            if side == "SHORT" and action == "SELL_OPEN" and confidence >= min_conf:
+            if side == "SHORT" and action == "SELL_OPEN":
                 selected.append((symbol, score, price, side))
-            if side == "LONG" and action == "BUY_OPEN" and confidence >= min_conf:
+            if side == "LONG" and action == "BUY_OPEN":
                 selected.append((symbol, score, price, side))
 
         # 从 AI 筛选结果中取前 K 个（默认 2）作为最终可下单目标
@@ -4501,10 +4825,14 @@ class TradingBot:
         return False
 
     def _run_dca_rotation_cycle(self) -> None:
-        """DCA rotation cycle optimized for AI token efficiency: only analyze positions + top DCA candidates."""
+        """双引擎循环：震荡套利 + 趋势跟随（AI可选）。"""
         update_info = self._reload_dca_config_if_changed()
         if update_info["updated"]:
-            print("\n🔔 DCA配置更新，已重新加载")
+            print("\n🔔 双引擎配置更新，已重新加载")
+            # 配置变更后清空旧的 5m 开仓计划缓存，避免按过期计划执行
+            self._dca_open_plan_cache = []
+            self._dca_open_plan_cache_bucket = None
+            self._dca_open_plan_cache_created_at = None
             if update_info["symbols_changed"]:
                 removed = update_info["removed_symbols"]
                 added = update_info["added_symbols"]
@@ -4537,6 +4865,26 @@ class TradingBot:
         
         interval = self.dca_config.get("interval", "5m")
         params = self.dca_config.get("params", {})
+        direction_refresh_cycle = bool(getattr(self, "_dual_engine_refresh_direction_this_cycle", True))
+        if self._is_dual_engine_mode():
+            if direction_refresh_cycle:
+                print("🧭 双引擎方向刷新：更新方向状态并执行开平仓")
+            else:
+                print("⏱️ 双引擎执行盯盘：沿用上次方向，仅做1m执行与风控")
+        strategy_cfg = self.config.get("strategy", {}) if isinstance(self.config, dict) else {}
+        strategy_dca_enabled = self._coerce_bool(
+            strategy_cfg.get("dca_enabled", False) if isinstance(strategy_cfg, dict) else False,
+            default=False,
+        )
+        params_dca_enabled = self._coerce_bool(params.get("dca_enabled", strategy_dca_enabled), default=strategy_dca_enabled)
+        dca_add_enabled = params_dca_enabled and (not self._is_dual_engine_mode())
+        if not dca_add_enabled:
+            try:
+                max_dca_cfg = int(params.get("max_dca", 0) or 0)
+            except Exception:
+                max_dca_cfg = 0
+            if max_dca_cfg > 0:
+                print(f"ℹ️ 已禁用DCA加仓（mode={self.strategy_mode}, dca_enabled={params_dca_enabled}），忽略 max_dca={max_dca_cfg}")
         direction = str(params.get("direction", "SHORT")).upper()
         score_threshold = float(params.get("score_threshold", 0.12))
         score_threshold_long = float(params.get("score_threshold_long", score_threshold))
@@ -4648,21 +4996,66 @@ class TradingBot:
         # 每日/总投入止损阈值（默认为 10%）。可以在 config/trading_config_vps.json 中通过
         # "total_stop_loss_pct" 覆盖（值为小数，0.10 表示 10%）。
         total_stop_loss_pct = float(params.get("total_stop_loss_pct", 0.10))
+        total_stop_loss_cooldown_seconds = self._dca_get_total_stop_loss_cooldown_seconds(params)
         if self.dca_peak_equity and total_stop_loss_pct > 0:
             drawdown = (self.dca_peak_equity - equity) / self.dca_peak_equity
             if drawdown >= total_stop_loss_pct:
-                print("⚠️  触发总投入止损，正在平仓并停止交易")
+                drawdown_pct = drawdown * 100
+                threshold_pct = total_stop_loss_pct * 100
+                peak_equity = float(self.dca_peak_equity)
+                print(
+                    "⚠️ 触发总投入止损："
+                    f"peak={peak_equity:.4f}, equity={equity:.4f}, "
+                    f"drawdown={drawdown_pct:.2f}% >= threshold={threshold_pct:.2f}%"
+                )
                 self.trade_executor.close_all_positions()
-                self.dca_halt = True
+                now_ts = datetime.now()
+                if total_stop_loss_cooldown_seconds > 0:
+                    self.dca_cooldown_expires = now_ts + timedelta(seconds=total_stop_loss_cooldown_seconds)
+                    self.dca_cooldown_reason = "total_stop_loss"
+                    print(
+                        "⏳ 总回撤止损后进入冷却："
+                        f"{total_stop_loss_cooldown_seconds}s，恢复时间 {self.dca_cooldown_expires.isoformat()}"
+                    )
+                else:
+                    self.dca_cooldown_expires = None
+                    self.dca_cooldown_reason = None
+                    print("ⓘ total_stop_loss_cooldown_seconds<=0，跳过冷却，下一轮可直接尝试新开仓")
+                # 重置峰值，避免冷却结束后因旧峰值持续超阈值而重复触发
+                self.dca_peak_equity = equity
+                # 风险事件后清空5m开仓计划缓存，避免按过期计划再次开仓
+                self._dca_open_plan_cache = []
+                self._dca_open_plan_cache_bucket = None
+                self._dca_open_plan_cache_created_at = None
+                # 兼容旧状态字段，确保不会被历史永久停机逻辑拦截
+                self.dca_halt = False
+                self._save_dca_state()
+                self._write_dca_dashboard(
+                    {},
+                    event={
+                        "timestamp": now_ts.isoformat(),
+                        "type": "RISK_TOTAL_STOP",
+                        "reason": "total_stop_loss",
+                        "peak_equity": round(peak_equity, 8),
+                        "equity": round(float(equity), 8),
+                        "drawdown_pct": round(drawdown_pct, 4),
+                        "threshold_pct": round(threshold_pct, 4),
+                        "cooldown_seconds": int(total_stop_loss_cooldown_seconds),
+                        "cooldown_expires": (
+                            self.dca_cooldown_expires.isoformat()
+                            if isinstance(self.dca_cooldown_expires, datetime)
+                            else None
+                        ),
+                    },
+                )
                 self._refresh_last_positions_snapshot({})
                 return
 
         if self.dca_halt:
-            print("⚠️  DCA已停止交易（总止损触发）")
+            # 历史兼容：旧版本可能遗留 dca_halt=True，新版自动清理并继续。
+            print("⚠️ 检测到遗留 dca_halt=True，已自动清理并继续执行")
+            self.dca_halt = False
             self._save_dca_state()
-            self._write_dca_dashboard(positions)
-            self._refresh_last_positions_snapshot(positions)
-            return
 
         # 更新持仓：止盈/止损/时间止损/DCA加仓
         force_close_unknown = bool(self.dca_config.get("force_close_unknown_symbols", False))
@@ -4707,6 +5100,22 @@ class TradingBot:
             # 退化：使用 BTC regime 或震荡判断
             sm_regime = "RANGE" if btc_regime == "NEUTRAL" else btc_regime
         cycle_engine = self._map_regime_to_engine(sm_regime)
+        cycle_trade_engine = self._resolve_dual_engine(cycle_engine)
+        risk_cfg_local = self.config.get("risk", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(risk_cfg_local, dict):
+            risk_cfg_local = {}
+        risk_osc_exit = risk_cfg_local.get("oscillation", {})
+        risk_osc_exit = (
+            risk_osc_exit.get("exit", {})
+            if isinstance(risk_osc_exit, dict) and isinstance(risk_osc_exit.get("exit", {}), dict)
+            else {}
+        )
+        risk_trend_exit = risk_cfg_local.get("trend", {})
+        risk_trend_exit = (
+            risk_trend_exit.get("exit", {})
+            if isinstance(risk_trend_exit, dict) and isinstance(risk_trend_exit.get("exit", {}), dict)
+            else {}
+        )
 
         # 持仓管理应覆盖所有当前持仓，避免持仓因本轮未入候选池而失管
         for symbol in list(positions.keys()):
@@ -4731,8 +5140,17 @@ class TradingBot:
                 side=pos_side,
                 current_price=current_price,
             )
+            if isinstance(state, dict):
+                if str(state.get("engine", "")).upper() not in ("RANGE", "TREND"):
+                    state["engine"] = cycle_trade_engine
+                if state.get("entry_regime") in (None, ""):
+                    state["entry_regime"] = str(sm_regime).upper()
             if entry_price <= 0:
                 continue
+            state_engine = self._resolve_dual_engine(state.get("engine", cycle_trade_engine), fallback=cycle_trade_engine)
+            if state_engine == "UNKNOWN":
+                state_engine = cycle_trade_engine
+            state["engine"] = state_engine
             
             # 【综合牛熊状态判断】使用 BTC + 交易对自身状态动态加权
             # 这样可以检测独立行情，避免被 BTC 误判
@@ -4769,7 +5187,13 @@ class TradingBot:
                 pnl_pct = (current_price - entry_price) / entry_price
 
             # 【集中计算阈值】统一获取 TP/SL/BE/Trailing 阈值（regime-aware）
-            thr = self._get_exit_thresholds_by_regime(params, sm_regime, verbose=True)
+            thr = self._get_exit_thresholds_by_regime(
+                params,
+                sm_regime,
+                engine_override=state_engine,
+                entry_regime=(state.get("entry_regime") if isinstance(state, dict) else None),
+                verbose=True,
+            )
             tp = thr["take_profit_pct"]
             sl = thr["stop_loss_pct"]
             be_trig = thr["break_even_trigger_pct"]
@@ -4779,6 +5203,16 @@ class TradingBot:
 
             max_hold_days = float(params.get("max_hold_days", 1))
             max_hold_minutes = max_hold_days * 24 * 60
+            max_hold_bars_cfg = 0
+            try:
+                if state_engine == "TREND":
+                    max_hold_bars_cfg = int(risk_trend_exit.get("max_hold_bars", 0) or 0)
+                else:
+                    max_hold_bars_cfg = int(risk_osc_exit.get("max_hold_bars", 0) or 0)
+            except Exception:
+                max_hold_bars_cfg = 0
+            if max_hold_bars_cfg > 0:
+                max_hold_minutes = max_hold_bars_cfg * max(1, int(bar_minutes))
 
             hold_minutes = (now - state.get("entry_time", now)).total_seconds() / 60
 
@@ -4791,7 +5225,7 @@ class TradingBot:
             if pnl_pct >= tp:
                 self._close_position(
                     symbol,
-                    {"action": "CLOSE", "reason": "dca_take_profit"},
+                    {"action": "CLOSE", "reason": f"dca_take_profit(engine={state_engine})"},
                     side=pos.get("side"),
                 )
                 self.dca_state.pop(symbol, None)
@@ -4829,7 +5263,7 @@ class TradingBot:
             tr_after_be_ratio = float(thr.get("trailing_stop_after_be_ratio", 1.0) or 1.0)
             tr_sl_eff = tr_sl * (tr_after_be_ratio if be_active else 1.0)
             trig, tr_reason = self._check_trailing_stop_by_pnl(
-                state, pnl_pct, tr_trig, tr_sl_eff, regime=sm_regime
+                state, pnl_pct, tr_trig, tr_sl_eff, regime=state_engine
             )
             if trig:
                 suffix = " | BE已启用" if be_active else ""
@@ -4862,7 +5296,7 @@ class TradingBot:
             if hold_minutes >= max_hold_minutes:
                 self._close_position(
                     symbol,
-                    {"action": "CLOSE", "reason": "dca_max_hold_time"},
+                    {"action": "CLOSE", "reason": f"dca_max_hold_time(engine={state_engine})"},
                     side=pos.get("side"),
                 )
                 self.dca_state.pop(symbol, None)
@@ -4922,6 +5356,9 @@ class TradingBot:
             engine_max_dca_cap = int(thr.get("engine_max_dca_cap", max_dca))
             max_dca = min(max_dca, engine_max_dca_cap)
 
+            # 双引擎实盘：默认禁用DCA加仓；即便开启，也只允许 RANGE 持仓触发。
+            if (not dca_add_enabled) or state_engine != "RANGE":
+                max_dca = 0
             if state.get("dca_count", 0) < max_dca:
                 equity_scale = self._dca_equity_scale(equity, params)
                 add_margin = float(params.get("add_margin", 3.65))
@@ -4995,13 +5432,24 @@ class TradingBot:
         dca_top_n = max(1, int(self.config.get("ai", {}).get("dca_top_n", 2)))
         # tuple: (symbol, score, price, side, quote_volume_24h, edge, threshold, p_win)
         open_candidates_raw: List[Tuple[str, float, float, str, float, float, float, float]] = []
+        open_candidate_reason: Dict[str, str] = {}
+        selected_high: List[Dict[str, Any]] = []
+        selected_low: List[Dict[str, Any]] = []
+        symbols_for_candidate = symbols if direction_refresh_cycle else []
+        if not direction_refresh_cycle:
+            print("♻️ 非方向刷新周期：跳过5m候选重算，尝试复用上一轮开仓计划")
 
         # 如果已达最大持仓数，不再寻找新候选
         if len(current_position_symbols) < MAX_POSITIONS:
             min_daily_volume = float(params.get("min_daily_volume_usdt", 30.0))
+            try:
+                trend_pullback_lookback = int(params.get("trend_pullback_lookback", 6) or 6)
+            except Exception:
+                trend_pullback_lookback = 6
+            trend_pullback_lookback = max(2, min(20, trend_pullback_lookback))
             # 先收集全量评分，再按"高分开多 + 低分开空"组装候选
             scored_pool: List[Dict[str, Any]] = []
-            for symbol in symbols:
+            for symbol in symbols_for_candidate:
                 if symbol in current_position_symbols:
                     continue
                 df = self._dca_get_klines_df(symbol, interval, limit=200)
@@ -5080,6 +5528,23 @@ class TradingBot:
                             "threshold_short": float(threshold_short_dyn),
                             "p_win_long": float(p_win_l),
                             "p_win_short": float(p_win_s),
+                            "rsi": float(row.get("rsi", 50) or 50),
+                            "bb_upper": float(
+                                row.get("bb_upper", row.get("bb_upperband", row.get("bb_upper_band", 0))) or 0
+                            ),
+                            "bb_lower": float(
+                                row.get("bb_lower", row.get("bb_lowerband", row.get("bb_lower_band", 0))) or 0
+                            ),
+                            "bb_middle": float(
+                                row.get("bb_middle", row.get("bb_middleband", row.get("bb_mid", 0))) or 0
+                            ),
+                            "volume_quantile": float(row.get("volume_quantile", 0.5) or 0.5),
+                            "ema_fast": float(row.get("ema_fast_20", row.get("ema_fast", 0)) or 0),
+                            "ema_slow": float(row.get("ema_slow_50", row.get("ema_slow", 0)) or 0),
+                            "low_min_k": float(df["low"].tail(trend_pullback_lookback).min() or 0),
+                            "high_max_k": float(df["high"].tail(trend_pullback_lookback).max() or 0),
+                            "close_prev": float(df["close"].iloc[-2]) if len(df) >= 2 else float(row.get("close", 0) or 0),
+                            "rsi_prev": float(df["rsi"].iloc[-2]) if ("rsi" in df.columns and len(df) >= 2) else float(row.get("rsi", 50) or 50),
                         }
                     )
 
@@ -5095,8 +5560,37 @@ class TradingBot:
             high_pick_n = max(0, min(5, high_pick_n))
             low_pick_n = max(0, min(5, low_pick_n))
 
-            ranked_desc = sorted(scored_pool, key=lambda x: (x["score"], x["quote_vol_24h"]), reverse=True)
-            ranked_asc = sorted(scored_pool, key=lambda x: (x["score"], -x["quote_vol_24h"]))
+            # 候选排序：
+            # - 趋势/默认：按 score 排序
+            # - RANGE/RANGE_LOCK：按距离布林带上下轨的极值排序
+            if str(sm_regime).upper() in ("RANGE", "RANGE_LOCK"):
+                def _dist_to_bb_lower(it: Dict[str, Any]) -> float:
+                    price = float(it.get("price", 0) or 0)
+                    lo = float(it.get("bb_lower", 0) or 0)
+                    if price <= 0 or lo <= 0:
+                        return 1e9
+                    # 越小越贴近/跌破下轨（多头均值回归优先）
+                    return (price - lo) / price
+
+                def _dist_to_bb_upper(it: Dict[str, Any]) -> float:
+                    price = float(it.get("price", 0) or 0)
+                    up = float(it.get("bb_upper", 0) or 0)
+                    if price <= 0 or up <= 0:
+                        return 1e9
+                    # 越小越贴近/突破上轨（空头均值回归优先）
+                    return (up - price) / price
+
+                ranked_desc = sorted(
+                    scored_pool,
+                    key=lambda x: (_dist_to_bb_lower(x), -float(x.get("quote_vol_24h", 0) or 0)),
+                )
+                ranked_asc = sorted(
+                    scored_pool,
+                    key=lambda x: (_dist_to_bb_upper(x), -float(x.get("quote_vol_24h", 0) or 0)),
+                )
+            else:
+                ranked_desc = sorted(scored_pool, key=lambda x: (x["score"], x["quote_vol_24h"]), reverse=True)
+                ranked_asc = sorted(scored_pool, key=lambda x: (x["score"], -x["quote_vol_24h"]))
 
 
 
@@ -5123,36 +5617,123 @@ class TradingBot:
                 min_p_win_short=min_p_win_short_base,
                 min_score_long=min_score_long_base,
                 max_score_short=max_score_short_base,
-                engine=cycle_engine,
+                engine=cycle_trade_engine,
             )
             min_p_win_long_base = float(entry_gate_pre["min_p_win_long"])
             min_p_win_short_base = float(entry_gate_pre["min_p_win_short"])
             min_score_long_base = float(entry_gate_pre["min_score_long"])
             max_score_short_base = float(entry_gate_pre["max_score_short"])
 
+            # RANGE / RANGE_LOCK：均值回归门禁（优先于 p_win/score）
+            osc_mode = params.get("oscillation_mode", {}) or {}
+            osc_entry = (
+                osc_mode.get("entry", {})
+                if isinstance(osc_mode.get("entry", {}), dict)
+                else {}
+            )
+            osc_rsi_low = float(osc_entry.get("rsi_low", 30))
+            osc_rsi_high = float(osc_entry.get("rsi_high", 70))
+            osc_bb_touch = float(osc_entry.get("bb_touch", 1.0))
+            osc_vol_q_max = float(osc_entry.get("vol_q_max", 0.65))
+
+            def _osc_mean_reversion_ok(it: Dict[str, Any], side: str) -> Tuple[bool, str]:
+                try:
+                    price = float(it.get("price", 0) or 0)
+                    rsi = float(it.get("rsi", 50) or 50)
+                    up = float(it.get("bb_upper", 0) or 0)
+                    lo = float(it.get("bb_lower", 0) or 0)
+                    vq = float(it.get("volume_quantile", 0.5) or 0.5)
+                    if price <= 0 or (up <= 0 and lo <= 0):
+                        return False, "osc_no_bb"
+                    if vq > osc_vol_q_max:
+                        return False, f"osc_skip_breakout(vq={vq:.2f})"
+                    if side == "LONG":
+                        if lo > 0 and price <= lo * osc_bb_touch and rsi <= osc_rsi_low:
+                            return True, f"osc_long(bb_low+rsi={rsi:.1f},vq={vq:.2f})"
+                        return False, f"osc_no_edge_long(rsi={rsi:.1f})"
+                    if up > 0 and price >= up * (2 - osc_bb_touch) and rsi >= osc_rsi_high:
+                        return True, f"osc_short(bb_up+rsi={rsi:.1f},vq={vq:.2f})"
+                    return False, f"osc_no_edge_short(rsi={rsi:.1f})"
+                except Exception:
+                    return False, "osc_err"
+
+            trend_cfg_local = risk_cfg_local.get("trend", {}) if isinstance(risk_cfg_local, dict) else {}
+            trend_entry_cfg: Dict[str, Any] = {}
+            if isinstance(trend_cfg_local, dict):
+                if isinstance(trend_cfg_local.get("entry", {}), dict):
+                    trend_entry_cfg = trend_cfg_local.get("entry", {}) or {}
+                elif isinstance(trend_cfg_local.get("entry_gate", {}), dict):
+                    trend_entry_cfg = trend_cfg_local.get("entry_gate", {}) or {}
+            trend_pullback_touch = float(trend_entry_cfg.get("pullback_touch", 1.005) or 1.005)
+            trend_confirm_rsi_long = float(trend_entry_cfg.get("confirm_rsi_long", 52) or 52)
+            trend_confirm_rsi_short = float(trend_entry_cfg.get("confirm_rsi_short", 48) or 48)
+
+            def _trend_pullback_ok(it: Dict[str, Any], side: str) -> Tuple[bool, str]:
+                try:
+                    price = float(it.get("price", 0) or 0)
+                    bbm = float(it.get("bb_middle", 0) or 0)
+                    ema_f = float(it.get("ema_fast", 0) or 0)
+                    ema_s = float(it.get("ema_slow", 0) or 0)
+                    low_min = float(it.get("low_min_k", 0) or 0)
+                    high_max = float(it.get("high_max_k", 0) or 0)
+                    close_prev = float(it.get("close_prev", price) or price)
+                    rsi = float(it.get("rsi", 50) or 50)
+                    rsi_prev = float(it.get("rsi_prev", rsi) or rsi)
+                    if price <= 0 or ema_f <= 0 or ema_s <= 0:
+                        return False, "trend_no_ema"
+                    if side == "LONG":
+                        if not (ema_f > ema_s and price > ema_f):
+                            return False, f"trend_not_up(ema_f={ema_f:.4g},ema_s={ema_s:.4g})"
+                        touch_ref = bbm if bbm > 0 else ema_f
+                        if touch_ref > 0 and low_min > touch_ref * trend_pullback_touch:
+                            return False, f"trend_no_pullback(low_min={low_min:.4g}>ref={touch_ref:.4g})"
+                        if not (price > close_prev and rsi >= trend_confirm_rsi_long and rsi >= rsi_prev):
+                            return False, f"trend_no_confirm(p={price:.4g},prev={close_prev:.4g},rsi={rsi:.1f}->{rsi_prev:.1f})"
+                        return True, f"trend_pullback_ok(ref={touch_ref:.4g},low_min={low_min:.4g},rsi={rsi:.1f})"
+                    if not (ema_f < ema_s and price < ema_f):
+                        return False, f"trend_not_down(ema_f={ema_f:.4g},ema_s={ema_s:.4g})"
+                    touch_ref = bbm if bbm > 0 else ema_f
+                    if touch_ref > 0 and high_max < touch_ref / max(trend_pullback_touch, 1e-6):
+                        return False, f"trend_no_pullback(high_max={high_max:.4g}<ref={touch_ref:.4g})"
+                    if not (price < close_prev and rsi <= trend_confirm_rsi_short and rsi <= rsi_prev):
+                        return False, f"trend_no_confirm(p={price:.4g},prev={close_prev:.4g},rsi={rsi:.1f}->{rsi_prev:.1f})"
+                    return True, f"trend_pullback_ok(ref={touch_ref:.4g},high_max={high_max:.4g},rsi={rsi:.1f})"
+                except Exception:
+                    return False, "trend_err"
+
             open_candidates_raw = []
+            p_win_gate_disabled_logged = False
             for it in selected_high:
                 sym = it["symbol"]
                 p_win_l = float(it.get("p_win_long", 0) or 0)
                 
-                # 【统一】对每个交易对获取综合牛熊状态，动态调整阈值
-                combined_regime, combined_score, _ = self._dca_get_combined_regime(sym, params)
-                min_p_win_long = min_p_win_long_base
-                if combined_regime == "BEAR":
-                    # 熊市：山寨币跟跌，做多风险大，提高多单阈值
-                    min_p_win_long = float(params.get("bear_min_p_win_long", min_p_win_long_base * 1.2) or min_p_win_long_base * 1.2)
-                
-                # 过滤低胜率候选
-                if p_win_l < min_p_win_long:
-                    print(f"   ⏸️ {sym} 多单p_win={p_win_l:.2f} < {min_p_win_long:.2f}（综合:{combined_regime}），跳过")
-                    continue
-                
-                # 过滤低评分候选（score 越高越偏多，只保留足够高的 score）
-                # min_score_long：做多最低允许的 score，低于此值表示"不够偏多"
-                score_val_l = float(it["score"])
-                if score_val_l < min_score_long_base:
-                    print(f"   ⏸️ {sym} LONG score={score_val_l:.3f} < min_score_long={min_score_long_base:.3f} → skip")
-                    continue
+                # RANGE 引擎：去掉 edge 过滤，只记录均值回归信号用于日志/复盘
+                if cycle_trade_engine == "RANGE":
+                    ok, rsn = _osc_mean_reversion_ok(it, "LONG")
+                    open_candidate_reason[sym] = rsn
+                    if ok:
+                        print(f"   ✅ {sym} RANGE均值回归入场：{rsn}")
+                    else:
+                        print(f"   ⓘ {sym} RANGE均值回归未触发（edge过滤已禁用）：{rsn}，保留候选")
+                else:
+                    # p_win 门槛已禁用，不再按胜率阈值过滤候选
+                    if not p_win_gate_disabled_logged:
+                        print("   ⓘ p_win开仓门槛已禁用（候选阶段）")
+                        p_win_gate_disabled_logged = True
+
+                    # 过滤低评分候选（score 越高越偏多，只保留足够高的 score）
+                    # min_score_long：做多最低允许的 score，低于此值表示"不够偏多"
+                    score_val_l = float(it["score"])
+                    if score_val_l < min_score_long_base:
+                        print(f"   ⏸️ {sym} LONG score={score_val_l:.3f} < min_score_long={min_score_long_base:.3f} → skip")
+                        continue
+                    if cycle_trade_engine == "TREND":
+                        trend_ok, trend_rsn = _trend_pullback_ok(it, "LONG")
+                        if not trend_ok:
+                            print(f"   ⏸️ {sym} TREND回调确认不满足：{trend_rsn}，跳过")
+                            continue
+                        open_candidate_reason[sym] = trend_rsn
+                        print(f"   ✅ {sym} TREND回调确认入场：{trend_rsn}")
                 
                 open_candidates_raw.append(
                     (
@@ -5170,24 +5751,33 @@ class TradingBot:
                 sym = it["symbol"]
                 p_win_s = float(it.get("p_win_short", 0) or 0)
                 
-                # 【统一】对每个交易对获取综合牛熊状态，动态调整阈值
-                combined_regime, combined_score, _ = self._dca_get_combined_regime(sym, params)
-                min_p_win_short = min_p_win_short_base
-                if combined_regime == "BULL":
-                    # 牛市：山寨币跟涨，做空风险大，提高空单阈值
-                    min_p_win_short = float(params.get("bull_min_p_win_short", min_p_win_short_base * 1.2) or min_p_win_short_base * 1.2)
-                
-                # 过滤低胜率候选
-                if p_win_s < min_p_win_short:
-                    print(f"   ⏸️ {sym} 空单p_win={p_win_s:.2f} < {min_p_win_short:.2f}（综合:{combined_regime}），跳过")
-                    continue
-                
-                # 过滤低评分候选（score 越低越偏空，只保留足够低的 score）
-                # max_score_short：做空最高允许的 score，超过此值表示"不够偏空"
-                score_val_s = float(it["score"])
-                if score_val_s > max_score_short_base:
-                    print(f"   ⏸️ {sym} SHORT score={score_val_s:.3f} > max_score_short={max_score_short_base:.3f} → skip")
-                    continue
+                # RANGE 引擎：去掉 edge 过滤，只记录均值回归信号用于日志/复盘
+                if cycle_trade_engine == "RANGE":
+                    ok, rsn = _osc_mean_reversion_ok(it, "SHORT")
+                    open_candidate_reason[sym] = rsn
+                    if ok:
+                        print(f"   ✅ {sym} RANGE均值回归入场：{rsn}")
+                    else:
+                        print(f"   ⓘ {sym} RANGE均值回归未触发（edge过滤已禁用）：{rsn}，保留候选")
+                else:
+                    # p_win 门槛已禁用，不再按胜率阈值过滤候选
+                    if not p_win_gate_disabled_logged:
+                        print("   ⓘ p_win开仓门槛已禁用（候选阶段）")
+                        p_win_gate_disabled_logged = True
+
+                    # 过滤低评分候选（score 越低越偏空，只保留足够低的 score）
+                    # max_score_short：做空最高允许的 score，超过此值表示"不够偏空"
+                    score_val_s = float(it["score"])
+                    if score_val_s > max_score_short_base:
+                        print(f"   ⏸️ {sym} SHORT score={score_val_s:.3f} > max_score_short={max_score_short_base:.3f} → skip")
+                        continue
+                    if cycle_trade_engine == "TREND":
+                        trend_ok, trend_rsn = _trend_pullback_ok(it, "SHORT")
+                        if not trend_ok:
+                            print(f"   ⏸️ {sym} TREND回调确认不满足：{trend_rsn}，跳过")
+                            continue
+                        open_candidate_reason[sym] = trend_rsn
+                        print(f"   ✅ {sym} TREND回调确认入场：{trend_rsn}")
                 
                 open_candidates_raw.append(
                     (
@@ -5205,14 +5795,120 @@ class TradingBot:
             # 最终候选上限：不超过 dca_top_n
             open_candidates_raw = open_candidates_raw[:dca_top_n]
 
+        # 严格模式：非方向刷新周期不生成新候选，只复用 5m 周期缓存计划
+        if not direction_refresh_cycle:
+            cached_plan = self._dca_open_plan_cache if isinstance(self._dca_open_plan_cache, list) else []
+            current_bucket = getattr(self, "_dual_engine_direction_bucket", None)
+            cached_bucket = getattr(self, "_dca_open_plan_cache_bucket", None)
+            if (
+                isinstance(cached_plan, list)
+                and cached_plan
+                and current_bucket is not None
+                and cached_bucket is not None
+                and int(cached_bucket) != int(current_bucket)
+            ):
+                print(
+                    "⚠️ 检测到5m缓存计划窗口已过期，已丢弃："
+                    f"cache_bucket={cached_bucket}, current_bucket={current_bucket}"
+                )
+                cached_plan = []
+            open_candidates_raw = []
+            open_candidate_reason = {}
+            if cached_plan:
+                print(f"♻️ 复用5m缓存开仓计划: {len(cached_plan)} 条")
+            for item in cached_plan:
+                if not isinstance(item, dict):
+                    continue
+                sym = str(item.get("symbol", "")).upper()
+                if not sym or sym in current_position_symbols:
+                    continue
+                decision_cached = item.get("decision", {})
+                if not isinstance(decision_cached, dict):
+                    continue
+                action_cached = str(decision_cached.get("action", "")).upper()
+                if action_cached not in ("BUY_OPEN", "SELL_OPEN"):
+                    continue
+                side_cached = "LONG" if action_cached == "BUY_OPEN" else "SHORT"
+                score_cached = float(item.get("score", 0.0) or 0.0)
+                price_cached = float(item.get("price", 0.0) or 0.0)
+                qv_cached = float(item.get("quote_vol_24h", 0.0) or 0.0)
+                edge_cached = float(item.get("edge", decision_cached.get("edge", 0.0)) or 0.0)
+                threshold_cached = float(item.get("threshold", 0.0) or 0.0)
+                p_win_cached = float(item.get("p_win", decision_cached.get("confidence", 0.0)) or 0.0)
+                open_candidates_raw.append(
+                    (
+                        sym,
+                        score_cached,
+                        price_cached,
+                        side_cached,
+                        qv_cached,
+                        edge_cached,
+                        threshold_cached,
+                        p_win_cached,
+                    )
+                )
+                cached_reason = str(
+                    decision_cached.get("entry_reason")
+                    or item.get("entry_reason")
+                    or ""
+                ).strip()
+                if cached_reason:
+                    open_candidate_reason[sym] = cached_reason
+            open_candidates_raw = open_candidates_raw[:dca_top_n]
+            if not open_candidates_raw:
+                print("⏭️ 当前无可执行的5m缓存开仓计划")
+
         candidate_symbols = [c[0] for c in open_candidates_raw]
         candidate_edge_info = [f"{c[0]}:{c[5]:.4f}" for c in open_candidates_raw]
         candidate_score_info = [f"{c[0]}:{c[1]:.3f}:{c[3]}" for c in open_candidates_raw]
-        print(f"📈 DCA候选: {candidate_symbols} (top {dca_top_n})")
+        print(f"📈 双引擎候选: {candidate_symbols} (top {dca_top_n})")
         if candidate_edge_info:
             print(f"   edge排序: {', '.join(candidate_edge_info)}")
         if candidate_score_info:
             print(f"   线性评分: {', '.join(candidate_score_info)}")
+        # RANGE/RANGE_LOCK：纯日志增强，打印 BB 距离（不改变交易行为）
+        if str(sm_regime).upper() in ("RANGE", "RANGE_LOCK"):
+            def _safe_f(v: Any, d: float = 0.0) -> float:
+                try:
+                    return float(v)
+                except Exception:
+                    return float(d)
+
+            def _dist_lower(it: Dict[str, Any]) -> float:
+                p = _safe_f(it.get("price", 0), 0.0)
+                lo = _safe_f(it.get("bb_lower", 0), 0.0)
+                if p <= 0 or lo <= 0:
+                    return 9999.0
+                return (p - lo) / p
+
+            def _dist_upper(it: Dict[str, Any]) -> float:
+                p = _safe_f(it.get("price", 0), 0.0)
+                up = _safe_f(it.get("bb_upper", 0), 0.0)
+                if p <= 0 or up <= 0:
+                    return 9999.0
+                return (up - p) / p
+
+            if selected_high:
+                high_dbg: List[str] = []
+                for it in selected_high:
+                    p = _safe_f(it.get("price", 0), 0.0)
+                    lo = _safe_f(it.get("bb_lower", 0), 0.0)
+                    d = _dist_lower(it)
+                    high_dbg.append(f"{it.get('symbol')} dL={d:.4f} p={p:.6g} lo={lo:.6g}")
+                print(f"   RANGE BB距下轨: {', '.join(high_dbg)}")
+
+            if selected_low:
+                low_dbg: List[str] = []
+                for it in selected_low:
+                    p = _safe_f(it.get("price", 0), 0.0)
+                    up = _safe_f(it.get("bb_upper", 0), 0.0)
+                    d = _dist_upper(it)
+                    low_dbg.append(f"{it.get('symbol')} dU={d:.4f} p={p:.6g} up={up:.6g}")
+                print(f"   RANGE BB距上轨: {', '.join(low_dbg)}")
+        if open_candidate_reason:
+            reason_info = [f"{sym}:{open_candidate_reason.get(sym, '')}" for sym in candidate_symbols if sym in open_candidate_reason]
+            if reason_info:
+                print(f"   {cycle_trade_engine} 入场触发: {', '.join(reason_info)}")
 
         # 3. 合并持仓+候选，准备AI批量分析（总共2-4个交易对）
         symbols_for_ai = list(set(current_position_symbols + candidate_symbols))
@@ -5258,8 +5954,8 @@ class TradingBot:
                 print("⚠️ AI组件未完全初始化，跳过 AI 分析")
                 multi_decisions = {}
         else:
-            # AI 被禁用：使用规则化 DCA 决策直接对候选构建开仓建议
-            print(f"⚙️ AI已禁用，使用规则 DCA 决策处理候选: {candidate_symbols}")
+            # AI 被禁用：使用规则化双引擎决策直接对候选构建开仓建议
+            print(f"⚙️ AI已禁用，使用规则双引擎决策处理候选: {candidate_symbols}")
             multi_decisions = {}
             # open_candidates_raw 包含 (symbol, score, price, side, quote_vol_24h, edge, threshold, p_win)
             params = self.dca_config.get("params", {}) or {}
@@ -5267,41 +5963,13 @@ class TradingBot:
             # 获取趋势评分开关
             trend_scoring_enabled_local = bool(params.get("trend_scoring_enabled", True))
 
-            # 获取最小 p_win 阈值（根据方向和综合牛熊状态动态调整）
-            # 逻辑：牛市做空风险大（山寨币跟涨）→ 提高空单阈值
-            #       熊市做多风险大（山寨币跟跌）→ 提高多单阈值
-            min_p_win_default = float(params.get("min_p_win_threshold", 0.50) or 0.50)
-            min_p_win_short = float(params.get("min_p_win_short", min_p_win_default) or min_p_win_default)
-            min_p_win_long = float(params.get("min_p_win_long", min_p_win_default) or min_p_win_default)
-            
+            print("ⓘ p_win开仓门槛已禁用（规则决策阶段）")
             for tup in (open_candidates_raw or []):
                 try:
                     sym, score_val, price_val, side_val, _qv, edge_val, threshold_val, p_win_val = tup
                 except Exception:
                     continue
-                
-                # 【使用综合牛熊状态】针对每个交易对获取其综合状态
-                # 这样可以识别独立行情，避免 BTC 误判
-                combined_regime, combined_score, combined_details = self._dca_get_combined_regime(sym, params)
-                
-                # 根据综合牛熊状态调整阈值
-                min_p_win_s = min_p_win_short
-                min_p_win_l = min_p_win_long
-                if combined_regime == "BULL":
-                    # 牛市：山寨币跟涨，做空风险大，提高空单阈值
-                    min_p_win_s = float(params.get("bull_min_p_win_short", min_p_win_short * 1.2) or min_p_win_short * 1.2)
-                elif combined_regime == "BEAR":
-                    # 熊市：山寨币跟跌，做多风险大，提高多单阈值
-                    min_p_win_l = float(params.get("bear_min_p_win_long", min_p_win_long * 1.2) or min_p_win_long * 1.2)
-                
-                # 根据方向获取对应的 p_win 阈值
                 is_short = (side_val or "SHORT").upper() == "SHORT"
-                min_p_win = min_p_win_s if is_short else min_p_win_l
-                
-                # 检查最小 p_win 阈值
-                if float(p_win_val) < min_p_win:
-                    print(f"⏸️ {sym} 跳过开{'空' if is_short else '多'}：p_win={float(p_win_val):.2f} < 阈值 {min_p_win:.2f} (综合状态={combined_regime})")
-                    continue
                 
                 action = "SELL_OPEN" if is_short else "BUY_OPEN"
                 
@@ -5325,10 +5993,13 @@ class TradingBot:
                     # atr_position 是 USDT 名义价值
                     account_summary = self.account_data.get_account_summary() or {}
                     equity = float(account_summary.get("equity", 100))
+                    max_position_raw = float(params.get("max_position_pct", 0.30))
+                    max_position_ratio = max_position_raw if 0 < max_position_raw <= 1.0 else max_position_raw / 100.0
+                    max_position_ratio = max(0.01, min(0.95, max_position_ratio))
                     if equity > 0:
                         # ATR 计算返回 USDT 名义价值，转为权益比例
                         position_ratio = atr_position / equity
-                        position_ratio = min(0.30, max(0.05, position_ratio))
+                        position_ratio = min(max_position_ratio, max(0.05, position_ratio))
                     else:
                         position_ratio = 0.15
                     print(f"   📊 {sym} ATR仓位: {position_ratio * 100:.1f}% (ATR={atr_details.get('atr', 0):.6f})")
@@ -5336,8 +6007,9 @@ class TradingBot:
                     # 直接使用配置的 0~1 比例值（如 0.45 表示 45%）
                     # 兼容：如果配置值 > 1，视为百分比，自动转换
                     position_raw = float(params.get("max_position_pct", 0.30))
-                    position_ratio = position_raw if 0 < position_raw <= 1.0 else position_raw / 100.0
-                    position_ratio = max(0.10, min(0.50, position_ratio))
+                    max_position_ratio = position_raw if 0 < position_raw <= 1.0 else position_raw / 100.0
+                    max_position_ratio = max(0.01, min(0.95, max_position_ratio))
+                    position_ratio = max_position_ratio
 
 
                 # 获取趋势强度（用于决策记录，不再影响 confidence）
@@ -5349,17 +6021,57 @@ class TradingBot:
                     "action": action,
                     "confidence": confidence,
                     "leverage": leverage,
+                    "engine": cycle_trade_engine,
+                    "entry_regime": str(sm_regime).upper(),
+                    "entry_reason": open_candidate_reason.get(sym, ""),
                     "position_percent": position_ratio,  # 统一存储 0~1 比例
+                    "position_percent_base": position_ratio,
+                    "position_percent_cap": max_position_ratio,
                     "take_profit_percent": take_profit,
                     "stop_loss_percent": -abs(stop_loss),
                     "reason": (
-                        f"规则DCA候选(score={score_val:.3f},edge={float(edge_val):.4f},"
-                        f"th={float(threshold_val):.3f},p_win={float(p_win_val):.2f})"
+                        f"规则双引擎候选(engine={cycle_trade_engine},sm={str(sm_regime).upper()},"
+                        f"score={score_val:.3f},edge={float(edge_val):.4f},"
+                        f"th={float(threshold_val):.3f},p_win={float(p_win_val):.2f}"
+                        + (f"|{open_candidate_reason.get(sym, '')}" if open_candidate_reason.get(sym) else "")
+                        + ")"
                     ),
                     "trend_strength": normalized_trend,
                     "edge": float(edge_val),
                 }
                 multi_decisions[sym] = decision
+
+        # 将本次 5m 决策的开仓计划缓存，供后续 1m 执行层复用
+        if direction_refresh_cycle:
+            refreshed_plan: List[Dict[str, Any]] = []
+            for sym, score_val, price_val, side_val, qv_val, edge_val, threshold_val, p_win_val in (open_candidates_raw or []):
+                decision_live = multi_decisions.get(sym)
+                if not isinstance(decision_live, dict):
+                    continue
+                action_live = str(decision_live.get("action", "")).upper()
+                if action_live not in ("BUY_OPEN", "SELL_OPEN"):
+                    continue
+                refreshed_plan.append(
+                    {
+                        "symbol": str(sym).upper(),
+                        "score": float(score_val),
+                        "price": float(price_val),
+                        "target_side": str(side_val).upper(),
+                        "quote_vol_24h": float(qv_val),
+                        "edge": float(edge_val),
+                        "threshold": float(threshold_val),
+                        "p_win": float(p_win_val),
+                        "entry_reason": str(open_candidate_reason.get(sym, "")),
+                        "decision": dict(decision_live),
+                    }
+                )
+            self._dca_open_plan_cache = refreshed_plan
+            self._dca_open_plan_cache_bucket = getattr(self, "_dual_engine_direction_bucket", None)
+            self._dca_open_plan_cache_created_at = datetime.now().isoformat()
+            print(
+                "💾 已缓存5m开仓计划: "
+                f"{len(refreshed_plan)} 条 (bucket={self._dca_open_plan_cache_bucket})"
+            )
 
         # 5. 处理AI决策：先平仓，再开仓
         # 5.1 检查所有当前持仓，看AI是否建议平仓
@@ -5373,7 +6085,7 @@ class TradingBot:
                 # 获取AI决策（应该在multi_decisions中）
                 decision = multi_decisions.get(symbol)
 
-                # 若无 AI 决策，维持规则 DCA 处理结果，不额外打印告警
+                # 若无 AI 决策，维持规则双引擎处理结果，不额外打印告警
                 if not decision:
                     continue
 
@@ -5420,7 +6132,7 @@ class TradingBot:
                 else:
                     print(f"ℹ️ {symbol} AI决策={action} (confidence={confidence:.2f})，保留持仓")
         elif current_position_symbols:
-            print("⚙️ AI已禁用，当前持仓按规则DCA处理（本轮已完成加仓/平仓判断）")
+            print("⚙️ AI已禁用，当前持仓按规则双引擎处理（本轮已完成加仓/平仓判断）")
 
         # 5.2 处理开仓决策：仅在持仓数<MAX_POSITIONS时才考虑开仓
         allow_open_new = True
@@ -5452,32 +6164,48 @@ class TradingBot:
 
         if regime_sm_enabled:
             # ===== 使用状态机 =====
-            # 1. 计算趋势分数 TS（每5m都计算）
-            ts, ts_details = self._calc_trend_score("BTCUSDT", params)
+            if direction_refresh_cycle:
+                # 1. 计算趋势分数 TS（仅在方向刷新周期更新）
+                ts, ts_details = self._calc_trend_score("BTCUSDT", params)
 
-            # 2. 更新 BTC 1H 指标（整点后更新一次，其他时间使用缓存）
-            indicators_1h = self._update_btc_1h_indicators(params)
-            bos = indicators_1h["bos"]
-            vol_ratio = indicators_1h["vol_ratio"]
+                # 2. 更新 BTC 1H 指标（整点后更新一次，其他时间使用缓存）
+                indicators_1h = self._update_btc_1h_indicators(params)
+                bos = int(indicators_1h["bos"])
+                vol_ratio = float(indicators_1h["vol_ratio"])
 
-            # 3. 计算 4H ADX（独立计算）
-            df_4h = self._dca_get_klines_df("BTCUSDT", "4h", limit=60)
-            adx_4h = 25.0
-            if df_4h is not None and len(df_4h) >= 55:
-                adx_4h = self._calc_adx(df_4h, period=14)
+                # 3. 计算 4H ADX（独立计算）
+                df_4h = self._dca_get_klines_df("BTCUSDT", "4h", limit=60)
+                adx_4h = 25.0
+                if df_4h is not None and len(df_4h) >= 55:
+                    adx_4h = self._calc_adx(df_4h, period=14)
 
-            # 4. 运行状态机
-            # 使用 1H close_time 作为 bos_event_ts（BOS事件时间戳）
-            bos_event_ts = indicators_1h.get("close_time", 0) if bos != 0 else None
-            new_regime, action, sm_details = self._decide_regime_state_machine(
-                ts=ts,
-                bos=bos,
-                vol_ratio=vol_ratio,
-                adx_4h=adx_4h,
-                params=params,
-                ctx=self._regime_sm_ctx,
-                bos_event_ts=bos_event_ts,
-            )
+                # 4. 运行状态机
+                # 使用 1H close_time 作为 bos_event_ts（BOS事件时间戳）
+                bos_event_ts = indicators_1h.get("close_time", 0) if bos != 0 else None
+                new_regime, action, sm_details = self._decide_regime_state_machine(
+                    ts=ts,
+                    bos=bos,
+                    vol_ratio=vol_ratio,
+                    adx_4h=adx_4h,
+                    params=params,
+                    ctx=self._regime_sm_ctx,
+                    bos_event_ts=bos_event_ts,
+                )
+            else:
+                # 非方向刷新周期：沿用上一轮状态机结果，不推进确认/切换计数
+                ts = float(self._trend_score_cache.get("ts", 0.0) or 0.0)
+                ts_details_raw = self._trend_score_cache.get("details", {})
+                ts_details = ts_details_raw if isinstance(ts_details_raw, dict) else {}
+                bos = int(self._regime_sm_ctx.get("cached_bos", 0) or 0)
+                vol_ratio = float(self._regime_sm_ctx.get("cached_vol_ratio", 1.0) or 1.0)
+                adx_4h = float(self._trend_score_cache.get("adx_4h", 25.0) or 25.0)
+                indicators_1h = {"updated": False}
+                new_regime = str(self._regime_sm_ctx.get("regime", "RANGE") or "RANGE")
+                action = "HOLD"
+                sm_details = {}
+                print("   ⏱️ 非方向刷新周期：状态机方向冻结，确认计数不推进")
+
+            bos = max(-1, min(1, int(bos)))
 
             # 更新缓存
             new_engine = self._map_regime_to_engine(new_regime)
@@ -5485,6 +6213,7 @@ class TradingBot:
             self._trend_score_cache["regime"] = new_regime
             self._trend_score_cache["engine"] = new_engine
             self._trend_score_cache["details"] = ts_details
+            self._trend_score_cache["adx_4h"] = adx_4h
 
             # 打印状态机详情
             ctx = self._regime_sm_ctx
@@ -5602,15 +6331,24 @@ class TradingBot:
             trend_scoring_enabled = bool(params.get("trend_scoring_enabled", True))
 
             if trend_scoring_enabled:
-                ts, ts_details = self._calc_trend_score("BTCUSDT", params)
-                ts_regime, ts_regime_label = self._get_regime_from_ts(ts, params)
-                is_oscillation, osc_details = self._detect_oscillation_market(params)
+                if direction_refresh_cycle:
+                    ts, ts_details = self._calc_trend_score("BTCUSDT", params)
+                    ts_regime, ts_regime_label = self._get_regime_from_ts(ts, params)
+                    is_oscillation, osc_details = self._detect_oscillation_market(params)
 
-                self._trend_score_cache["ts"] = ts
-                self._trend_score_cache["regime"] = ts_regime
-                self._trend_score_cache["engine"] = self._map_regime_to_engine(ts_regime)
-                self._trend_score_cache["is_oscillation"] = is_oscillation
-                self._trend_score_cache["details"] = ts_details
+                    self._trend_score_cache["ts"] = ts
+                    self._trend_score_cache["regime"] = ts_regime
+                    self._trend_score_cache["engine"] = self._map_regime_to_engine(ts_regime)
+                    self._trend_score_cache["is_oscillation"] = is_oscillation
+                    self._trend_score_cache["details"] = ts_details
+                else:
+                    ts = float(self._trend_score_cache.get("ts", 0.0) or 0.0)
+                    ts_regime = str(self._trend_score_cache.get("regime", "NEUTRAL") or "NEUTRAL")
+                    ts_regime_label = "CACHED"
+                    is_oscillation = bool(self._trend_score_cache.get("is_oscillation", False))
+                    ts_details_raw = self._trend_score_cache.get("details", {})
+                    ts_details = ts_details_raw if isinstance(ts_details_raw, dict) else {}
+                    print("   ⏱️ 非方向刷新周期：沿用趋势评分缓存，不执行趋势转换确认")
 
                 if ts_regime in ("STRONG_BULL", "WEAK_BULL"):
                     effective_regime = "BULL"
@@ -5627,7 +6365,7 @@ class TradingBot:
                 print(f"   ├─ 市场层: TS_market={ts_details.get('ts_market', 0):+.3f}")
                 print(f"   └─ 震荡市: {'是' if is_oscillation else '否'}")
 
-                if effective_regime != self._last_regime:
+                if direction_refresh_cycle and effective_regime != self._last_regime:
                     confirmed, confirm_state = self._check_transition_confirm(params)
                     if confirmed:
                         print(f"\n🔄 【趋势转换确认】{self._last_regime} → {effective_regime}")
@@ -5649,31 +6387,41 @@ class TradingBot:
                         print(f"   ⏳ 趋势转换待确认（当前: {self._last_regime} → 候选: {effective_regime}）")
                         effective_regime = self._last_regime
             else:
-                global_regime, regime_score, regime_details = self._dca_detect_btc_regime(params)
-                major_regime, major_action = self._dca_detect_btc_major_regime(params)
+                if direction_refresh_cycle:
+                    global_regime, regime_score, regime_details = self._dca_detect_btc_regime(params)
+                    major_regime, major_action = self._dca_detect_btc_major_regime(params)
 
-                print(f"\n📈 BTC 牛熊判断: {global_regime} (score={regime_score:+.3f})")
-                for tf, info in regime_details.items():
-                    if "error" not in info:
-                        print(f"   {tf}: score={info.get('score', 0):+.2f}, EMA20={info.get('ema_fast', 0):.2f}, EMA50={info.get('ema_slow', 0):.2f}")
-                print(f"   🔶 大趋势(4H): {major_regime} [{major_action}]")
+                    print(f"\n📈 BTC 牛熊判断: {global_regime} (score={regime_score:+.3f})")
+                    for tf, info in regime_details.items():
+                        if "error" not in info:
+                            print(f"   {tf}: score={info.get('score', 0):+.2f}, EMA20={info.get('ema_fast', 0):.2f}, EMA50={info.get('ema_slow', 0):.2f}")
+                    print(f"   🔶 大趋势(4H): {major_regime} [{major_action}]")
 
-                if "TRANSITIONED" in major_action:
-                    print(f"\n🔄 大趋势转换确认: {major_regime}")
-                    if major_regime == "BEAR":
-                        for sym, pos in list(positions_after_close.items()):
-                            if pos and str(pos.get("side", "")).upper() == "LONG":
-                                print(f"🐻 大趋势转熊，平掉多单: {sym}")
-                                self._close_position(sym, {"action": "CLOSE", "reason": "major_regime_bear_close_long"}, side="LONG")
-                                self.dca_state.pop(sym, None)
-                    elif major_regime == "BULL":
-                        for sym, pos in list(positions_after_close.items()):
-                            if pos and str(pos.get("side", "")).upper() == "SHORT":
-                                print(f"🐂 大趋势转牛，平掉空单: {sym}")
-                                self._close_position(sym, {"action": "CLOSE", "reason": "major_regime_bull_close_short"}, side="SHORT")
-                                self.dca_state.pop(sym, None)
-                    self._last_regime = major_regime
-                    self._save_dca_state()
+                    if "TRANSITIONED" in major_action:
+                        print(f"\n🔄 大趋势转换确认: {major_regime}")
+                        if major_regime == "BEAR":
+                            for sym, pos in list(positions_after_close.items()):
+                                if pos and str(pos.get("side", "")).upper() == "LONG":
+                                    print(f"🐻 大趋势转熊，平掉多单: {sym}")
+                                    self._close_position(sym, {"action": "CLOSE", "reason": "major_regime_bear_close_long"}, side="LONG")
+                                    self.dca_state.pop(sym, None)
+                        elif major_regime == "BULL":
+                            for sym, pos in list(positions_after_close.items()):
+                                if pos and str(pos.get("side", "")).upper() == "SHORT":
+                                    print(f"🐂 大趋势转牛，平掉空单: {sym}")
+                                    self._close_position(sym, {"action": "CLOSE", "reason": "major_regime_bull_close_short"}, side="SHORT")
+                                    self.dca_state.pop(sym, None)
+                        self._last_regime = major_regime
+                        self._save_dca_state()
+                else:
+                    cache_regime_details = self._btc_regime_cache.get("details", {})
+                    regime_details = cache_regime_details if isinstance(cache_regime_details, dict) else {}
+                    global_regime = str(self._btc_regime_cache.get("regime", "NEUTRAL") or "NEUTRAL")
+                    regime_score = float(self._btc_regime_cache.get("score", 0.0) or 0.0)
+                    major_regime = str(self._last_regime or "NEUTRAL")
+                    major_action = "HOLD(CACHED)"
+                    print(f"\n📈 BTC 牛熊判断(缓存): {global_regime} (score={regime_score:+.3f})")
+                    print("   ⏱️ 非方向刷新周期：沿用缓存，不触发大趋势转换")
 
                 effective_regime = major_regime
                 is_oscillation = False
@@ -5706,7 +6454,8 @@ class TradingBot:
             current_engine = self._map_regime_to_engine(current_regime)
             regime_risk_mult = 1.0
             regime_threshold = {"min_ts_asset": 0.0, "min_vol_ratio": 1.3, "min_p_win": 0.55}
-        engine_params_live = self._get_engine_params(params, regime=current_regime, engine=current_engine)
+        current_trade_engine = self._resolve_dual_engine(current_engine)
+        engine_params_live = self._get_engine_params(params, regime=current_regime, engine=current_trade_engine)
 
         # 在转换缓冲期内，保持原有持仓限制不变（避免频繁调仓）
         if self._regime_transition_counter > 0:
@@ -5727,55 +6476,54 @@ class TradingBot:
         
         print(f"   📊 持仓上限: 多单={max_long_positions}, 空单={max_short_positions}")
         print(
-            f"   📊 引擎: {current_engine} | 风险倍数: {regime_risk_mult:.2f} | "
-            f"开仓门槛(p_win): {regime_threshold.get('min_p_win', 0.55):.2f}"
+            f"   📊 引擎: {current_trade_engine} | 风险倍数: {regime_risk_mult:.2f} | "
+            "开仓门槛(p_win): 已禁用"
         )
+        try:
+            max_positions_range = int(params.get("max_positions_range", max(1, MAX_POSITIONS // 2)))
+        except Exception:
+            max_positions_range = max(1, MAX_POSITIONS // 2)
+        try:
+            max_positions_trend = int(params.get("max_positions_trend", MAX_POSITIONS))
+        except Exception:
+            max_positions_trend = MAX_POSITIONS
+        max_positions_range = max(0, min(MAX_POSITIONS, max_positions_range))
+        max_positions_trend = max(0, min(MAX_POSITIONS, max_positions_trend))
+
+        range_open_count = 0
+        trend_open_count = 0
+        for sym, pos in positions_after_close.items():
+            if not pos:
+                continue
+            amt = abs(float(pos.get("amount", pos.get("positionAmt", 0)) or 0))
+            if amt <= 0:
+                continue
+            st = self.dca_state.get(sym, {})
+            st_engine = self._resolve_dual_engine(
+                st.get("engine", cycle_trade_engine) if isinstance(st, dict) else cycle_trade_engine
+            )
+            if st_engine == "UNKNOWN":
+                st_engine = cycle_trade_engine
+            if st_engine == "RANGE":
+                range_open_count += 1
+            else:
+                trend_open_count += 1
+        print(f"   📊 双引擎配额: RANGE={range_open_count}/{max_positions_range}, TREND={trend_open_count}/{max_positions_trend}")
 
         if current_count >= MAX_POSITIONS:
-            print(f"✋ 已达最大持仓数({current_count}/{MAX_POSITIONS})，不再开新仓（不影响已有仓位DCA）")
+            print(f"✋ 已达最大持仓数({current_count}/{MAX_POSITIONS})，不再开新仓（不影响已有仓位管理）")
             allow_open_new = False
 
         # 从候选中筛选AI建议开仓的，按confidence排序
         open_actions = []
         candidate_rule_map = {sym: {"score": score, "target_side": side} for sym, score, _p, side, _qv, _e, _th, _pw in open_candidates_raw}
-        min_p_win_default_live = float(params.get("min_p_win_threshold", 0.50) or 0.50)
-        min_p_win_short_live = float(params.get("min_p_win_short", min_p_win_default_live) or min_p_win_default_live)
-        min_p_win_long_live = float(params.get("min_p_win_long", min_p_win_default_live) or min_p_win_default_live)
-        min_score_long_live = float(params.get("min_score_long", 0.1))
-        max_score_short_live = float(params.get("max_score_short", 0.0))
-        entry_gate_live = self._adjust_entry_thresholds_by_engine(
-            min_p_win_long=min_p_win_long_live,
-            min_p_win_short=min_p_win_short_live,
-            min_score_long=min_score_long_live,
-            max_score_short=max_score_short_live,
-            engine=current_engine,
-        )
-        osc_signal_cache: Dict[str, Dict[str, Any]] = {}
+        print("ⓘ p_win开仓门槛已禁用（下单前阶段）")
         if allow_open_new:
             for symbol in candidate_symbols:
                 decision = multi_decisions.get(symbol)
                 if not decision:
                     continue
-
-                # RANGE / RANGE_LOCK 下：使用震荡信号覆盖开仓动作与置信度
-                if current_engine == "RANGE" or current_regime in ("RANGE", "RANGE_LOCK"):
-                    osc_sig = osc_signal_cache.get(symbol)
-                    if not isinstance(osc_sig, dict):
-                        osc_sig = self._oscillation_entry_signal(symbol, params)
-                        osc_signal_cache[symbol] = osc_sig
-                    osc_action = str(osc_sig.get("action", "HOLD")).upper()
-                    if osc_action in ("BUY_OPEN", "SELL_OPEN", "HOLD"):
-                        decision["action"] = osc_action
-                    try:
-                        osc_conf = float(osc_sig.get("confidence", decision.get("confidence", 0.0)) or 0.0)
-                    except Exception:
-                        osc_conf = float(decision.get("confidence", 0.0) or 0.0)
-                    decision["confidence"] = osc_conf
-                    base_reason = str(decision.get("reason", "") or "").strip()
-                    osc_reason = str(osc_sig.get("reason", "") or "").strip()
-                    decision["reason"] = (
-                        f"{base_reason} | {osc_reason}" if base_reason and osc_reason else (osc_reason or base_reason)
-                    )
+                # RANGE/RANGE_LOCK 的均值回归门禁已在候选阶段执行，这里不再重复判定。
 
                 action = str(decision.get("action", "HOLD")).upper()
                 if action not in ["BUY_OPEN", "SELL_OPEN"]:
@@ -5790,8 +6538,7 @@ class TradingBot:
                 except Exception:
                     confidence = 0.5
 
-                # 【统一开仓门禁】confidence = p_win
-                # 获取该交易对的 p_win 阈值（已在候选筛选阶段计算过）
+                # p_win/confidence 仅用于排序与日志，不再用于阈值拦截
                 rule = candidate_rule_map.get(symbol, {})
                 target_side = str(rule.get("target_side", "")).upper()
                 if action == "BUY_OPEN":
@@ -5800,40 +6547,20 @@ class TradingBot:
                     target_side = "SHORT"
                 edge_val = float(decision.get("edge", 0) or 0)
                 if not self._direction_allowed_by_engine(
-                    engine=current_engine,
+                    engine=current_trade_engine,
                     regime=current_regime,
                     side=target_side,
                 ):
-                    print(f"⏸️ {symbol} 跳过开仓：engine={current_engine} 锁方向，{current_regime} 不允许 {target_side}")
+                    print(f"⏸️ {symbol} 跳过开仓：engine={current_trade_engine} 锁方向，{current_regime} 不允许 {target_side}")
                     continue
 
-                # 【状态机开仓门槛】弱态更严格
-                regime_min_p_win = float(regime_threshold.get("min_p_win", 0.55))
-
-                # 根据方向确定最小 confidence 阈值（取 max：基础阈值 vs 状态机阈值）
                 if target_side == "LONG":
-                    # 多单：使用 min_p_win_long 和状态机阈值的较大值
-                    effective_min_p_win = max(float(entry_gate_live["min_p_win_long"]), regime_min_p_win)
                     if action != "BUY_OPEN":
                         print(f"⏸️ {symbol} 跳过开多：action={action} ≠ BUY_OPEN")
                         continue
-                    if confidence < effective_min_p_win:
-                        print(
-                            f"⏸️ {symbol} 跳过开多：confidence={confidence:.2f} < 阈值 {effective_min_p_win:.2f} "
-                            f"(基础{float(entry_gate_live['min_p_win_long']):.2f}/状态机{regime_min_p_win:.2f})"
-                        )
-                        continue
                 elif target_side == "SHORT":
-                    # 空单：使用 min_p_win_short 和状态机阈值的较大值
-                    effective_min_p_win = max(float(entry_gate_live["min_p_win_short"]), regime_min_p_win)
                     if action != "SELL_OPEN":
                         print(f"⏸️ {symbol} 跳过开空：action={action} ≠ SELL_OPEN")
-                        continue
-                    if confidence < effective_min_p_win:
-                        print(
-                            f"⏸️ {symbol} 跳过开空：confidence={confidence:.2f} < 阈值 {effective_min_p_win:.2f} "
-                            f"(基础{float(entry_gate_live['min_p_win_short']):.2f}/状态机{regime_min_p_win:.2f})"
-                        )
                         continue
                 
                 # edge 仅作为辅助信息，不作为开仓门禁
@@ -5850,6 +6577,12 @@ class TradingBot:
             if current_count >= MAX_POSITIONS:
                 print(f"✋ 已达最大持仓数({current_count}/{MAX_POSITIONS})，停止开仓")
                 break
+            if current_trade_engine == "RANGE" and range_open_count >= max_positions_range:
+                print(f"✋ RANGE 引擎配额已满({range_open_count}/{max_positions_range})，停止 RANGE 开仓")
+                break
+            if current_trade_engine == "TREND" and trend_open_count >= max_positions_trend:
+                print(f"✋ TREND 引擎配额已满({trend_open_count}/{max_positions_trend})，停止 TREND 开仓")
+                break
             action = str(decision.get("action", "")).upper()
             if action == "BUY_OPEN" and current_long_count >= max_long_positions:
                 print(f"⏸️ {symbol} 跳过开多：多单数量已达上限({current_long_count}/{max_long_positions})")
@@ -5858,30 +6591,78 @@ class TradingBot:
                 print(f"⏸️ {symbol} 跳过开空：空单数量已达上限({current_short_count}/{max_short_positions})")
                 continue
 
+            # 双引擎开仓附带 TP/SL：按引擎选择参数，避免趋势仓沿用震荡小止盈
+            exit_cfg_open = risk_trend_exit if current_trade_engine == "TREND" else risk_osc_exit
+            try:
+                tp_cfg_open = float(exit_cfg_open.get("take_profit_pct", 0) or 0)
+            except Exception:
+                tp_cfg_open = 0.0
+            try:
+                sl_cfg_open = float(exit_cfg_open.get("symbol_stop_loss_pct", 0) or 0)
+            except Exception:
+                sl_cfg_open = 0.0
+            if tp_cfg_open > 0:
+                decision["take_profit_percent"] = tp_cfg_open
+            if sl_cfg_open > 0:
+                decision["stop_loss_percent"] = -abs(sl_cfg_open)
+
             market_data = self.get_market_data_for_symbol(symbol)
             self.save_decision(symbol, decision, market_data)
             try:
                 # 【风险倍数】根据状态机状态调整仓位
                 decision["regime_risk_mult"] = regime_risk_mult
                 decision["regime"] = current_regime  # 传递 regime 给下游 ATR sizing
-                decision["engine"] = current_engine
+                decision["engine"] = current_trade_engine
+                decision["entry_regime"] = decision.get("entry_regime") or str(sm_regime).upper()
+                decision["entry_reason"] = decision.get("entry_reason") or open_candidate_reason.get(symbol, "")
+                base_reason = str(decision.get("reason", "") or "")
+                reason_prefix = f"engine={current_trade_engine} sm={str(sm_regime).upper()}"
+                if base_reason:
+                    decision["reason"] = (
+                        f"{reason_prefix} | {base_reason}"
+                        if not ("engine=" in base_reason and "sm=" in base_reason)
+                        else base_reason
+                    )
+                else:
+                    decision["reason"] = reason_prefix
                 try:
                     pos_raw = float(decision.get("position_percent", 0) or 0)
                 except Exception:
                     pos_raw = 0.0
                 pos_ratio = pos_raw / 100.0 if pos_raw > 1.0 else pos_raw
-                pos_ratio *= float(engine_params_live.get("position_mult", 1.0))
+                try:
+                    base_raw = float(decision.get("position_percent_base", pos_ratio) or pos_ratio)
+                except Exception:
+                    base_raw = pos_ratio
+                base_ratio = base_raw / 100.0 if base_raw > 1.0 else base_raw
+                try:
+                    cap_raw = float(decision.get("position_percent_cap", params.get("max_position_pct", 0.30)) or params.get("max_position_pct", 0.30))
+                except Exception:
+                    cap_raw = float(params.get("max_position_pct", 0.30) or 0.30)
+                pos_cap = cap_raw / 100.0 if cap_raw > 1.0 else cap_raw
+                pos_cap = max(0.01, min(0.95, pos_cap))
+                engine_mult = float(engine_params_live.get("position_mult", 1.0))
+                pos_ratio *= engine_mult
                 if pos_ratio > 0:
-                    pos_ratio = max(0.01, min(0.95, pos_ratio))
+                    pos_ratio = max(0.01, min(pos_cap, pos_ratio))
                     decision["position_percent"] = pos_ratio
+                    decision["position_percent_base"] = base_ratio
+                    decision["position_percent_cap"] = pos_cap
+                    decision["engine_position_mult"] = engine_mult
                 print(
                     f"🚀 开仓: {symbol} (p_win={conf:.2%}, edge={edge_val:.4f}, risk_mult={regime_risk_mult:.2f}, "
-                    f"regime={current_regime}, engine={current_engine})"
+                    f"regime={current_regime}, engine={current_trade_engine})"
                 )
                 self.execute_decision(symbol, decision, market_data)
                 # 检查是否成功开仓
                 pos_after = self.position_data.get_current_position(symbol)
                 if pos_after and abs(float(pos_after.get("amount", pos_after.get("positionAmt", 0)))) > 0:
+                    # 已成功开仓的计划从缓存移除，避免同一 5m 窗口重复尝试
+                    if isinstance(self._dca_open_plan_cache, list) and self._dca_open_plan_cache:
+                        self._dca_open_plan_cache = [
+                            item for item in self._dca_open_plan_cache
+                            if str(item.get("symbol", "")).upper() != str(symbol).upper()
+                        ]
                     current_count += 1
                     pos_side = str(pos_after.get("side", "")).upper()
                     if pos_side == "LONG":
@@ -5891,18 +6672,19 @@ class TradingBot:
                     state_side = pos_side
                     if state_side not in ("LONG", "SHORT"):
                         state_side = "LONG" if action == "BUY_OPEN" else "SHORT"
-                    # 记录DCA状态
                     price = market_data.get("realtime", {}).get("price", 0)
-                    self.dca_state[symbol] = {
-                        "side": state_side,
-                        "last_dca_price": price,
-                        "dca_count": 0,
-                        "entry_time": now,
-                        "peak_pnl_pct": 0.0,
-                        "be_active": False,
-                    }
+                    self._tag_dca_engine_on_open(
+                        symbol,
+                        side=state_side,
+                        entry_price=float(price or 0),
+                        decision=decision,
+                        now=now,
+                    )
+                    if current_trade_engine == "RANGE":
+                        range_open_count += 1
+                    else:
+                        trend_open_count += 1
                     self.dca_last_entry_time = now
-                    self._save_dca_state()
                     self._write_dca_dashboard(positions_after_close)
             except Exception as e:
                 print(f"❌ 开仓失败: {symbol} - {e}")
@@ -6149,8 +6931,8 @@ class TradingBot:
             else:
                 confidence = 0.5
 
-        # ----- 阈值检查（配置可控制） -----
-        # 【统一门槛】confidence = p_win，使用 p_win 阈值判断
+        # ----- 开仓前执行检查 -----
+        # p_win/confidence 门槛已禁用，仅保留方向与仓位风控
         try:
             min_pos_raw = float(self.config.get("trading", {}).get("min_position_percent", 10))
         except Exception:
@@ -6158,40 +6940,7 @@ class TradingBot:
         min_pos_ratio = min_pos_raw / 100.0 if min_pos_raw > 1.0 else min_pos_raw
         params_local = self.dca_config.get("params", {}) or {}
         current_regime = str(decision.get("regime", "RANGE"))
-        current_engine = str(decision.get("engine") or self._map_regime_to_engine(current_regime))
-        
-        # 【统一】获取综合牛熊状态（而非仅BTC状态）
-        combined_regime, combined_score, _ = self._dca_get_combined_regime(symbol, params_local)
-        
-        # 根据方向和牛熊状态确定最小 p_win 阈值
-        min_p_win_default = float(params_local.get("min_p_win_threshold", 0.50) or 0.50)
-        min_p_win_short = float(params_local.get("min_p_win_short", min_p_win_default) or min_p_win_default)
-        min_p_win_long = float(params_local.get("min_p_win_long", min_p_win_default) or min_p_win_default)
-        min_score_long = float(params_local.get("min_score_long", 0.1))
-        max_score_short = float(params_local.get("max_score_short", 0.0))
-        entry_gate_exec = self._adjust_entry_thresholds_by_engine(
-            min_p_win_long=min_p_win_long,
-            min_p_win_short=min_p_win_short,
-            min_score_long=min_score_long,
-            max_score_short=max_score_short,
-            engine=current_engine,
-        )
-        min_p_win_short = float(entry_gate_exec["min_p_win_short"])
-        min_p_win_long = float(entry_gate_exec["min_p_win_long"])
-        
-        # 根据综合牛熊状态调整阈值
-        if combined_regime == "BULL":
-            min_p_win_short = float(params_local.get("bull_min_p_win_short", min_p_win_short * 1.2) or min_p_win_short * 1.2)
-        elif combined_regime == "BEAR":
-            min_p_win_long = float(params_local.get("bear_min_p_win_long", min_p_win_long * 1.2) or min_p_win_long * 1.2)
-        
-        # 根据 action 确定最小阈值
-        if action == "SELL_OPEN":
-            min_confidence = min_p_win_short
-        elif action == "BUY_OPEN":
-            min_confidence = min_p_win_long
-        else:
-            min_confidence = 0.0  # 平仓操作不需要门槛
+        current_engine = self._resolve_dual_engine(decision.get("engine") or self._map_regime_to_engine(current_regime))
 
         if action in ("BUY_OPEN", "SELL_OPEN"):
             desired_side = "LONG" if action == "BUY_OPEN" else "SHORT"
@@ -6212,22 +6961,32 @@ class TradingBot:
                     pnl_percent=None,
                 )
                 return
-        
-        # 检查信心度是否满足门槛
-        if action in ("BUY_OPEN", "SELL_OPEN") and confidence < min_confidence:
-            print(f"⚠️ {symbol} 信心度不足(p_win={confidence:.2%} < {min_confidence:.2%}), 跳过执行 (综合:{combined_regime})")
-            # 记录跳过的决策到交易日志
-            self._append_trade_log(
-                symbol=symbol,
-                action=action,
-                decision=decision,
-                quantity=0,
-                entry_price=market_data["realtime"].get("price", 0),
-                result="skipped_low_confidence",
-                pnl=None,
-                pnl_percent=None,
-            )
-            return
+
+            if self._is_dual_engine_mode():
+                exec_ok, exec_reason, exec_meta = self._dca_execution_layer_confirm(
+                    symbol=symbol,
+                    action=action,
+                    params=params_local,
+                )
+                if not exec_ok:
+                    print(f"⚠️ {symbol} 执行层过滤未通过: {exec_reason}")
+                    self._append_trade_log(
+                        symbol=symbol,
+                        action=action,
+                        decision=decision,
+                        quantity=0,
+                        entry_price=market_data["realtime"].get("price", 0),
+                        result="skipped_execution_layer_filter",
+                        pnl=None,
+                        pnl_percent=None,
+                    )
+                    return
+
+                if exec_meta:
+                    print(
+                        f"   ✅ {symbol} 执行层确认({exec_meta.get('timeframe')}): "
+                        f"rsi={exec_meta.get('rsi')}, flags={exec_meta.get('opposite_flags')}"
+                    )
 
         # 如果仓位小于最小阈值且是开仓操作，则视配置决定：跳过或按最小仓位提升
         try:
@@ -6279,11 +7038,23 @@ class TradingBot:
                 )
                 return
 
-        # 读取最大仓位（配置项，默认30%）并对目标仓位进行上限约束
+        # 读取最大仓位并对目标仓位进行上限约束：
+        # 优先 decision.position_percent_cap，其次 dca params.max_position_pct，最后 trading.max_position_percent
         try:
-            max_pos_raw = float(self.config.get("trading", {}).get("max_position_percent", 30))
+            max_pos_raw = float(decision.get("position_percent_cap", 0) or 0)
         except Exception:
-            max_pos_raw = 30.0
+            max_pos_raw = 0.0
+        if max_pos_raw <= 0:
+            try:
+                dca_params = self.dca_config.get("params", {}) if isinstance(getattr(self, "dca_config", {}), dict) else {}
+                max_pos_raw = float(dca_params.get("max_position_pct", 0) or 0)
+            except Exception:
+                max_pos_raw = 0.0
+        if max_pos_raw <= 0:
+            try:
+                max_pos_raw = float(self.config.get("trading", {}).get("max_position_percent", 30))
+            except Exception:
+                max_pos_raw = 30.0
         max_pos_ratio = max_pos_raw / 100.0 if max_pos_raw > 1.0 else max_pos_raw
 
         if pos_ratio > max_pos_ratio:
@@ -6442,7 +7213,7 @@ class TradingBot:
             leverage = int(float(decision.get("leverage", 1)))
         except Exception:
             leverage = 5
-        if self.strategy_mode == "DCA_ROTATION":
+        if self._is_dual_engine_mode():
             leverage = max(5, min(12, leverage))
         # 默认遵循用户建议：建议止盈 +14%，最大止损 0.6%
         take_profit_percent = decision.get("take_profit_percent", 14.0)
@@ -6556,6 +7327,10 @@ class TradingBot:
                     print(f"   details: {res}")
                 self.trade_count += 1
                 try:
+                    self._tag_dca_engine_on_open(symbol, side="LONG", entry_price=current_price, decision=decision)
+                except Exception:
+                    pass
+                try:
                     self._append_trade_log(
                         symbol=symbol,
                         action="BUY_OPEN",
@@ -6667,7 +7442,7 @@ class TradingBot:
             leverage = int(float(decision.get("leverage", 1)))
         except Exception:
             leverage = 5
-        if self.strategy_mode == "DCA_ROTATION":
+        if self._is_dual_engine_mode():
             leverage = max(5, min(12, leverage))
         # 默认遵循用户建议：建议止盈 +14%，最大止损 0.6%
         take_profit_percent = decision.get("take_profit_percent", 14.0)
@@ -6756,6 +7531,10 @@ class TradingBot:
                 if os.getenv("BINANCE_VERBOSE_OPEN_RESULT") == "1":
                     print(f"   details: {res}")
                 self.trade_count += 1
+                try:
+                    self._tag_dca_engine_on_open(symbol, side="SHORT", entry_price=current_price, decision=decision)
+                except Exception:
+                    pass
                 try:
                     self._append_trade_log(
                         symbol=symbol,
@@ -6903,8 +7682,6 @@ class TradingBot:
         quantity = self.client.ensure_min_notional_quantity(symbol, quantity, current_price)
         details["quantity"] = quantity
         return quantity, details
-        quantity = self.client.ensure_min_notional_quantity(symbol, quantity, current_price)
-        return quantity
 
     def _calc_tp_sl_prices(
         self,
@@ -7429,6 +8206,9 @@ class TradingBot:
             "confidence": decision["confidence"],
             "leverage": decision["leverage"],
             "position_percent": decision["position_percent"],
+            "engine": decision.get("engine"),
+            "entry_regime": decision.get("entry_regime"),
+            "entry_reason": decision.get("entry_reason"),
             "reason": decision["reason"],
             "price": market_data["realtime"].get("price", 0),
         }
@@ -7549,7 +8329,7 @@ class TradingBot:
             self._print_positions_snapshot(cycle_log, sort_by=sort_by)
 
         # 规则策略模式（单币种逐个分析）
-        if self.strategy_mode == "DCA_ROTATION":
+        if self._is_dual_engine_mode():
             self._run_dca_rotation_cycle()
 
         # 规则策略模式（单币种逐个分析）
@@ -7741,21 +8521,33 @@ class TradingBot:
         schedule_config = ConfigLoader.get_schedule_config(self.config)
         # 默认周期
         interval_seconds = schedule_config["interval_seconds"]
+        dual_engine_mode = self._is_dual_engine_mode()
+        direction_interval_seconds = interval_seconds
         download_delay_seconds = schedule_config.get("download_delay_seconds", 5)
         # 限制 download_delay_seconds 最大为30秒，确保在K线更新后的30s内完成下载/分析
         if download_delay_seconds > 30:
             download_delay_seconds = 30
 
-        # DCA 轮动使用配置的 K 线周期对齐
-        if self.strategy_mode == "DCA_ROTATION":
-            interval = str(self.dca_config.get("interval", "5m"))
-            if interval.endswith("m") and interval[:-1].isdigit():
-                interval_seconds = int(interval[:-1]) * 60
-
-        print(f"\n⏱️  交易周期: 每{interval_seconds}秒")
+        # 双引擎固定 1m 执行层循环；方向刷新按 dca_rotation.interval（默认 5m）
+        if dual_engine_mode:
+            interval_seconds = self._dual_engine_exec_interval_seconds
+            interval_raw = str(self.dca_config.get("interval", "5m")).strip().lower()
+            if interval_raw.endswith("m") and interval_raw[:-1].isdigit():
+                direction_interval_seconds = max(60, int(interval_raw[:-1]) * 60)
+            elif interval_raw.endswith("h") and interval_raw[:-1].isdigit():
+                direction_interval_seconds = max(60, int(interval_raw[:-1]) * 3600)
+            self._dual_engine_direction_interval_seconds = direction_interval_seconds
+            self._dual_engine_direction_bucket = None
+            self._dual_engine_refresh_direction_this_cycle = True
+            print(
+                "\n⏱️  双引擎调度: "
+                f"执行层每{interval_seconds}秒 | 方向刷新每{direction_interval_seconds}秒"
+            )
+        else:
+            print(f"\n⏱️  交易周期: 每{interval_seconds}秒")
         symbols_list = (
             self._get_dca_symbols()
-            if self.strategy_mode == "DCA_ROTATION"
+            if dual_engine_mode
             else ConfigLoader.get_trading_symbols(self.config)
         )
         print(f"📊 交易币种: {', '.join(symbols_list)}")
@@ -7783,7 +8575,17 @@ class TradingBot:
                 time.sleep(initial_sleep)
 
             while True:
-                time.time()
+                cycle_now = time.time()
+                if dual_engine_mode:
+                    direction_bucket = int(cycle_now) // max(60, direction_interval_seconds)
+                    refresh_direction = (self._dual_engine_direction_bucket != direction_bucket)
+                    self._dual_engine_refresh_direction_this_cycle = refresh_direction
+                    direction_minutes = max(1, direction_interval_seconds // 60)
+                    if refresh_direction:
+                        self._dual_engine_direction_bucket = direction_bucket
+                        print(f"\n🧭 方向刷新周期：更新{direction_minutes}m决策并执行")
+                    else:
+                        print(f"\n⏱️ 执行层周期：沿用{direction_minutes}m方向，继续1m盯执行")
 
                 # 执行交易周期（在K线更新后的短延迟内运行）
                 self.run_cycle()
@@ -7816,7 +8618,7 @@ class TradingBot:
         print("\n" + "=" * 60)
         print("🛑 交易机器人正在关闭...")
         print("=" * 60)
-        if self.strategy_mode == "DCA_ROTATION":
+        if self._is_dual_engine_mode():
             self._save_dca_state()
         print(f"✅ 本次运行交易次数: {self.trade_count}")
         print(f"✅ 决策记录数量: {len(self.decision_history)}")
@@ -7869,6 +8671,8 @@ def main():
         osc_cfg = risk_cfg.get("oscillation", {}) or {}
         osc_entry = osc_cfg.get("entry_gate", {}) if isinstance(osc_cfg.get("entry_gate", {}), dict) else {}
         osc_exit = osc_cfg.get("exit", {}) if isinstance(osc_cfg.get("exit", {}), dict) else {}
+        trend_cfg = risk_cfg.get("trend", {}) or {}
+        trend_exit = trend_cfg.get("exit", {}) if isinstance(trend_cfg.get("exit", {}), dict) else {}
 
         # 兼容命名：有的配置把单笔初始保证金写在 dca_rotation.params.add_margin
         initial_margin = risk_cfg.get(
@@ -7881,6 +8685,10 @@ def main():
         max_long_positions = risk_cfg.get("max_long_positions", dca_cfg.get("max_long_positions"))
         max_short_positions = risk_cfg.get("max_short_positions", dca_cfg.get("max_short_positions"))
         total_stop_loss_pct = dca_cfg.get("total_stop_loss_pct", risk_cfg.get("total_stop_loss_pct"))
+        total_stop_loss_cooldown_seconds = dca_cfg.get("total_stop_loss_cooldown_seconds")
+        exec_layer_cfg = dca_cfg.get("execution_layer", {}) if isinstance(dca_cfg.get("execution_layer", {}), dict) else {}
+        exec_layer_enabled = exec_layer_cfg.get("enabled", True)
+        exec_layer_tf = exec_layer_cfg.get("timeframe", "1m")
         max_position_pct = risk_cfg.get("max_position_pct", dca_cfg.get("max_position_pct"))
         leverage = risk_cfg.get("leverage", dca_cfg.get("leverage"))
         osc_min_p_win_long = osc_entry.get("min_p_win_long", dca_cfg.get("min_p_win_long"))
@@ -7914,6 +8722,7 @@ def main():
                 "trailing_stop_after_be_ratio",
             )
         ) else "dca_rotation.params.oscillation_mode"
+        trend_exit_src = "risk.trend.exit" if trend_exit else "(fallback params)"
 
         print("\n================ 风险摘要确认 ================")
         print(f"初始保证金 (initial_margin/add_margin): {initial_margin}")
@@ -7923,6 +8732,8 @@ def main():
         print(f"单标的最大仓位 (max_position_pct): {max_position_pct}")
         print(f"杠杆 (leverage): {leverage}")
         print(f"总回撤止损 (total_stop_loss_pct): {total_stop_loss_pct}")
+        print(f"总回撤止损冷却秒数 (total_stop_loss_cooldown_seconds): {total_stop_loss_cooldown_seconds}")
+        print(f"执行层确认 (execution_layer): enabled={exec_layer_enabled}, timeframe={exec_layer_tf}")
         print("------------------------------------------------")
         print("震荡开仓门禁（RANGE/RANGE_LOCK）:")
         print(f"  source: {osc_entry_src}")
@@ -7945,6 +8756,13 @@ def main():
         print(f"  trailing_trigger_ratio: {osc_trailing_trigger_ratio}")
         print(f"  trailing_stop_ratio: {osc_trailing_stop_ratio}")
         print(f"  trailing_stop_after_be_ratio: {osc_trailing_after_be_ratio}")
+        print("趋势出场基线（TREND）:")
+        print(f"  source: {trend_exit_src}")
+        print(f"  take_profit_pct: {trend_exit.get('take_profit_pct', '(fallback)')}")
+        print(f"  symbol_stop_loss_pct: {trend_exit.get('symbol_stop_loss_pct', '(fallback)')}")
+        print(f"  break_even_trigger_pct: {trend_exit.get('break_even_trigger_pct', '(fallback)')}")
+        print(f"  trailing_stop_trigger_pct: {trend_exit.get('trailing_stop_trigger_pct', '(fallback)')}")
+        print(f"  trailing_stop_pct: {trend_exit.get('trailing_stop_pct', '(fallback)')}")
         print("================================================\n")
 
     except Exception as e:
