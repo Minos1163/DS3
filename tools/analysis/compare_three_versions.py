@@ -1,0 +1,173 @@
+"""
+对比三个版本的回测结果
+"""
+import pandas as pd
+import sys
+import io
+
+# 设置输出编码为UTF-8
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+print("="*80)
+print("三版本策略对比分析")
+print("="*80)
+
+# 读取三个版本的交易记录
+trades_v1 = pd.read_csv('logs/backtest_trades_20260201_120116.csv')  # V1: 原始版本
+trades_v2 = pd.read_csv('logs/backtest_trades_20260201_120557.csv')  # V2: 优化版本
+trades_v3 = pd.read_csv('logs/backtest_trades_20260201_120830.csv')  # V3: 进一步优化
+
+
+def analyze_trades(trades_df, version_name):
+    win = trades_df[trades_df['pnl'] > 0]
+    loss = trades_df[trades_df['pnl'] <= 0]
+
+    return {
+        'name': version_name,
+        'total_trades': len(trades_df),
+        'win_trades': len(win),
+        'loss_trades': len(loss),
+        'win_rate': len(win) / len(trades_df) * 100,
+        'total_pnl': trades_df['pnl'].sum(),
+        'return_pct': (trades_df['pnl'].sum() / 10000) * 100,
+        'avg_pnl': trades_df['pnl'].mean(),
+        'avg_win': win['pnl'].mean() if len(win) > 0 else 0,
+        'avg_loss': loss['pnl'].mean() if len(loss) > 0 else 0,
+        'profit_ratio': abs(win['pnl'].mean() / loss['pnl'].mean()) if len(loss) > 0 and loss['pnl'].mean() != 0 else float('in'),
+        'profit_factor': abs(win['pnl'].sum() / loss['pnl'].sum()) if len(loss) > 0 and loss['pnl'].sum() != 0 else float('in'),
+        'max_win': win['pnl'].max() if len(win) > 0 else 0,
+        'max_loss': loss['pnl'].min() if len(loss) > 0 else 0,
+    }
+
+v1 = analyze_trades(trades_v1, "V1")
+v2 = analyze_trades(trades_v2, "V2")
+v3 = analyze_trades(trades_v3, "V3")
+
+print("\n" + "="*80)
+print("版本参数对比")
+print("="*80)
+print(f"{'指标':<20} {'V1 (原始)':<25} {'V2 (优化1)':<25} {'V3 (优化2)':<25}")
+print("-"*80)
+print(f"{'止损':<20} {'2%':<25} {'1.5%':<25} {'1.5%':<25}")
+print(f"{'止盈':<20} {'3%':<25} {'4%':<25} {'5%':<25}")
+print(f"{'RSI阈值':<20} {'30/70':<25} {'35/65':<25} {'32/68':<25}")
+print(f"{'趋势过滤':<20} {'无':<25} {'无':<25} {'MA20过滤':<25}")
+
+print("\n" + "="*80)
+print("关键指标对比")
+print("="*80)
+print(f"{'指标':<20} {'V1':<15} {'V2':<15} {'V3':<15} {'V1→V3变化':<20}")
+print("-"*80)
+
+# 收益对比
+print(f"{'总收益':<20} ${v1['total_pnl']:<14.2f} ${v2['total_pnl']:<14.2f} ${v3['total_pnl']:<14.2f} +${v3['total_pnl']-v1['total_pnl']:.2f} ({(v3['total_pnl']/v1['total_pnl']-1)*100:+.1f}%)")
+print(f"{'收益率':<20} {v1['return_pct']:<14.2f}% {v2['return_pct']:<14.2f}% {v3['return_pct']:<14.2f}% {v3['return_pct']-v1['return_pct']:+.2f}%")
+
+# 交易统计
+print(f"{'交易次数':<20} {v1['total_trades']:<15} {v2['total_trades']:<15} {v3['total_trades']:<15} {v3['total_trades']-v1['total_trades']:+d} ({(v3['total_trades']/v1['total_trades']-1)*100:+.1f}%)")
+print(f"{'胜率':<20} {v1['win_rate']:<14.1f}% {v2['win_rate']:<14.1f}% {v3['win_rate']:<14.1f}% {v3['win_rate']-v1['win_rate']:+.1f}%")
+
+# 盈亏分析
+print(f"{'平均盈亏':<20} ${v1['avg_pnl']:<14.2f} ${v2['avg_pnl']:<14.2f} ${v3['avg_pnl']:<14.2f} ${v3['avg_pnl']-v1['avg_pnl']:+.2f}")
+print(f"{'平均盈利':<20} ${v1['avg_win']:<14.2f} ${v2['avg_win']:<14.2f} ${v3['avg_win']:<14.2f} ${v3['avg_win']-v1['avg_win']:+.2f}")
+print(f"{'平均亏损':<20} ${v1['avg_loss']:<14.2f} ${v2['avg_loss']:<14.2f} ${v3['avg_loss']:<14.2f} ${v3['avg_loss']-v1['avg_loss']:+.2f}")
+print(f"{'盈亏比':<20} {v1['profit_ratio']:<14.2f} {v2['profit_ratio']:<14.2f} {v3['profit_ratio']:<14.2f} {v3['profit_ratio']-v1['profit_ratio']:+.2f}")
+print(f"{'盈利因子':<20} {v1['profit_factor']:<14.2f} {v2['profit_factor']:<14.2f} {v3['profit_factor']:<14.2f} {v3['profit_factor']-v1['profit_factor']:+.2f}")
+
+print("\n" + "="*80)
+print("📊 性能排名")
+print("="*80)
+
+metrics = [
+    ('总收益', [v1['total_pnl'], v2['total_pnl'], v3['total_pnl']], '越高越好'),
+    ('胜率', [v1['win_rate'], v2['win_rate'], v3['win_rate']], '越高越好'),
+    ('盈亏比', [v1['profit_ratio'], v2['profit_ratio'], v3['profit_ratio']], '越高越好'),
+    ('平均亏损', [abs(v1['avg_loss']), abs(v2['avg_loss']), abs(v3['avg_loss'])], '越低越好'),
+    ('交易次数', [v1['total_trades'], v2['total_trades'], v3['total_trades']], '适中最好'),
+]
+
+versions = ['V1', 'V2', 'V3']
+for metric_name, values, note in metrics:
+    if '越低越好' in note:
+        best_idx = values.index(min(values))
+    elif '适中最好' in note:
+        # 交易次数：40-60次为适中
+        distances = [abs(v - 50) for v in values]
+        best_idx = distances.index(min(distances))
+    else:
+        best_idx = values.index(max(values))
+
+    print(f"{metric_name:<15} 🏆 {versions[best_idx]:<5} ({note})")
+
+print("\n" + "="*80)
+print("🎯 最终推荐")
+print("="*80)
+
+# 综合评分
+scores = {
+    'V1': 0,
+    'V2': 0,
+    'V3': 0
+}
+
+# 总收益权重40%
+if v3['total_pnl'] >= max(v1['total_pnl'], v2['total_pnl']):
+    scores['V3'] += 40
+elif v2['total_pnl'] >= v1['total_pnl']:
+    scores['V2'] += 40
+else:
+    scores['V1'] += 40
+
+# 盈亏比权重30%
+if v3['profit_ratio'] >= max(v1['profit_ratio'], v2['profit_ratio']):
+    scores['V3'] += 30
+elif v2['profit_ratio'] >= v1['profit_ratio']:
+    scores['V2'] += 30
+else:
+    scores['V1'] += 30
+
+# 风险控制（平均亏损）权重20%
+if abs(v3['avg_loss']) <= min(abs(v1['avg_loss']), abs(v2['avg_loss'])):
+    scores['V3'] += 20
+elif abs(v2['avg_loss']) <= abs(v1['avg_loss']):
+    scores['V2'] += 20
+else:
+    scores['V1'] += 20
+
+# 交易效率（接近50次）权重10%
+trade_efficiency = {
+    'V1': abs(v1['total_trades'] - 50),
+    'V2': abs(v2['total_trades'] - 50),
+    'V3': abs(v3['total_trades'] - 50)
+}
+best_efficiency = min(trade_efficiency.values())
+for v in ['V1', 'V2', 'V3']:
+    if trade_efficiency[v] == best_efficiency:
+        scores[v] += 10
+        break
+
+print("\n综合评分（满分100）:")
+for v in ['V1', 'V2', 'V3']:
+    print(f"  {v}: {scores[v]}分")
+
+winner = max(scores, key=lambda x: scores[x])
+print(f"\n🏆 最佳策略: {winner}")
+
+if winner == 'V3':
+    print("\n✅ V3优势:")
+    if v3['total_pnl'] > max(v1['total_pnl'], v2['total_pnl']):
+        print(f"  • 总收益最高: ${v3['total_pnl']:.2f}")
+    if v3['profit_ratio'] > max(v1['profit_ratio'], v2['profit_ratio']):
+        print(f"  • 盈亏比最优: {v3['profit_ratio']:.2f}")
+    if abs(v3['avg_loss']) < min(abs(v1['avg_loss']), abs(v2['avg_loss'])):
+        print(f"  • 风险控制最好: 平均亏损${v3['avg_loss']:.2f}")
+    print("  • MA20趋势过滤提高交易质量")
+    print(f"  • 交易次数合理: {v3['total_trades']}笔")
+
+    print("\n📈 建议:")
+    print("  1. ✅ 使用V3参数作为实盘策略")
+    print("  2. 📊 用30天以上数据验证稳定性")
+    print("  3. 💰 考虑小额实盘测试")
+    print("  4. 🔄 根据实盘结果微调参数")
+
+print("\n" + "="*80)

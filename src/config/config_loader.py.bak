@@ -36,7 +36,7 @@ class ConfigLoader:
 
     @staticmethod
     def load_trading_config(
-        file_path: str = "config/trading_config.json",
+        file_path: str = "config/trading_config_vps.json",
     ) -> Dict[str, Any]:
         """
         加载交易配置

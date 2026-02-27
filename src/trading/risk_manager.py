@@ -3,8 +3,9 @@
 负责风险控制和检查
 """
 
+from collections import deque
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Deque, Dict, Optional, Tuple
 
 
 class RiskManager:
@@ -22,6 +23,174 @@ class RiskManager:
         self.daily_start_balance = 0.0  # 今日起始余额
         self.consecutive_losses = 0  # 连续亏损次数
         self.last_reset_date = datetime.now().date()
+
+        # ========== MACD/CVD 冲突保护状态 ==========
+        # 记录每个交易对的连续冲突次数 - key: (symbol, side)
+        self._conflict_counters: Dict[Tuple[str, str], int] = {}
+        # cooldown: key: (symbol, side) -> last protect timestamp (epoch seconds)
+        self._last_protect_ts: Dict[Tuple[str, str], float] = {}
+        # 冲突保护配置阈值
+        self._conflict_cfg = {
+            "cvd_min": 0.3,           # CVD 最小阈值（避免噪声）
+            "conflict_hard": 0.8,     # 重度冲突阈值
+            "macd_weak": 0.4,         # MACD 弱信号阈值
+            "confirm_bars": 2,        # 连续确认根数
+            "same_macd_min": 0.25,    # 判定"MACD 与持仓同向"的最小强度（提升抗噪）
+            "cooldown_sec": 60.0,     # 同一(symbol,side)保护动作冷却（避免频繁 tighten/撤挂）
+            "neutral_decay": 1,       # 中性时冲突计数衰减步长（避免立刻清零抖动）
+        }
+
+        # ========== 冲突保护行为统计器 ==========
+        # 全局累计
+        self._protect_stats: Dict[str, Any] = {
+            "levels": {"confirm": 0, "neutral": 0, "conflict_light": 0, "conflict_hard": 0},
+            "actions": {
+                "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+                "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+                "reduce": {"triggered": 0},
+            },
+        }
+        # (symbol, side) 维度累计
+        self._protect_stats_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # 最近事件（便于复盘）
+        self._protect_events: Deque[Dict[str, Any]] = deque(maxlen=200)
+
+    # ========== 冲突保护统计器方法 ==========
+
+    def _get_or_create_key_stats(self, key: Tuple[str, str]) -> Dict[str, Any]:
+        """获取或创建 (symbol, side) 维度的统计"""
+        if key not in self._protect_stats_by_key:
+            self._protect_stats_by_key[key] = {
+                "levels": {"confirm": 0, "neutral": 0, "conflict_light": 0, "conflict_hard": 0},
+                "actions": {
+                    "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+                    "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+                    "reduce": {"triggered": 0},
+                },
+            }
+        return self._protect_stats_by_key[key]
+
+    def record_protection_level(
+        self,
+        symbol: str,
+        side: str,
+        level: str,
+        reason: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ):
+        """记录一次 protection level（confirm/neutral/light/hard）出现"""
+        level = str(level or "neutral")
+        side_u = str(side).upper()
+        key = (symbol, side_u)
+        if level not in self._protect_stats["levels"]:
+            level = "neutral"
+        self._protect_stats["levels"][level] += 1
+        ks = self._get_or_create_key_stats(key)
+        ks["levels"][level] += 1
+        ev: Dict[str, Any] = {"ts": datetime.now().isoformat(), "symbol": symbol, "side": side_u, "type": "level", "level": level, "reason": reason}
+        if extra:
+            ev["extra"] = extra
+        self._protect_events.append(ev)
+
+    def record_protection_action(
+        self,
+        symbol: str,
+        side: str,
+        action: str,
+        outcome: str,
+        level: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        记录保护动作执行结果
+
+        Args:
+            symbol: 交易对
+            side: 持仓方向
+            action: tighten / breakeven / reduce
+            outcome: applied | attempt | skipped_cooldown | skipped_not_tighter | error | triggered
+            level: 保护级别
+            detail: 额外详情
+        """
+        action = str(action)
+        outcome = str(outcome)
+        side_u = str(side).upper()
+        key = (symbol, side_u)
+        ks = self._get_or_create_key_stats(key)
+
+        if action in ("tighten", "breakeven"):
+            if outcome not in self._protect_stats["actions"][action]:
+                outcome = "error"
+            self._protect_stats["actions"][action][outcome] += 1
+            ks["actions"][action][outcome] += 1
+        elif action == "reduce":
+            # reduce 目前只统计 triggered
+            self._protect_stats["actions"]["reduce"]["triggered"] += 1
+            ks["actions"]["reduce"]["triggered"] += 1
+
+        ev: Dict[str, Any] = {
+            "ts": datetime.now().isoformat(),
+            "symbol": symbol,
+            "side": side_u,
+            "type": "action",
+            "action": action,
+            "outcome": outcome,
+        }
+        if level:
+            ev["level"] = str(level)
+        if detail:
+            ev["detail"] = detail
+        self._protect_events.append(ev)
+
+    def get_conflict_protection_stats(self) -> Dict[str, Any]:
+        """返回统计快照（可用于 API/日志）"""
+        return {
+            "global": self._protect_stats,
+            "by_key": self._protect_stats_by_key,
+            "recent_events": list(self._protect_events),
+        }
+
+    def reset_conflict_protection_stats(self):
+        """清空统计（不清空 counters / cooldown 状态）"""
+        self._protect_stats["levels"] = {"confirm": 0, "neutral": 0, "conflict_light": 0, "conflict_hard": 0}
+        self._protect_stats["actions"] = {
+            "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+            "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+            "reduce": {"triggered": 0},
+        }
+        self._protect_stats_by_key.clear()
+        self._protect_events.clear()
+
+    def format_conflict_protection_stats(self, top_n: int = 6) -> str:
+        """一行摘要，适合定期打印"""
+        g = self._protect_stats
+        lv = g["levels"]
+        act = g["actions"]
+        parts = [
+            f"LV(confirm={lv['confirm']}, neutral={lv['neutral']}, light={lv['conflict_light']}, hard={lv['conflict_hard']})",
+            "ACT("
+            f"tighten[a={act['tighten']['attempt']}, ok={act['tighten']['applied']}, cd={act['tighten']['skipped_cooldown']}, nt={act['tighten']['skipped_not_tighter']}, err={act['tighten']['error']}], "
+            f"be[a={act['breakeven']['attempt']}, ok={act['breakeven']['applied']}, cd={act['breakeven']['skipped_cooldown']}, nt={act['breakeven']['skipped_not_tighter']}, err={act['breakeven']['error']}], "
+            f"reduce={act['reduce']['triggered']}"
+            ")",
+        ]
+
+        # top symbols by hard+light count
+        keys = []
+        for (sym, side), s in self._protect_stats_by_key.items():
+            score = int(s["levels"]["conflict_hard"]) * 3 + int(s["levels"]["conflict_light"])
+            if score > 0:
+                keys.append(((sym, side), score, s))
+        keys.sort(key=lambda x: x[1], reverse=True)
+        if keys:
+            tops = []
+            for (sym, side), score, s in keys[: max(1, int(top_n))]:
+                tops.append(
+                    f"{sym}:{side}(light={s['levels']['conflict_light']},hard={s['levels']['conflict_hard']},"
+                    f"reduce={s['actions']['reduce']['triggered']})"
+                )
+            parts.append("TOP[" + ", ".join(tops) + "]")
+        return " | ".join(parts)
 
     def check_position_size(self, symbol: str, quantity: float, price: float, total_equity: float) -> tuple[bool, str]:
         """
@@ -187,3 +356,296 @@ class RiskManager:
             return True, f"持仓亏损过大（{unrealized_pnl:.2f} USDT）"
 
         return False, ""
+
+    # ========== MACD/CVD 冲突保护机制 ==========
+
+    def check_position_protection(
+        self,
+        symbol: str,
+        position_side: str,
+        macd_hist_norm: float,
+        cvd_norm: float,
+        ev_direction: Optional[str] = None,
+        ev_score: Optional[float] = None,
+        lw_direction: Optional[str] = None,
+        lw_score: Optional[float] = None,
+        macd_strength: Optional[float] = None,
+        now_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        检查持仓保护状态（基于 MACD/CVD 冲突）
+
+        用于保护已有持仓，而非决定方向。
+        - 确认增强：MACD 同向 + CVD 同向 → 允许加仓/持有
+        - 轻度冲突：MACD 同向 + CVD 反向（中等） → 冻结加仓、收紧止损
+        - 重度冲突：MACD 同向 + CVD 反向（强）+ 连续 → 减仓/提前保本
+
+        Args:
+            symbol: 交易对
+            position_side: 持仓方向 "LONG" / "SHORT"
+            macd_hist_norm: MACD hist 归一化值 [-1, 1]
+            cvd_norm: CVD 归一化值 [-1, 1]
+            ev_direction: EV 方向 ("LONG_ONLY"/"SHORT_ONLY"/"BOTH")
+            ev_score: EV 分数
+            lw_direction: LW 方向 ("LONG_ONLY"/"SHORT_ONLY"/"BOTH")
+            lw_score: LW 分数
+            macd_strength: MACD 强度（可选，默认用 abs(macd_hist_norm)）
+            now_ts: 当前时间戳（可选，用于 cooldown 检查）
+
+        Returns:
+            {
+                "level": "confirm" / "neutral" / "conflict_light" / "conflict_hard",
+                "allow_add": bool,              # 是否允许加仓
+                "tighten_trailing": bool,       # 是否收紧 trailing
+                "reduce_position_pct": float,   # 减仓比例 (0.0 ~ 1.0)
+                "force_break_even": bool,       # 是否强制保本止损
+                "risk_penalty": float,          # 风险惩罚系数 [0, 1]
+                "conflict_bars": int,           # 连续冲突次数
+                "cooldown_active": bool,        # 是否处于 cooldown 期间
+                "reason": str,                  # 原因说明
+            }
+        """
+        import time
+        cfg = self._conflict_cfg
+        cvd_min = cfg["cvd_min"]
+        conflict_hard = cfg["conflict_hard"]
+        macd_weak = cfg["macd_weak"]
+        confirm_bars = cfg["confirm_bars"]
+        same_macd_min = cfg.get("same_macd_min", 0.25)
+        cooldown_sec = float(cfg.get("cooldown_sec", 60.0))
+        neutral_decay = int(cfg.get("neutral_decay", 1))
+
+        key = (symbol, str(position_side).upper())
+        # caller can pass loop timestamp; otherwise fallback to "now"
+        ts_now = float(now_ts) if now_ts is not None else time.time()
+
+        # 默认返回值
+        result = {
+            "level": "neutral",
+            "allow_add": True,
+            "tighten_trailing": False,
+            "reduce_position_pct": 0.0,
+            "force_break_even": False,
+            "risk_penalty": 0.0,
+            "conflict_bars": 0,
+            "cooldown_active": False,
+            "reason": "",
+        }
+
+        # 计算方向
+        macd_dir = 1 if macd_hist_norm > 0 else -1 if macd_hist_norm < 0 else 0
+        cvd_dir = 1 if cvd_norm > 0 else -1 if cvd_norm < 0 else 0
+        pos_dir = 1 if position_side == "LONG" else -1
+        ev_dir_raw = str(ev_direction or "BOTH").upper()
+        lw_dir_raw = str(lw_direction or "BOTH").upper()
+        ev_dir = 1 if ev_dir_raw == "LONG_ONLY" else -1 if ev_dir_raw == "SHORT_ONLY" else 0
+        lw_dir = 1 if lw_dir_raw == "LONG_ONLY" else -1 if lw_dir_raw == "SHORT_ONLY" else 0
+        ev_score_abs = abs(float(ev_score or 0.0))
+        lw_score_abs = abs(float(lw_score or 0.0))
+
+        # MACD 强度
+        strength = macd_strength if macd_strength is not None else abs(macd_hist_norm)
+
+        # cooldown check (applies only when we'd take a protection action)
+        last_ts = float(self._last_protect_ts.get(key, 0.0))
+        cooldown_active = (ts_now - last_ts) < cooldown_sec
+
+        # ========== EV 主导持仓保护 ==========
+        # 经验结论：持仓后以 EV 为主，LW 只做辅助确认/降噪，MACD/CVD 作为回退。
+        ev_confirm_min = 0.10
+        ev_conflict_light_min = 0.12
+        ev_conflict_hard_min = 0.30
+        lw_assist_min = 0.18
+
+        if ev_dir != 0:
+            same_ev = ev_dir == pos_dir
+            against_ev = ev_dir == -pos_dir
+
+            if same_ev and ev_score_abs >= ev_confirm_min:
+                self._conflict_counters[key] = 0
+                result.update({
+                    "level": "confirm",
+                    "allow_add": True,
+                    "tighten_trailing": False,
+                    "reason": (
+                        f"EV确认: pos={position_side} ev={ev_dir_raw}({float(ev_score or 0.0):+.2f}) "
+                        f"lw={lw_dir_raw}({float(lw_score or 0.0):+.2f})"
+                    ),
+                })
+                self.record_protection_level(symbol, position_side, "confirm", reason=result["reason"])
+                return result
+
+            if against_ev and ev_score_abs >= ev_conflict_light_min:
+                self._conflict_counters[key] = self._conflict_counters.get(key, 0) + 1
+                conflict_bars = self._conflict_counters[key]
+                conflict_score = ev_score_abs
+                # LW 与 EV 同向（都反持仓）时，提升冲突等级；反之降级
+                if lw_dir == ev_dir and lw_score_abs >= lw_assist_min:
+                    conflict_score += 0.08
+                elif lw_dir == pos_dir and lw_score_abs >= lw_assist_min:
+                    conflict_score -= 0.08
+                conflict_score = max(0.0, min(1.0, conflict_score))
+
+                is_hard_conflict = (
+                    conflict_score >= ev_conflict_hard_min
+                    or (conflict_bars >= confirm_bars and conflict_score >= (ev_conflict_light_min + 0.05))
+                )
+                result["cooldown_active"] = bool(cooldown_active)
+                if is_hard_conflict:
+                    result.update({
+                        "level": "conflict_hard",
+                        "allow_add": False,
+                        "tighten_trailing": True,
+                        "reduce_position_pct": 0.25,
+                        "force_break_even": True,
+                        "risk_penalty": conflict_score,
+                        "conflict_bars": conflict_bars,
+                        "reason": (
+                            f"EV重度冲突: pos={position_side} ev={ev_dir_raw}({float(ev_score or 0.0):+.2f}) "
+                            f"lw={lw_dir_raw}({float(lw_score or 0.0):+.2f}) bars={conflict_bars} "
+                            f"cd={'Y' if cooldown_active else 'N'}"
+                        ),
+                    })
+                else:
+                    result.update({
+                        "level": "conflict_light",
+                        "allow_add": False,
+                        "tighten_trailing": True,
+                        "risk_penalty": conflict_score,
+                        "conflict_bars": conflict_bars,
+                        "reason": (
+                            f"EV轻度冲突: pos={position_side} ev={ev_dir_raw}({float(ev_score or 0.0):+.2f}) "
+                            f"lw={lw_dir_raw}({float(lw_score or 0.0):+.2f}) bars={conflict_bars} "
+                            f"cd={'Y' if cooldown_active else 'N'}"
+                        ),
+                    })
+                if not cooldown_active:
+                    self._last_protect_ts[key] = ts_now
+                self.record_protection_level(
+                    symbol,
+                    position_side,
+                    result["level"],
+                    reason=result.get("reason", ""),
+                    extra={"source": "ev_primary", "conflict_bars": conflict_bars, "risk_penalty": conflict_score},
+                )
+                return result
+
+        # ========== 确认增强 ==========
+        # stronger same_macd threshold -> less noise-induced protection flips
+        same_macd = (macd_dir == pos_dir) and (abs(macd_hist_norm) >= same_macd_min)
+        same_cvd = (cvd_dir == pos_dir) and (abs(cvd_norm) > cvd_min)
+
+        if same_macd and same_cvd:
+            # 确认增强：允许加仓、持有更稳
+            self._conflict_counters[key] = 0  # 重置冲突计数
+            result.update({
+                "level": "confirm",
+                "allow_add": True,
+                "tighten_trailing": False,
+                "reason": f"确认增强: pos={position_side} macd={macd_dir:+.1f} cvd={cvd_dir:+.1f}",
+            })
+            self.record_protection_level(symbol, position_side, "confirm", reason=result["reason"])
+            return result
+
+        # ========== 冲突检测 ==========
+        # MACD 与持仓同向，但 CVD 与持仓反向
+        conflict = same_macd and (cvd_dir != pos_dir) and (abs(cvd_norm) > cvd_min)
+
+        if conflict:
+            # 更新冲突计数
+            self._conflict_counters[key] = self._conflict_counters.get(key, 0) + 1
+            conflict_bars = self._conflict_counters[key]
+
+            # 风险惩罚系数
+            risk_penalty = min(1.0, abs(cvd_norm))
+
+            # 判断冲突级别
+            is_hard_conflict = (
+                abs(cvd_norm) > conflict_hard
+                and strength < macd_weak
+                and conflict_bars >= confirm_bars
+            )
+
+            # If cooldown is active, we still report the conflict status
+            # but advise caller to avoid repeated tighten/re-hang actions.
+            result["cooldown_active"] = bool(cooldown_active)
+
+            if is_hard_conflict:
+                # ========== 重度冲突 ==========
+                result.update({
+                    "level": "conflict_hard",
+                    "allow_add": False,
+                    "tighten_trailing": True,
+                    "reduce_position_pct": 0.25,  # 减仓 25%
+                    "force_break_even": True,
+                    "risk_penalty": risk_penalty,
+                    "conflict_bars": conflict_bars,
+                    "reason": (
+                        f"重度冲突: pos={position_side} macd={macd_hist_norm:+.2f} "
+                        f"cvd={cvd_norm:+.2f} bars={conflict_bars} cd={'Y' if cooldown_active else 'N'}"
+                    ),
+                })
+            else:
+                # ========== 轻度冲突 ==========
+                result.update({
+                    "level": "conflict_light",
+                    "allow_add": False,
+                    "tighten_trailing": True,
+                    "risk_penalty": risk_penalty,
+                    "conflict_bars": conflict_bars,
+                    "reason": (
+                        f"轻度冲突: pos={position_side} macd={macd_hist_norm:+.2f} "
+                        f"cvd={cvd_norm:+.2f} bars={conflict_bars} cd={'Y' if cooldown_active else 'N'}"
+                    ),
+                })
+
+            # record last protect timestamp only when we are in conflict state
+            # (caller can still decide to skip action when cooldown_active=True)
+            if not cooldown_active:
+                self._last_protect_ts[key] = ts_now
+            self.record_protection_level(
+                symbol,
+                position_side,
+                result["level"],
+                reason=result.get("reason", ""),
+                extra={"conflict_bars": conflict_bars, "cooldown_active": cooldown_active, "risk_penalty": risk_penalty},
+            )
+            return result
+
+        # ========== 无明确信号 ==========
+        # neutral: decay instead of hard reset to reduce thrash
+        prev = int(self._conflict_counters.get(key, 0))
+        if prev > 0:
+            self._conflict_counters[key] = max(0, prev - max(1, neutral_decay))
+        else:
+            self._conflict_counters[key] = 0
+        result["reason"] = f"中性: pos={position_side} macd={macd_hist_norm:+.2f} cvd={cvd_norm:+.2f} bars={self._conflict_counters[key]}"
+        self.record_protection_level(symbol, position_side, "neutral", reason=result["reason"])
+        return result
+
+    def get_conflict_counter(self, symbol: str, side: Optional[str] = None) -> int:
+        """获取指定交易对的连续冲突次数"""
+        if side:
+            return self._conflict_counters.get((symbol, str(side).upper()), 0)
+        # legacy interface: sum both sides if needed
+        total = 0
+        for (sym, _side), v in self._conflict_counters.items():
+            if sym == symbol:
+                total += int(v)
+        return total
+
+    def reset_conflict_counter(self, symbol: str, side: Optional[str] = None):
+        """重置指定交易对的冲突计数"""
+        if side:
+            self._conflict_counters[(symbol, str(side).upper())] = 0
+            self._last_protect_ts.pop((symbol, str(side).upper()), None)
+            return
+        # reset both sides
+        for s in ("LONG", "SHORT"):
+            self._conflict_counters[(symbol, s)] = 0
+            self._last_protect_ts.pop((symbol, s), None)
+
+    def reset_all_conflict_counters(self):
+        """重置所有冲突计数"""
+        self._conflict_counters.clear()
+        self._last_protect_ts.clear()

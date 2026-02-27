@@ -46,6 +46,12 @@ class TradeExecutor:
     def _execute_open(self, intent: TradeIntent) -> Dict[str, Any]:
         assert intent.action == IntentAction.OPEN
         assert intent.side is not None  # OPEN 意图必须有 side
+        # Enforce protected opens: every OPEN must carry both TP and SL.
+        if intent.take_profit is None or intent.stop_loss is None:
+            return {
+                "status": "error",
+                "message": "OPEN 必须同时设置止盈和止损，已拒绝开仓",
+            }
 
         # 🔥 移除本地快照检查，让交易所 API 判断是否真的有仓位
         # 避免第一次请求失败后，retry 时错误地阻止开仓
@@ -172,39 +178,26 @@ class TradeExecutor:
                     protection_retry,
                 )
 
-                # 回滚策略：可配置是否在 TP/SL 失败时立即平仓
-                rollback_cfg = (
-                    self.config.get("trading", {}).get("rollback_on_tp_sl_fail")
-                    if isinstance(self.config, dict)
-                    else None
-                )
-                rollback = bool(rollback_cfg) if rollback_cfg is not None else False
-
-                if rollback:
-                    try:
-                        self._close(intent.symbol, intent.side, None)
-                    except Exception:
-                        pass
-                    try:
-                        self.client.cancel_all_open_orders(intent.symbol)
-                    except Exception:
-                        pass
-                    return {
-                        "status": "error",
-                        "message": "TP/SL 下单失败，已回滚开仓",
-                        "open": res,
-                        "protection": protection,
-                        "protection_retry": protection_retry,
-                    }
-                else:
-                    # 不回滚：保留已开仓位，记录警告并返回部分成功信息
-                    return {
-                        "status": "warning",
-                        "message": "TP/SL 下单失败，已保留开仓，请手动检查保护单",
-                        "open": res,
-                        "protection": protection,
-                        "protection_retry": protection_retry,
-                    }
+                # Hard safety policy: protection failed => rollback open immediately.
+                try:
+                    self._close(intent.symbol, intent.side, None)
+                except Exception:
+                    pass
+                try:
+                    self.client.cancel_all_conditional_orders(intent.symbol)
+                except Exception:
+                    pass
+                try:
+                    self.client.cancel_all_open_orders(intent.symbol)
+                except Exception:
+                    pass
+                return {
+                    "status": "error",
+                    "message": "TP/SL 下单失败，已强制回滚开仓并撤销未触发委托",
+                    "open": res,
+                    "protection": protection,
+                    "protection_retry": protection_retry,
+                }
 
         return res
 
@@ -212,10 +205,15 @@ class TradeExecutor:
         """判定保护单是否成功挂出（允许部分成功按失败处理）"""
         if not isinstance(protection, dict):
             return False
-        if protection.get("status") != "success":
+        status = str(protection.get("status", "")).lower()
+        if status not in ("success", "protected"):
             return False
         orders = protection.get("orders")
+        # state machine format: {"status":"protected","orders":{"status":"success","orders":[...]}}
         if isinstance(orders, dict):
+            nested_status = str(orders.get("status", "")).lower()
+            if nested_status and nested_status != "success":
+                return False
             orders = orders.get("orders")
         if not isinstance(orders, list) or not orders:
             return False
@@ -285,6 +283,12 @@ class TradeExecutor:
         assert intent.side is not None  # CLOSE 意图必须有 side
         side = intent.side  # 类型: IntentPositionSide (非 None)
 
+        # Always purge stale protection orders before closing.
+        try:
+            self.client.cancel_all_conditional_orders(intent.symbol)
+        except Exception:
+            pass
+
         # ===== 仓位存在性校验 =====
         pos = self.client.get_position(intent.symbol, side.value)
         if not pos or float(pos.get("positionAmt", 0)) == 0:
@@ -308,7 +312,17 @@ class TradeExecutor:
             # 部分平仓：使用 reduceOnly=True
             intent = dataclasses.replace(intent, reduce_only=True)
 
-        return self.client.execute_intent(intent)
+        res = self.client.execute_intent(intent)
+        # Best-effort post-close cleanup to avoid lingering untriggered orders.
+        try:
+            self.client.cancel_all_conditional_orders(intent.symbol)
+        except Exception:
+            pass
+        try:
+            self.client.cancel_all_open_orders(intent.symbol)
+        except Exception:
+            pass
+        return res
 
     # =========================
     # 开仓接口

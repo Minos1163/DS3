@@ -12,6 +12,18 @@ class ConfigLoader:
     """配置加载器"""
 
     @staticmethod
+    def _project_root() -> str:
+        """返回项目根目录（src 的上级目录）。"""
+        return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    @staticmethod
+    def _resolve_config_path(file_path: str) -> str:
+        """将配置路径解析为绝对路径；相对路径按项目根目录解析。"""
+        if os.path.isabs(file_path):
+            return file_path
+        return os.path.join(ConfigLoader._project_root(), file_path)
+
+    @staticmethod
     def load_json_config(file_path: str) -> Dict[str, Any]:
         """
         加载JSON配置文件
@@ -26,17 +38,18 @@ class ConfigLoader:
             FileNotFoundError: 文件不存在
             json.JSONDecodeError: JSON格式错误
         """
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"配置文件不存在: {file_path}")
+        resolved_path = ConfigLoader._resolve_config_path(file_path)
+        if not os.path.exists(resolved_path):
+            raise FileNotFoundError(f"配置文件不存在: {file_path} (resolved: {resolved_path})")
 
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(resolved_path, "r", encoding="utf-8") as f:
             config = json.load(f)
 
         return config
 
     @staticmethod
     def load_trading_config(
-        file_path: str = "config/trading_config.json",
+        file_path: str = "config/trading_config_vps.json",
     ) -> Dict[str, Any]:
         """
         加载交易配置
@@ -132,7 +145,11 @@ class ConfigLoader:
             except Exception:
                 return 0.0
             v = abs(v)
-            if v > 1.0:
+            # 统一兼容：
+            # - 0.006 => 0.6%
+            # - 0.6   => 0.6%
+            # - 1     => 1%
+            if v > 0.05:
                 return v / 100.0
             return v
 

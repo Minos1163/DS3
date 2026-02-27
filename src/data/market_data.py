@@ -9,9 +9,14 @@ import pandas as pd
 
 from src.api.binance_client import BinanceClient
 from src.utils.indicators import (
+    calculate_adx,
     calculate_atr,
+    calculate_bbi,
     calculate_bollinger_bands,
     calculate_ema,
+    calculate_ema_diff_pct,
+    calculate_ema_slope,
+    calculate_kdj,
     calculate_macd,
     calculate_rsi,
     calculate_sma,
@@ -207,9 +212,176 @@ class MarketDataManager:
                 "funding_rate": funding_rate if funding_rate else 0.0,
                 "open_interest": open_interest if open_interest else 0.0,
             }
-        except Exception as e:
-            print(f"⚠️ 获取实时市场数据失败 {symbol}: {e}")
+        except Exception:
+            # 错误由调用方汇总处理，此处静默返回
             return None
+
+    def get_trend_filter_metrics(
+        self,
+        symbol: str,
+        interval: str = "15m",
+        limit: int = 120,
+    ) -> Dict[str, float]:
+        """
+        获取趋势过滤指标：
+        - ema_fast(EMA20), ema_slow(EMA50)
+        - adx(14), atr_pct(ATR14 / last_close)
+        - bbi(多空指标), macd, macd_signal, macd_hist
+        - ema_slope(EMA20斜率), ema_diff_pct(快慢EMA差值%)
+        - last_close(最新价格)
+        - 归一化指标: *_norm (范围 [-1, 1])
+        """
+        try:
+            klines = self.client.get_klines(symbol, interval, limit=limit)
+            if not klines or len(klines) < 60:
+                return {}
+
+            df = pd.DataFrame(
+                klines,
+                columns=[
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "close_time",
+                    "quote_volume",
+                    "trades",
+                    "taker_buy_base",
+                    "taker_buy_quote",
+                    "ignore",
+                ],
+            )
+            for col in ("high", "low", "close", "open"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            close = df["close"]
+            high = df["high"]
+            low = df["low"]
+
+            # 基础指标
+            ema_fast = calculate_ema(close, period=20)
+            ema_slow = calculate_ema(close, period=50)
+            adx = calculate_adx(high, low, close, period=14)
+            atr = calculate_atr(high, low, close, period=14)
+            last_close = float(close.iloc[-1]) if len(close) > 0 else 0.0
+            last_open = float(df["open"].iloc[-1]) if len(df["open"]) > 0 else 0.0
+            atr_pct = (float(atr) / last_close) if (atr is not None and last_close > 0) else None
+
+            # 新增指标
+            bbi = calculate_bbi(close, periods=[3, 6, 12, 24])
+            macd, macd_signal, macd_hist = calculate_macd(close, fast=12, slow=26, signal=9)
+            kdj_k, kdj_d, kdj_j = calculate_kdj(high, low, close, period=9, smooth=3)
+            ema_slope = calculate_ema_slope(close, period=20, slope_period=3)
+            ema_diff_pct = calculate_ema_diff_pct(close, fast_period=20, slow_period=50)
+
+            if ema_fast is None or ema_slow is None or adx is None or atr_pct is None:
+                return {}
+
+            result = {
+                "ema_fast": float(ema_fast),
+                "ema_slow": float(ema_slow),
+                "adx": float(adx),
+                "atr_pct": float(atr_pct),
+                "last_close": last_close,
+                "last_open": last_open,
+            }
+
+            # 归一化辅助函数
+            def _normalize(value: float, rolling_std_series: pd.Series, eps: float = 1e-9) -> float:
+                """使用 rolling_std 归一化到 [-1, 1]"""
+                if value is None or rolling_std_series is None or len(rolling_std_series) < 10:
+                    return 0.0
+                std = float(rolling_std_series.iloc[-1]) if not pd.isna(rolling_std_series.iloc[-1]) else eps
+                norm = value / (std + eps)
+                return max(-1.0, min(1.0, norm / 3.0))  # clip to [-1, 1]
+
+            # 添加原始指标
+            if bbi is not None:
+                result["bbi"] = float(bbi)
+                # BBI gap 归一化
+                bbi_gap_pct = (last_close - float(bbi)) / float(bbi) if float(bbi) > 0 else 0.0
+                result["bbi_gap_pct"] = bbi_gap_pct
+                # 计算 bbi_gap 滚动标准差用于归一化
+                if len(close) >= 30:
+                    bbi_series = close.rolling(window=3).mean() + close.rolling(window=6).mean() + \
+                                 close.rolling(window=12).mean() + close.rolling(window=24).mean()
+                    bbi_series = bbi_series / 4.0
+                    bbi_gap_series = (close - bbi_series) / bbi_series.replace(0, pd.NA)
+                    bbi_gap_std = bbi_gap_series.rolling(window=20).std()
+                    result["bbi_gap_norm"] = _normalize(bbi_gap_pct, bbi_gap_std)
+                else:
+                    result["bbi_gap_norm"] = max(-1.0, min(1.0, bbi_gap_pct * 100))  # 简单映射
+
+            if macd_hist is not None:
+                result["macd_hist"] = float(macd_hist)
+                # MACD hist 归一化
+                if len(close) >= 30:
+                    # 计算 hist 滚动标准差
+                    ema12 = close.ewm(span=12, adjust=False).mean()
+                    ema26 = close.ewm(span=26, adjust=False).mean()
+                    macd_line = ema12 - ema26
+                    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+                    hist_series = macd_line - signal_line
+                    hist_std = hist_series.rolling(window=20).std()
+                    result["macd_hist_norm"] = _normalize(float(macd_hist), hist_std)
+                else:
+                    # 简单归一化
+                    norm_val = float(macd_hist) / (last_close * 0.001 + 1e-9)
+                    result["macd_hist_norm"] = max(-1.0, min(1.0, norm_val))
+
+            if macd is not None:
+                result["macd"] = float(macd)
+            if macd_signal is not None:
+                result["macd_signal"] = float(macd_signal)
+
+            if kdj_k is not None and kdj_d is not None and kdj_j is not None:
+                result["kdj_k"] = float(kdj_k)
+                result["kdj_d"] = float(kdj_d)
+                result["kdj_j"] = float(kdj_j)
+                j_centered = float(kdj_j) - 50.0
+                if len(close) >= 30:
+                    low_n = low.rolling(window=9).min()
+                    high_n = high.rolling(window=9).max()
+                    spread = (high_n - low_n).replace(0, pd.NA)
+                    rsv_series = ((close - low_n) / spread) * 100.0
+                    k_series = rsv_series.ewm(alpha=1.0 / 3.0, adjust=False).mean()
+                    d_series = k_series.ewm(alpha=1.0 / 3.0, adjust=False).mean()
+                    j_series = 3.0 * k_series - 2.0 * d_series
+                    j_centered_std = (j_series - 50.0).rolling(window=20).std()
+                    result["kdj_j_norm"] = _normalize(j_centered, j_centered_std)
+                else:
+                    result["kdj_j_norm"] = max(-1.0, min(1.0, j_centered / 50.0))
+
+            if ema_diff_pct is not None:
+                result["ema_diff_pct"] = float(ema_diff_pct)
+                # EMA diff 归一化
+                if len(close) >= 30:
+                    ema20 = close.ewm(span=20, adjust=False).mean()
+                    ema50 = close.ewm(span=50, adjust=False).mean()
+                    diff_series = (ema20 - ema50) / ema50.replace(0, pd.NA)
+                    diff_std = diff_series.rolling(window=20).std()
+                    result["ema_diff_norm"] = _normalize(float(ema_diff_pct), diff_std)
+                else:
+                    result["ema_diff_norm"] = max(-1.0, min(1.0, float(ema_diff_pct) * 100))
+
+            if ema_slope is not None:
+                result["ema_slope"] = float(ema_slope)
+                # EMA slope 归一化 - 使用 rolling_std（已经是 pct 格式）
+                if len(close) >= 30:
+                    # 计算 EMA slope 的滚动标准差
+                    ema20_slope = close.ewm(span=20, adjust=False).mean()
+                    # 计算滚动 slope pct
+                    slope_series = ema20_slope.pct_change(periods=3)
+                    slope_std = slope_series.rolling(window=20).std()
+                    result["ema_slope_norm"] = _normalize(float(ema_slope), slope_std)
+                else:
+                    result["ema_slope_norm"] = max(-1.0, min(1.0, float(ema_slope) * 100))
+
+            return result
+        except Exception:
+            return {}
 
     def format_market_data_for_ai(
         self,

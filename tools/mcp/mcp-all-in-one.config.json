@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@upstash/context7-mcp",
+        "--transport",
+        "stdio"
+      ],
+      "env": {
+        "CONTEXT7_API_KEY": "YOUR_CONTEXT7_API_KEY"
+      }
+    },
+    "lmstudio_mcp": {
+      "command": "python",
+      "args": [
+        "d:/AIDCA/DCABOT/tools/mcp/lmstudio_server/server.py"
+      ],
+      "cwd": "d:/AIDCA/DCABOT",
+      "env": {
+        "LMSTUDIO_API_BASE": "http://localhost:1234/v1",
+        "LMSTUDIO_API_KEY": "lmstudio"
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 """
 配置文件监控器
-监控trading_config.json文件的变化，并处理交易对变更
+监控trading_config_vps.json文件的变化，并处理交易对变更
 """
 
 import json

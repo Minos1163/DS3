@@ -12,19 +12,30 @@ from src.config.config_loader import ConfigLoader
 class AccountDataManager:
     """账户数据管理器"""
 
-    def __init__(self, client):
+    def __init__(self, client, config_path: Optional[str] = None):
         """
         初始化账户数据管理器
 
         Args:
             client: Binance API客户端
+            config_path: 交易配置文件路径（可选）
         """
         self.client = client
+        self.config_path = config_path
         # 缓存上一次成功的账户摘要（用于请求失败时回退）
         self._last_account_summary: Optional[Dict[str, Any]] = None
         self._last_account_updated_at: float = 0.0
         # 缓存有效期（秒），默认 60 秒，可按需调整或暴露为参数
         self._cache_ttl: float = 60.0
+        # 默认关闭 traceback 刷屏，排查时可通过环境变量开启
+        self._verbose_errors: bool = os.getenv("BINANCE_VERBOSE_ACCOUNT_ERRORS") == "1"
+
+    @staticmethod
+    def _brief_error(error: BaseException, max_len: int = 220) -> str:
+        msg = str(error).strip().replace("\n", " ")
+        if len(msg) > max_len:
+            return msg[:max_len] + "..."
+        return msg
 
     def get_account_summary(self) -> Optional[Dict[str, Any]]:
         """
@@ -56,13 +67,14 @@ class AccountDataManager:
                 break
             except Exception as e:
                 _last_exc = e
-                print(f"⚠️ 获取账户信息失败（尝试 {attempt + 1}/{retries}）：{e}")
-                try:
-                    import traceback
+                print(f"⚠️ 获取账户信息失败（尝试 {attempt + 1}/{retries}）：{self._brief_error(e)}")
+                if self._verbose_errors:
+                    try:
+                        import traceback
 
-                    traceback.print_exc()
-                except Exception:
-                    pass
+                        traceback.print_exc()
+                    except Exception:
+                        pass
                 time.sleep(backoff)
                 backoff *= 2
 
@@ -204,7 +216,9 @@ class AccountDataManager:
                     # 支持通过配置文件或环境变量设置阈值（单位 USDT），默认 0.01
                     threshold = 0.01
                     try:
-                        cfg = ConfigLoader.load_trading_config()
+                        cfg = ConfigLoader.load_trading_config(
+                            self.config_path or "config/trading_config_vps.json"
+                        )
                         threshold = ConfigLoader.get_unrealized_pnl_threshold_usdt(cfg)
                     except Exception:
                         try:
@@ -281,10 +295,11 @@ class AccountDataManager:
                 pass
             return result
         except Exception as e:
-            print(f"⚠️ 获取账户摘要失败: {e}")
-            import traceback
+            print(f"⚠️ 获取账户摘要失败: {self._brief_error(e)}")
+            if self._verbose_errors:
+                import traceback
 
-            traceback.print_exc()
+                traceback.print_exc()
             # 出错时尝试返回缓存（如果存在且未过期）
             if (
                 self._last_account_summary is not None

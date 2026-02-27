@@ -163,6 +163,19 @@ class PositionStateMachineV2:
         assert intent.side is not None
         assert intent.quantity is not None
 
+        allow_position_increase = False
+        existing_snapshot = self.snapshots.get(intent.symbol)
+        if existing_snapshot is not None and existing_snapshot.side == intent.side and float(existing_snapshot.quantity) > 0:
+            allow_position_increase = True
+        if not allow_position_increase:
+            try:
+                pos_check_side = intent.side.value if intent.side else None
+                pos = self.client.get_position(intent.symbol, side=pos_check_side)
+                if pos and abs(float(pos.get("positionAmt", 0))) > 0:
+                    allow_position_increase = True
+            except Exception:
+                pass
+
         # 打开前清理该 Symbol 所有挂单（防止旧的 TP/SL 意外触发）
         try:
             self.client.cancel_all_open_orders(intent.symbol)
@@ -177,6 +190,9 @@ class PositionStateMachineV2:
             "type": order_type,
             "quantity": intent.quantity,
         }
+        if allow_position_increase:
+            # Internal marker consumed by OrderGateway; stripped before exchange request.
+            params["_allow_position_increase"] = True
 
         # Hedge 模式下必须带 positionSide
         if self.client.broker.get_hedge_mode():

@@ -25,6 +25,7 @@ import hmac
 import os
 import time
 from enum import Enum
+from urllib.parse import urlsplit
 
 
 class ApiCapability(Enum):
@@ -61,6 +62,8 @@ class BinanceBroker:
         self.order = OrderGateway(self)
         self.position = PositionGateway(self)
         self.balance = BalanceEngine(self)
+        # 由 BinanceClient 在初始化完成后注入 MarketGateway
+        self.market: Optional[MarketGateway] = None
 
         self._hedge_mode_cache: Optional[Tuple[bool, float]] = None
         self._HEDGE_MODE_CACHE_TTL = 10.0
@@ -74,7 +77,15 @@ class BinanceBroker:
         self._disable_env_proxy = os.getenv("BINANCE_DISABLE_PROXY") == "1"
         self._proxy_fallback = os.getenv("BINANCE_PROXY_FALLBACK") == "1"
         self._force_direct = os.getenv("BINANCE_FORCE_DIRECT") == "1"
-        self._session.trust_env = not self._disable_env_proxy
+        self._close_use_proxy = os.getenv("BINANCE_CLOSE_USE_PROXY") == "1"
+        self._close_proxy = os.getenv("BINANCE_CLOSE_PROXY")
+        self._close_proxy_warned = False
+        self._session.trust_env = (not self._disable_env_proxy) and (not self._force_direct)
+        self._fapi_endpoints = self._load_fapi_endpoints()
+        self._fapi_endpoint_index = 0
+        if self.FAPI_BASE in self._fapi_endpoints:
+            self._fapi_endpoint_index = self._fapi_endpoints.index(self.FAPI_BASE)
+        self._apply_fapi_endpoint(self._fapi_endpoints[self._fapi_endpoint_index])
         retry_strategy = Retry(
             total=3,  # 最多重试 3 次
             backoff_factor=0.5,  # 重试延迟：0.5s, 1s, 2s
@@ -87,6 +98,21 @@ class BinanceBroker:
 
         # 初始化时间偏移（避免 -1021 时间戳超前/滞后）
         self._sync_time_offset(force=True)
+
+    def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if self.market is None:
+            return None
+        return self.market.get_symbol_info(symbol)
+
+    def format_quantity(self, symbol: str, quantity: float) -> float:
+        if self.market is None:
+            return float(quantity)
+        return self.market.format_quantity(symbol, quantity)
+
+    def ensure_min_notional_quantity(self, symbol: str, quantity: float, price: float) -> float:
+        if self.market is None:
+            return float(quantity)
+        return self.market.ensure_min_notional_quantity(symbol, quantity, price)
 
     def _load_proxies(self) -> Optional[Dict[str, str]]:
         proxy = os.getenv("BINANCE_PROXY")
@@ -101,6 +127,115 @@ class BinanceBroker:
         if https_proxy:
             proxies["https"] = https_proxy
         return proxies or None
+
+    def _load_close_proxies(self) -> Optional[Dict[str, str]]:
+        if self._close_proxy:
+            return {"http": self._close_proxy, "https": self._close_proxy}
+        return self._proxies
+
+    def _resolve_request_proxies(self, close_request: bool) -> Optional[Dict[str, str]]:
+        # force_direct 必须全局生效（包括平仓请求），避免"已切直连但仍走平仓代理"
+        if self._force_direct:
+            return None
+        default_proxies = self._proxies
+        if not close_request or not self._close_use_proxy:
+            return default_proxies
+
+        close_proxies = self._load_close_proxies()
+        if close_proxies:
+            return close_proxies
+
+        if not self._close_proxy_warned:
+            self._close_proxy_warned = True
+            print("⚠️ 已开启 BINANCE_CLOSE_USE_PROXY=1，但未配置代理地址，平仓请求将沿用当前连接模式。")
+        return default_proxies
+
+    def _load_fapi_endpoints(self) -> List[str]:
+        raw = (
+            os.getenv("BINANCE_FUTURES_ENDPOINTS")
+            or os.getenv("BINANCE_FAPI_ENDPOINTS")
+            or ""
+        )
+        env_eps = [x.strip().rstrip("/") for x in raw.split(",") if x.strip()]
+        defaults = [
+            "https://fapi.binance.com",
+            "https://fapi1.binance.com",
+            "https://fapi2.binance.com",
+            "https://fapi3.binance.com",
+        ]
+        merged: List[str] = []
+        for ep in [*env_eps, *defaults]:
+            if ep and ep not in merged:
+                merged.append(ep)
+        return merged
+
+    def _apply_fapi_endpoint(self, base: str) -> None:
+        self.FAPI_BASE = base.rstrip("/")
+        self.MARKET_BASE = self.FAPI_BASE
+
+    def _rotate_fapi_endpoint(self) -> bool:
+        if len(self._fapi_endpoints) <= 1:
+            return False
+        self._fapi_endpoint_index = (self._fapi_endpoint_index + 1) % len(self._fapi_endpoints)
+        self._apply_fapi_endpoint(self._fapi_endpoints[self._fapi_endpoint_index])
+        return True
+
+    def _rewrite_fapi_url(self, url: str) -> str:
+        if "/fapi/" not in str(url):
+            return url
+        try:
+            parts = urlsplit(url)
+            q = f"?{parts.query}" if parts.query else ""
+            return f"{self.FAPI_BASE}{parts.path}{q}"
+        except Exception:
+            return url
+
+    def _extract_request_meta(self, resp: requests.Response) -> Tuple[str, str]:
+        method = "UNKNOWN"
+        req_url = ""
+        try:
+            req = getattr(resp, "request", None)
+            method = str(getattr(req, "method", method) or method).upper()
+            req_url = str(getattr(req, "url", "") or "")
+        except Exception:
+            pass
+        if not req_url:
+            try:
+                req_url = str(getattr(resp, "url", "") or "")
+            except Exception:
+                req_url = ""
+        if not req_url:
+            req_url = "unknown_url"
+        return method, req_url
+
+    def _print_http_error_body(self, resp: requests.Response) -> None:
+        method, req_url = self._extract_request_meta(resp)
+        if self._is_html_error(resp):
+            ctype = resp.headers.get("Content-Type", "")
+            print(f"⚠️ 返回 HTML 错误页 (content-type={ctype})，URL: {method} {req_url}，已省略正文。")
+            return
+        body = (resp.text or "").strip()
+        # 跳过 Invalid symbol 错误的打印（会在上层汇总处理）
+        try:
+            import json
+            err_data = json.loads(body)
+            if err_data.get("code") == -1121:  # Invalid symbol
+                return
+        except Exception:
+            pass
+        if len(body) > 800:
+            body = body[:800] + " ...[truncated]"
+        print(body)
+
+    def _is_invalid_symbol_error(self, resp: requests.Response) -> bool:
+        """检测是否是 Invalid symbol 错误"""
+        try:
+            import json
+            body = (resp.text or "").strip()
+            err_data = json.loads(body)
+            return err_data.get("code") == -1121  # Invalid symbol
+        except Exception:
+            return False
 
     def _is_proxy_related_error(self, error: Exception) -> bool:
         if isinstance(error, requests.exceptions.ProxyError):
@@ -124,6 +259,15 @@ class BinanceBroker:
 
     def _headers(self) -> Dict[str, str]:
         return {"X-MBX-APIKEY": self.api_key}
+
+    def _mask(self, s: Optional[str], show: int = 4) -> str:
+        """Mask a secret-ish string for safe logging."""
+        if not s:
+            return ""
+        s = str(s)
+        if len(s) <= show * 2:
+            return "*" * len(s)
+        return s[:show] + ("*" * (len(s) - show * 2)) + s[-show:]
 
     def _signed_params(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = dict(params or {})
@@ -150,6 +294,14 @@ class BinanceBroker:
         for k, v in sorted(norm.items()):
             ordered[k] = v
         ordered["signature"] = signature
+        # 可选的详细调试：打印签名前的 query 与签名（签名会被掩码），由环境变量控制
+        try:
+            if os.getenv("BINANCE_VERBOSE_SIGNING") == "1":
+                masked_sig = self._mask(signature, show=6)
+                print(f"[DEBUG] Signing query: {query}")
+                print(f"[DEBUG] Signature (masked): {masked_sig}")
+        except Exception:
+            pass
         return ordered
 
     def _normalize_value(self, v: Any) -> str:
@@ -192,12 +344,21 @@ class BinanceBroker:
         return str(data.get("code")) == "-1021"
 
     def _is_html_error(self, resp: requests.Response) -> bool:
-        content_type = (resp.headers.get("Content-Type") or "").lower()
-        if "text/html" in content_type:
-            return True
+        # 更鲁棒的 HTML 错误页检测：检查 Content-Type 或者响应体包含 HTML 标记
         try:
-            text = resp.text.lower()
-            if "<html" in text and "binance.com/en/error" in text:
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if "text/html" in content_type:
+                return True
+        except Exception:
+            pass
+
+        try:
+            text = (resp.text or "").lower()
+            # 常见 HTML 标记或 DOCTYPE
+            if "<html" in text or "<!doctype html" in text:
+                return True
+            # 特殊场景：代理返回的 Binance 错误页包含关键字
+            if "binance.com" in text and ("error" in text or "sorry" in text):
                 return True
         except Exception:
             return False
@@ -210,6 +371,7 @@ class BinanceBroker:
         params: Optional[Dict[str, Any]] = None,
         signed: bool = False,
         allow_error: bool = False,
+        close_request: bool = False,
     ) -> requests.Response:
         input_params = dict(params or {})
 
@@ -231,7 +393,6 @@ class BinanceBroker:
         # NOTE: payload must be (re)computed each attempt because timestamp/signature
         # depends on current time offset which may be resynced on -1021 errors.
         headers = self._headers()
-        is_papi = url.startswith(self.PAPI_BASE)
         method_upper = method.upper()
 
         # 自动重试连接错误和超时
@@ -246,61 +407,44 @@ class BinanceBroker:
             # recompute payload on each attempt to refresh timestamp/signature
             payload = self._signed_params(input_params) if signed else dict(input_params)
             try:
+                effective_url = self._rewrite_fapi_url(url)
+                is_papi = effective_url.startswith(self.PAPI_BASE)
+                request_proxies = self._resolve_request_proxies(close_request=close_request)
                 request_kwargs = {
                     "headers": headers,
                     "timeout": self.timeout,
-                    "proxies": None if self._force_direct else self._proxies,
+                    "proxies": request_proxies,
                 }
 
                 if is_papi and method_upper in {"POST", "PUT", "DELETE"}:
                     headers["Content-Type"] = "application/x-www-form-urlencoded"
                     resp = self._session.request(
                         method,
-                        url,
+                        effective_url,
                         data=payload,
                         **request_kwargs,
                     )
                 else:
                     resp = self._session.request(
                         method,
-                        url,
+                        effective_url,
                         params=payload,
                         **request_kwargs,
                     )
 
                 if not allow_error:
-                    if self._is_html_error(resp) and not fallback_used:
-                        fallback_used = True
-                        print("⚠️ 检测到 HTML 错误页，可能被代理重定向，尝试直连重试一次...")
-                        trust_env_original = self._session.trust_env
-                        self._session.trust_env = False
-                        try:
-                            fallback_kwargs = {
-                                "headers": headers,
-                                "timeout": self.timeout,
-                                "proxies": None,
-                            }
-                            if is_papi and method_upper in {"POST", "PUT", "DELETE"}:
-                                headers["Content-Type"] = "application/x-www-form-urlencoded"
-                                resp = self._session.request(
-                                    method,
-                                    url,
-                                    data=payload,
-                                    **fallback_kwargs,
-                                )
-                            else:
-                                resp = self._session.request(
-                                    method,
-                                    url,
-                                    params=payload,
-                                    **fallback_kwargs,
-                                )
-                            if resp.status_code < 400:
-                                self._force_direct = True
-                                print("✅ 直连成功，后续请求固定直连")
-                                return resp
-                        finally:
-                            self._session.trust_env = trust_env_original
+                    if self._is_html_error(resp):
+                        switched = False
+                        if not self._force_direct:
+                            self._force_direct = True
+                            self._session.trust_env = False
+                            switched = True
+                            print("⚠️ 检测到 HTML 错误页，已切换直连模式并重试...")
+                        elif "/fapi/" in effective_url and self._rotate_fapi_endpoint():
+                            switched = True
+                            print(f"⚠️ 检测到 HTML 错误页，切换期货端点到 {self.FAPI_BASE} 并重试...")
+                        if switched and attempt < max_retries - 1:
+                            continue
                     if resp.status_code == 400 and self._is_timestamp_error(resp):
                         print("⚠️ 检测到时间戳偏差(-1021)，正在同步服务器时间并重试...")
                         self._sync_time_offset(force=True)
@@ -315,10 +459,25 @@ class BinanceBroker:
                         if timestamp_retry_count >= timestamp_retry_limit:
                             raise RuntimeError("时间戳偏差(-1021)仍然存在，已重试多次。")
                         continue
+                    # 如果遇到权限错误，输出额外调试信息（受环境变量 BINANCE_VERBOSE_REQ 控制）
+                    if resp.status_code in (401, 403) and os.getenv("BINANCE_VERBOSE_REQ") == "1":
+                        try:
+                            method_name, req_url = self._extract_request_meta(resp)
+                            masked_key = self._mask(self.api_key, show=4)
+                            print(f"[DEBUG] 请求被拒绝：{method_name} {req_url} status={resp.status_code}")
+                            print(f"[DEBUG] 请求 headers (masked): X-MBX-APIKEY: {masked_key}")
+                            # 打印响应体的前几百字符帮助排查，但避免泄露过多信息
+                            body = (resp.text or "")
+                            snippet = body[:800] + ("...[truncated]" if len(body) > 800 else "")
+                            print(f"[DEBUG] Response body snippet: {snippet}")
+                        except Exception:
+                            pass
                     if resp.status_code >= 400:
-                        # 避免一行过长，分开打印状态码和消息
-                        print("❌ Binance Error (%s):" % (resp.status_code,))
-                        print(resp.text)
+                        # 跳过 Invalid symbol 错误的打印（会在上层汇总处理）
+                        if not self._is_invalid_symbol_error(resp):
+                            method_name, req_url = self._extract_request_meta(resp)
+                            print(f"❌ Binance Error ({resp.status_code}) [{method_name} {req_url}]:")
+                            self._print_http_error_body(resp)
                     resp.raise_for_status()
                 return resp
             except (
@@ -359,8 +518,11 @@ class BinanceBroker:
 
                         if not allow_error:
                             if resp.status_code >= 400:
-                                print("❌ Binance Error (%s):" % (resp.status_code,))
-                                print(resp.text)
+                                # 跳过 Invalid symbol 错误的打印（会在上层汇总处理）
+                                if not self._is_invalid_symbol_error(resp):
+                                    method_name, req_url = self._extract_request_meta(resp)
+                                    print(f"❌ Binance Error ({resp.status_code}) [{method_name} {req_url}]:")
+                                    self._print_http_error_body(resp)
                             resp.raise_for_status()
                         # 直连成功后固定直连（后续请求不再使用代理）
                         self._force_direct = True
@@ -389,10 +551,17 @@ class BinanceBroker:
         try:
             url = f"{self.FAPI_BASE}/fapi/v2/account"
             resp = self.request("GET", url, signed=True, allow_error=True)
+            # 如果能正常返回 200，则说明标准 API 可用
             if resp.status_code == 200:
+                return ApiCapability.STANDARD
+            # 如果返回 401/403，通常是 API key 权限或 IP 白名单问题——不应据此断定为 PAPI_ONLY，
+            # 因为这会导致后续切换到 PAPI 而触发更多权限错误。保守处理为仍然使用 STANDARD。
+            if resp.status_code in (401, 403):
+                print(f"⚠️ 探测 FAPI 能力时遇到权限错误 (status={resp.status_code})，保守使用 STANDARD 模式")
                 return ApiCapability.STANDARD
         except Exception:
             pass
+        # 未能确定为 STANDARD，回退为 PAPI_ONLY 以保持兼容性
         return ApiCapability.PAPI_ONLY
 
     def _detect_account_mode(self) -> AccountMode:
@@ -402,8 +571,12 @@ class BinanceBroker:
         try:
             url = f"{self.PAPI_BASE}/papi/v1/account"
             resp = self.request("GET", url, signed=True, allow_error=True)
+            # 只有明确返回 200 才认定为 UNIFIED；遇到 401/403 权限错误时，不要误判为 UNIFIED
             if resp.status_code == 200:
                 return AccountMode.UNIFIED
+            if resp.status_code in (401, 403):
+                print(f"⚠️ 探测 PAPI 账户模式时遇到权限错误 (status={resp.status_code})，保守使用 CLASSIC 模式")
+                return AccountMode.CLASSIC
         except Exception:
             pass
         return AccountMode.CLASSIC
@@ -585,6 +758,7 @@ class BinanceClient:
 
         self.broker = BinanceBroker(k, s, timeout=timeout)
         self.market = MarketGateway(self.broker)
+        self.broker.market = self.market
         self.position_gateway = self.broker.position
         self.balance_engine = self.broker.balance
         self._order_gateway = self.broker.order
@@ -659,6 +833,9 @@ class BinanceClient:
     def get_open_interest(self, *args, **kwargs):
         return self.market.get_open_interest(*args, **kwargs)
 
+    def get_order_book(self, *args, **kwargs):
+        return self.market.get_order_book(*args, **kwargs)
+
     def format_quantity(self, symbol: str, qty: float) -> float:
         return self.market.format_quantity(symbol, qty)
 
@@ -706,20 +883,135 @@ class BinanceClient:
         """撤销某个币种的所有条件单（STOP/TAKE_PROFIT）"""
         base = self.broker.um_base()
         if "papi" in base:
-            path = "/papi/v1/um/conditional/all"
-            url = f"{base}{path}"
-            return self.broker.request(
-                "DELETE",
-                url,
-                params={"symbol": symbol},
-                signed=True,
-            ).json()
+            # 不同账户版本的 PAPI 条件单批量撤销端点存在差异，逐个尝试并静默回退。
+            bulk_paths = [
+                "/papi/v1/um/conditional/all",
+                "/papi/v1/um/conditional/allOpenOrders",
+            ]
+            last_error: Optional[Dict[str, Any]] = None
+            for path in bulk_paths:
+                status_code, data = self._papi_request_json(
+                    method="DELETE",
+                    path=path,
+                    params={"symbol": symbol},
+                )
+                if status_code < 400:
+                    return data if isinstance(data, dict) else {"status": "success", "data": data}
+                last_error = {"status_code": status_code, "data": data, "path": path}
+
+            # 批量端点不可用时，回退为逐单撤销（best-effort）。
+            open_conditional = self.get_open_conditional_orders(symbol)
+            if not isinstance(open_conditional, list):
+                open_conditional = []
+            if not open_conditional:
+                return {
+                    "status": "noop",
+                    "symbol": symbol,
+                    "message": "no open conditional orders",
+                    "last_error": last_error,
+                }
+
+            cancelled = 0
+            failed = 0
+            for order in open_conditional:
+                if not isinstance(order, dict):
+                    continue
+                order_id = order.get("orderId")
+                strategy_id = order.get("strategyId")
+                if order_id is None and strategy_id is None:
+                    failed += 1
+                    continue
+
+                cancel_params: Dict[str, Any] = {"symbol": symbol}
+                if order_id is not None:
+                    cancel_params["orderId"] = order_id
+                if strategy_id is not None:
+                    cancel_params["strategyId"] = strategy_id
+
+                status_code, _ = self._papi_request_json(
+                    method="DELETE",
+                    path="/papi/v1/um/conditional/order",
+                    params=cancel_params,
+                )
+                if status_code < 400:
+                    cancelled += 1
+                else:
+                    failed += 1
+
+            return {
+                "status": "success" if failed == 0 else "partial",
+                "symbol": symbol,
+                "cancelled": cancelled,
+                "failed": failed,
+                "last_error": last_error,
+            }
 
         # 非 PAPI 模式：使用 allOpenOrders 统一撤销（包含条件单）
         return self.cancel_all_open_orders(symbol)
 
     def get_open_orders(self, symbol: Optional[str] = None):
         return self._order_gateway.query_open_orders(symbol)
+
+    def get_open_conditional_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        查询未触发条件单（TP/SL 等）。
+        - PAPI: 优先使用 conditional/openOrders，若端点差异则自动回退
+        - 非 PAPI: 返回空（避免与 openOrders 重复计数）
+        """
+        base = self.broker.um_base()
+        if "papi" not in base:
+            # 非 PAPI 下 openOrders 已覆盖常见条件单查询场景，这里返回空避免与 get_open_orders 重复计数
+            return []
+
+        params = {"symbol": symbol} if symbol else {}
+        candidate_paths = [
+            "/papi/v1/um/conditional/openOrders",
+            "/papi/v1/um/conditional/openOrder",
+        ]
+        for path in candidate_paths:
+            status_code, data = self._papi_request_json(
+                method="GET",
+                path=path,
+                params=params,
+            )
+            if status_code >= 400:
+                continue
+            if isinstance(data, list):
+                return [x for x in data if isinstance(x, dict)]
+            if isinstance(data, dict):
+                for key in ("orders", "data", "rows"):
+                    nested = data.get(key)
+                    if isinstance(nested, list):
+                        return [x for x in nested if isinstance(x, dict)]
+        return []
+
+    def _papi_request_json(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, Any]:
+        """
+        PAPI 请求辅助：始终 allow_error=True，返回(status_code, json_or_text)。
+        """
+        base = self.broker.um_base()
+        url = f"{base}{path}"
+        try:
+            resp = self.broker.request(
+                method=method,
+                url=url,
+                params=params or {},
+                signed=True,
+                allow_error=True,
+            )
+            code = int(getattr(resp, "status_code", 500) or 500)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"text": getattr(resp, "text", "")}
+            return code, data
+        except Exception as e:
+            return 599, {"error": str(e)}
 
     # 内部执行逻辑 (供状态机调用)
 
@@ -751,6 +1043,7 @@ class BinanceClient:
         side: IntentPositionSide,
         tp: Optional[float],
         sl: Optional[float],
+        quantity: Optional[float] = None,
     ) -> Dict[str, Any]:
         """由状态机调用的保护单下单接口"""
         if self.broker.dry_run:
@@ -784,17 +1077,61 @@ class BinanceClient:
                 "orders": [],
             }
 
+        def _normalize_protection_result(orders: Any) -> Dict[str, Any]:
+            order_list = orders if isinstance(orders, list) else []
+            ok_orders: List[Dict[str, Any]] = []
+            err_orders: List[Any] = []
+            for item in order_list:
+                if not isinstance(item, dict):
+                    err_orders.append(item)
+                    continue
+                code = item.get("code")
+                if isinstance(code, (int, float)) and code < 0:
+                    err_orders.append(item)
+                    continue
+                if item.get("orderId") is not None:
+                    ok_orders.append(item)
+                    continue
+                # 某些端点返回文本结构体，缺少 orderId 也视为失败
+                err_orders.append(item)
+
+            if len(ok_orders) == 0:
+                return {
+                    "status": "error",
+                    "message": "保护单下发失败",
+                    "orders": order_list,
+                    "ok_count": 0,
+                    "error_count": len(err_orders),
+                }
+            if len(err_orders) > 0:
+                return {
+                    "status": "partial",
+                    "message": "保护单部分成功",
+                    "orders": order_list,
+                    "ok_count": len(ok_orders),
+                    "error_count": len(err_orders),
+                }
+            return {
+                "status": "success",
+                "message": "保护单下发成功",
+                "orders": order_list,
+                "ok_count": len(ok_orders),
+                "error_count": 0,
+            }
+
         if self.broker.is_papi_only():
             manager = PapiTpSlManager(self.broker)
             cfg = TpSlConfig(
                 symbol=symbol,
                 position_side=side.value,
                 entry_price=entry_price,
+                quantity=quantity,
                 stop_loss_price=sl,
                 take_profit_price=tp,
             )
             results = manager.place_tp_sl(cfg)
-            return {"status": "success", "orders": results}
+            normalized = _normalize_protection_result(results)
+            return normalized
 
         results = self._order_gateway.place_protection_orders(
             symbol=symbol,
@@ -802,7 +1139,7 @@ class BinanceClient:
             tp=tp,
             sl=sl,
         )
-        return {"status": "success", "orders": results}
+        return _normalize_protection_result(results)
 
     def get_server_time(self):
         url = f"{self.broker.FAPI_BASE}/fapi/v1/time"

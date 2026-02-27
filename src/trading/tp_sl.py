@@ -145,7 +145,11 @@ class PapiTpSlManager:
         except Exception:
             return 0.0
         val = abs(val)
-        if val > 1.0:
+        # 统一兼容：
+        # - 0.006 => 0.6%
+        # - 0.6   => 0.6%
+        # - 1     => 1%
+        if val > 0.05:
             return val / 100.0
         return val
 
@@ -238,18 +242,39 @@ class PapiTpSlManager:
         price_dec = Decimal(str(price))
         tick_dec = Decimal(str(tick_size))
         rounded = (price_dec / tick_dec).to_integral_value(rounding=ROUND_DOWN) * tick_dec
-        return float(rounded)
+        rounded_f = float(rounded)
+        # Avoid zero/negative stop prices caused by stale or mismatched tick sizes.
+        if rounded_f <= 0 and price > 0:
+            return self._round_fallback(price)
+        return rounded_f
 
     def _get_tick_size(self, symbol: str) -> Optional[float]:
-        if symbol in self._tick_size_cache:
-            return self._tick_size_cache[symbol]
+        # Prefer market gateway symbol metadata (it matches symbol precisely).
+        try:
+            market = getattr(self.broker, "market", None)
+            if market and hasattr(market, "get_symbol_info"):
+                info = market.get_symbol_info(symbol)
+                if info:
+                    tick = float(info.get("tick_size", 0) or 0)
+                    if tick > 0:
+                        self._tick_size_cache[symbol] = tick
+                        self._save_tick_cache()
+                        return tick
+        except Exception:
+            pass
+
         try:
             url = f"{self.broker.FAPI_BASE}/fapi/v1/exchangeInfo"
             resp = self.broker.request("GET", url, params={"symbol": symbol}, signed=False)
             data = resp.json()
             symbols = data.get("symbols", []) if isinstance(data, dict) else []
-            if symbols:
-                filters = symbols[0].get("filters", [])
+            target = None
+            for s in symbols:
+                if str(s.get("symbol", "")).upper() == str(symbol).upper():
+                    target = s
+                    break
+            if target:
+                filters = target.get("filters", [])
                 for f in filters:
                     if f.get("filterType") == "PRICE_FILTER":
                         tick = float(f.get("tickSize", 0))
@@ -259,4 +284,8 @@ class PapiTpSlManager:
                             return tick
         except Exception:
             pass
+        # Last fallback: use cached value if available.
+        cached = self._tick_size_cache.get(symbol)
+        if cached and float(cached) > 0:
+            return float(cached)
         return None

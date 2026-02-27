@@ -291,7 +291,8 @@ class V5Strategy:
         gain = delta.where(delta > 0, 0).rolling(window=14).mean()
         loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
         rs = gain / loss
-        df["rsi"] = 100 - (100 / (1 + rs))
+        # use float literals to avoid type-checker operator issues with Series
+        df["rsi"] = 100.0 - (100.0 / (1.0 + rs))
 
         df["ema_5"] = close.ewm(span=5, adjust=False).mean()
         df["ema_20"] = close.ewm(span=20, adjust=False).mean()
