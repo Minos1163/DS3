@@ -29,15 +29,23 @@ class RiskManager:
         self._conflict_counters: Dict[Tuple[str, str], int] = {}
         # cooldown: key: (symbol, side) -> last protect timestamp (epoch seconds)
         self._last_protect_ts: Dict[Tuple[str, str], float] = {}
-        # 冲突保护配置阈值
+        # 冲突保护配置阈值（支持 risk.conflict_protection 覆盖）
+        risk_cfg = self.config.get("risk", {}) if isinstance(self.config, dict) else {}
+        conflict_cfg = risk_cfg.get("conflict_protection", {}) if isinstance(risk_cfg.get("conflict_protection"), dict) else {}
         self._conflict_cfg = {
-            "cvd_min": 0.3,           # CVD 最小阈值（避免噪声）
-            "conflict_hard": 0.8,     # 重度冲突阈值
-            "macd_weak": 0.4,         # MACD 弱信号阈值
-            "confirm_bars": 2,        # 连续确认根数
-            "same_macd_min": 0.25,    # 判定"MACD 与持仓同向"的最小强度（提升抗噪）
-            "cooldown_sec": 60.0,     # 同一(symbol,side)保护动作冷却（避免频繁 tighten/撤挂）
-            "neutral_decay": 1,       # 中性时冲突计数衰减步长（避免立刻清零抖动）
+            "cvd_min": float(conflict_cfg.get("cvd_min", 0.3)),                    # CVD 最小阈值（避免噪声）
+            "conflict_hard": float(conflict_cfg.get("conflict_hard", 0.8)),        # 回退路径重度冲突阈值
+            "macd_weak": float(conflict_cfg.get("macd_weak", 0.4)),                # MACD 弱信号阈值
+            "light_confirm_bars": int(conflict_cfg.get("light_confirm_bars", 2)),  # 连续2根才进入 LIGHT
+            "hard_confirm_bars": int(conflict_cfg.get("hard_confirm_bars", 4)),    # 连续4根才进入 HARD
+            "same_macd_min": float(conflict_cfg.get("same_macd_min", 0.25)),       # 判定"MACD 与持仓同向"最小强度
+            "cooldown_sec": float(conflict_cfg.get("cooldown_sec", 60.0)),         # 同一(symbol,side)保护动作冷却
+            "neutral_decay": int(conflict_cfg.get("neutral_decay", 1)),             # 中性时冲突计数衰减步长
+            "trend_light_tighten": bool(conflict_cfg.get("trend_light_tighten", False)),  # TREND+LIGHT 默认不收紧止损
+            "ev_conflict_light_min": float(conflict_cfg.get("ev_conflict_light_min", 0.12)),
+            "ev_conflict_hard_min": float(conflict_cfg.get("ev_conflict_hard_min", 0.30)),
+            "ev_conflict_hard_delta": float(conflict_cfg.get("ev_conflict_hard_delta", 0.08)),
+            "lw_assist_min": float(conflict_cfg.get("lw_assist_min", 0.18)),
         }
 
         # ========== 冲突保护行为统计器 ==========
@@ -45,8 +53,8 @@ class RiskManager:
         self._protect_stats: Dict[str, Any] = {
             "levels": {"confirm": 0, "neutral": 0, "conflict_light": 0, "conflict_hard": 0},
             "actions": {
-                "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
-                "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+                "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "skipped_not_ready": 0, "error": 0},
+                "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "skipped_not_ready": 0, "error": 0},
                 "reduce": {"triggered": 0},
             },
         }
@@ -63,8 +71,8 @@ class RiskManager:
             self._protect_stats_by_key[key] = {
                 "levels": {"confirm": 0, "neutral": 0, "conflict_light": 0, "conflict_hard": 0},
                 "actions": {
-                    "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
-                    "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+                    "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "skipped_not_ready": 0, "error": 0},
+                    "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "skipped_not_ready": 0, "error": 0},
                     "reduce": {"triggered": 0},
                 },
             }
@@ -108,7 +116,7 @@ class RiskManager:
             symbol: 交易对
             side: 持仓方向
             action: tighten / breakeven / reduce
-            outcome: applied | attempt | skipped_cooldown | skipped_not_tighter | error | triggered
+            outcome: applied | attempt | skipped_cooldown | skipped_not_tighter | skipped_not_ready | error | triggered
             level: 保护级别
             detail: 额外详情
         """
@@ -154,8 +162,8 @@ class RiskManager:
         """清空统计（不清空 counters / cooldown 状态）"""
         self._protect_stats["levels"] = {"confirm": 0, "neutral": 0, "conflict_light": 0, "conflict_hard": 0}
         self._protect_stats["actions"] = {
-            "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
-            "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "error": 0},
+            "tighten": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "skipped_not_ready": 0, "error": 0},
+            "breakeven": {"attempt": 0, "applied": 0, "skipped_cooldown": 0, "skipped_not_tighter": 0, "skipped_not_ready": 0, "error": 0},
             "reduce": {"triggered": 0},
         }
         self._protect_stats_by_key.clear()
@@ -169,8 +177,8 @@ class RiskManager:
         parts = [
             f"LV(confirm={lv['confirm']}, neutral={lv['neutral']}, light={lv['conflict_light']}, hard={lv['conflict_hard']})",
             "ACT("
-            f"tighten[a={act['tighten']['attempt']}, ok={act['tighten']['applied']}, cd={act['tighten']['skipped_cooldown']}, nt={act['tighten']['skipped_not_tighter']}, err={act['tighten']['error']}], "
-            f"be[a={act['breakeven']['attempt']}, ok={act['breakeven']['applied']}, cd={act['breakeven']['skipped_cooldown']}, nt={act['breakeven']['skipped_not_tighter']}, err={act['breakeven']['error']}], "
+            f"tighten[a={act['tighten']['attempt']}, ok={act['tighten']['applied']}, cd={act['tighten']['skipped_cooldown']}, nt={act['tighten']['skipped_not_tighter']}, nr={act['tighten']['skipped_not_ready']}, err={act['tighten']['error']}], "
+            f"be[a={act['breakeven']['attempt']}, ok={act['breakeven']['applied']}, cd={act['breakeven']['skipped_cooldown']}, nt={act['breakeven']['skipped_not_tighter']}, nr={act['breakeven']['skipped_not_ready']}, err={act['breakeven']['error']}], "
             f"reduce={act['reduce']['triggered']}"
             ")",
         ]
@@ -371,13 +379,14 @@ class RiskManager:
         lw_score: Optional[float] = None,
         macd_strength: Optional[float] = None,
         now_ts: Optional[float] = None,
+        market_regime: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         检查持仓保护状态（基于 MACD/CVD 冲突）
 
         用于保护已有持仓，而非决定方向。
         - 确认增强：MACD 同向 + CVD 同向 → 允许加仓/持有
-        - 轻度冲突：MACD 同向 + CVD 反向（中等） → 冻结加仓、收紧止损
+        - 轻度冲突：MACD 同向 + CVD 反向（中等） → 冻结加仓（TREND 默认不收紧止损）
         - 重度冲突：MACD 同向 + CVD 反向（强）+ 连续 → 减仓/提前保本
 
         Args:
@@ -410,10 +419,15 @@ class RiskManager:
         cvd_min = cfg["cvd_min"]
         conflict_hard = cfg["conflict_hard"]
         macd_weak = cfg["macd_weak"]
-        confirm_bars = cfg["confirm_bars"]
+        light_confirm_bars = max(1, int(cfg.get("light_confirm_bars", 2)))
+        hard_confirm_bars = max(light_confirm_bars, int(cfg.get("hard_confirm_bars", 3)))
         same_macd_min = cfg.get("same_macd_min", 0.25)
         cooldown_sec = float(cfg.get("cooldown_sec", 60.0))
         neutral_decay = int(cfg.get("neutral_decay", 1))
+        trend_light_tighten = bool(cfg.get("trend_light_tighten", False))
+
+        regime = str(market_regime or "").upper()
+        is_trend = regime == "TREND"
 
         key = (symbol, str(position_side).upper())
         # caller can pass loop timestamp; otherwise fallback to "now"
@@ -453,9 +467,10 @@ class RiskManager:
         # ========== EV 主导持仓保护 ==========
         # 经验结论：持仓后以 EV 为主，LW 只做辅助确认/降噪，MACD/CVD 作为回退。
         ev_confirm_min = 0.10
-        ev_conflict_light_min = 0.12
-        ev_conflict_hard_min = 0.30
-        lw_assist_min = 0.18
+        ev_conflict_light_min = max(0.0, float(cfg.get("ev_conflict_light_min", 0.12)))
+        ev_conflict_hard_min = max(ev_conflict_light_min, float(cfg.get("ev_conflict_hard_min", 0.30)))
+        ev_conflict_hard_delta = max(0.0, float(cfg.get("ev_conflict_hard_delta", 0.08)))
+        lw_assist_min = max(0.0, float(cfg.get("lw_assist_min", 0.18)))
 
         if ev_dir != 0:
             same_ev = ev_dir == pos_dir
@@ -486,9 +501,34 @@ class RiskManager:
                     conflict_score -= 0.08
                 conflict_score = max(0.0, min(1.0, conflict_score))
 
+                # 第 1 根冲突先观察，避免开仓后立即被噪声扰动出局
+                if conflict_bars < light_confirm_bars:
+                    result.update({
+                        "level": "neutral",
+                        "allow_add": True,
+                        "tighten_trailing": False,
+                        "risk_penalty": conflict_score,
+                        "conflict_bars": conflict_bars,
+                        "reason": (
+                            f"EV冲突待确认: pos={position_side} ev={ev_dir_raw}({float(ev_score or 0.0):+.2f}) "
+                            f"lw={lw_dir_raw}({float(lw_score or 0.0):+.2f}) bars={conflict_bars}/{light_confirm_bars}"
+                        ),
+                    })
+                    self.record_protection_level(
+                        symbol,
+                        position_side,
+                        "neutral",
+                        reason=result.get("reason", ""),
+                        extra={"source": "ev_pending", "conflict_bars": conflict_bars, "risk_penalty": conflict_score},
+                    )
+                    return result
+
                 is_hard_conflict = (
-                    conflict_score >= ev_conflict_hard_min
-                    or (conflict_bars >= confirm_bars and conflict_score >= (ev_conflict_light_min + 0.05))
+                    conflict_bars >= hard_confirm_bars
+                    and (
+                        conflict_score >= ev_conflict_hard_min
+                        or conflict_score >= (ev_conflict_light_min + ev_conflict_hard_delta)
+                    )
                 )
                 result["cooldown_active"] = bool(cooldown_active)
                 if is_hard_conflict:
@@ -510,7 +550,7 @@ class RiskManager:
                     result.update({
                         "level": "conflict_light",
                         "allow_add": False,
-                        "tighten_trailing": True,
+                        "tighten_trailing": (not is_trend) or trend_light_tighten,
                         "risk_penalty": conflict_score,
                         "conflict_bars": conflict_bars,
                         "reason": (
@@ -563,12 +603,34 @@ class RiskManager:
             is_hard_conflict = (
                 abs(cvd_norm) > conflict_hard
                 and strength < macd_weak
-                and conflict_bars >= confirm_bars
+                and conflict_bars >= hard_confirm_bars
             )
 
             # If cooldown is active, we still report the conflict status
             # but advise caller to avoid repeated tighten/re-hang actions.
             result["cooldown_active"] = bool(cooldown_active)
+
+            # 第 1 根冲突仅观察，不立刻进入保护动作
+            if conflict_bars < light_confirm_bars:
+                result.update({
+                    "level": "neutral",
+                    "allow_add": True,
+                    "tighten_trailing": False,
+                    "risk_penalty": risk_penalty,
+                    "conflict_bars": conflict_bars,
+                    "reason": (
+                        f"冲突待确认: pos={position_side} macd={macd_hist_norm:+.2f} "
+                        f"cvd={cvd_norm:+.2f} bars={conflict_bars}/{light_confirm_bars}"
+                    ),
+                })
+                self.record_protection_level(
+                    symbol,
+                    position_side,
+                    "neutral",
+                    reason=result.get("reason", ""),
+                    extra={"source": "macd_cvd_pending", "conflict_bars": conflict_bars, "risk_penalty": risk_penalty},
+                )
+                return result
 
             if is_hard_conflict:
                 # ========== 重度冲突 ==========
@@ -590,7 +652,7 @@ class RiskManager:
                 result.update({
                     "level": "conflict_light",
                     "allow_add": False,
-                    "tighten_trailing": True,
+                    "tighten_trailing": (not is_trend) or trend_light_tighten,
                     "risk_penalty": risk_penalty,
                     "conflict_bars": conflict_bars,
                     "reason": (

@@ -248,8 +248,10 @@ class TradingBot:
         self._daily_open_date: Optional[str] = None
         self._peak_equity: Optional[float] = None
         self._position_first_seen_ts: Dict[str, float] = {}
+        self._position_extrema_by_pos: Dict[str, Dict[str, float]] = {}
         self._protection_missing_since_ts: Dict[str, float] = {}
         self._protection_last_alert_ts: Dict[str, float] = {}
+        self._pre_risk_exit_streak_by_pos: Dict[str, int] = {}
         self._dca_stage_by_pos: Dict[str, int] = {}
         self._opened_symbols_this_cycle: set[str] = set()
         self._volatility_spike_streak_by_symbol: Dict[str, int] = {}
@@ -1150,10 +1152,34 @@ class TradingBot:
         gate_cfg = ff_cfg.get("pretrade_risk_gate", {}) if isinstance(ff_cfg.get("pretrade_risk_gate"), dict) else {}
         defaults = RiskConfig()
         volatility_cap = max(1e-6, self._normalize_percent_to_ratio(gate_cfg.get("volatility_cap", 0.01), 0.01))
+        block_actions_raw = gate_cfg.get("entry_block_actions", ["EXIT", "BLOCK", "AVOID"])
+        if not isinstance(block_actions_raw, list):
+            block_actions_raw = ["EXIT", "BLOCK", "AVOID"]
+        entry_block_actions = [str(x).upper() for x in block_actions_raw if str(x).strip()]
+        if not entry_block_actions:
+            entry_block_actions = ["EXIT", "BLOCK", "AVOID"]
         return {
             "enabled": bool(gate_cfg.get("enabled", True)),
             "force_exit_on_gate": bool(gate_cfg.get("force_exit_on_gate", True)),
+            "entry_block_actions": entry_block_actions,
+            "entry_hold_portion_scale": min(1.0, max(0.1, self._to_float(gate_cfg.get("entry_hold_portion_scale", 0.6), 0.6))),
+            "entry_hold_leverage_cap": max(1.0, self._to_float(gate_cfg.get("entry_hold_leverage_cap", 2.0), 2.0)),
             "exit_close_ratio": min(1.0, max(0.1, self._to_float(gate_cfg.get("exit_close_ratio", 1.0), 1.0))),
+            "exit_score_threshold": min(
+                1.0,
+                max(0.0, self._to_float(gate_cfg.get("exit_score_threshold", 0.12), 0.12)),
+            ),
+            "exit_confirm_bars": max(1, int(self._to_float(gate_cfg.get("exit_confirm_bars", 2), 2))),
+            "exit_min_hold_seconds": max(0, int(self._to_float(gate_cfg.get("exit_min_hold_seconds", 300), 300))),
+            "exit_require_price_followthrough": bool(gate_cfg.get("exit_require_price_followthrough", True)),
+            "exit_price_change_min": max(
+                0.0,
+                self._normalize_percent_to_ratio(gate_cfg.get("exit_price_change_min", 0.0006), 0.0006),
+            ),
+            "exit_drawdown_override": max(
+                0.0,
+                self._normalize_percent_to_ratio(gate_cfg.get("exit_drawdown_override", 0.01), 0.01),
+            ),
             "momentum_scale": max(1.0, self._to_float(gate_cfg.get("momentum_scale", 300.0), 300.0)),
             "volatility_cap": volatility_cap,
             "max_drawdown": max(
@@ -1442,6 +1468,8 @@ class TradingBot:
             )
             gate_action = str(gate_result.get("action", "HOLD")).upper()
             gate_score = self._to_float(gate_result.get("score"), 0.0)
+            gate_details_raw = gate_result.get("details")
+            gate_details: Dict[str, Any] = gate_details_raw if isinstance(gate_details_raw, dict) else {}
             gate_meta = {
                 "enabled": True,
                 "state": state,
@@ -1449,24 +1477,80 @@ class TradingBot:
                 "score": gate_score,
                 "enter": bool(gate_result.get("enter", False)),
                 "exit": bool(gate_result.get("exit", False)),
+                "details": gate_details,
             }
             if isinstance(md, dict):
                 md["pretrade_risk_gate"] = gate_meta
 
-            if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL) and gate_action != "ENTER":
-                base_reason = str(decision.reason or "").strip()
-                block_reason = f"PRE_RISK_BLOCK action={gate_action} score={gate_score:.3f}"
-                return (
-                    FundFlowDecision(
-                        operation=FundFlowOperation.HOLD,
+            pos_side = str(position.get("side", "")).upper() if isinstance(position, dict) else ""
+            pos_key = self._position_track_key(symbol, pos_side) if pos_side in ("LONG", "SHORT") else ""
+            if pos_key:
+                if gate_action == "EXIT":
+                    self._pre_risk_exit_streak_by_pos[pos_key] = int(self._pre_risk_exit_streak_by_pos.get(pos_key, 0) or 0) + 1
+                else:
+                    self._pre_risk_exit_streak_by_pos.pop(pos_key, None)
+
+            if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                block_actions_cfg = cfg.get("entry_block_actions", ["EXIT", "BLOCK", "AVOID"])
+                block_actions = {
+                    str(x).upper()
+                    for x in (block_actions_cfg if isinstance(block_actions_cfg, list) else ["EXIT", "BLOCK", "AVOID"])
+                    if str(x).strip()
+                }
+                if gate_action in block_actions:
+                    base_reason = str(decision.reason or "").strip()
+                    block_reason = f"PRE_RISK_BLOCK action={gate_action} score={gate_score:.3f}"
+                    return (
+                        FundFlowDecision(
+                            operation=FundFlowOperation.HOLD,
+                            symbol=symbol,
+                            target_portion_of_balance=0.0,
+                            leverage=decision.leverage,
+                            reason=f"{base_reason} | {block_reason}" if base_reason else block_reason,
+                            metadata=md if isinstance(md, dict) else {},
+                        ),
+                        gate_meta,
+                    )
+
+                if gate_action == "HOLD":
+                    portion_scale = min(1.0, max(0.1, self._to_float(cfg.get("entry_hold_portion_scale"), 0.6)))
+                    lev_cap = max(1, int(self._to_float(cfg.get("entry_hold_leverage_cap"), 2)))
+                    scaled_portion = max(
+                        0.0,
+                        min(1.0, self._to_float(decision.target_portion_of_balance, 0.0) * portion_scale),
+                    )
+                    if scaled_portion <= 0:
+                        base_reason = str(decision.reason or "").strip()
+                        block_reason = (
+                            f"PRE_RISK_BLOCK action=HOLD score={gate_score:.3f} "
+                            f"portion_scale={portion_scale:.2f}"
+                        )
+                        return (
+                            FundFlowDecision(
+                                operation=FundFlowOperation.HOLD,
+                                symbol=symbol,
+                                target_portion_of_balance=0.0,
+                                leverage=decision.leverage,
+                                reason=f"{base_reason} | {block_reason}" if base_reason else block_reason,
+                                metadata=md if isinstance(md, dict) else {},
+                            ),
+                            gate_meta,
+                        )
+                    requested_lev = int(self._to_float(decision.leverage, 1.0))
+                    scaled_lev = max(1, min(requested_lev, lev_cap))
+                    base_reason = str(decision.reason or "").strip()
+                    degrade_reason = (
+                        f"PRE_RISK_DEGRADE action=HOLD score={gate_score:.3f} "
+                        f"portion_scale={portion_scale:.2f} lev_cap={lev_cap}"
+                    )
+                    decision = FundFlowDecision(
+                        operation=decision.operation,
                         symbol=symbol,
-                        target_portion_of_balance=0.0,
-                        leverage=decision.leverage,
-                        reason=f"{base_reason} | {block_reason}" if base_reason else block_reason,
+                        target_portion_of_balance=scaled_portion,
+                        leverage=scaled_lev,
+                        reason=f"{base_reason} | {degrade_reason}" if base_reason else degrade_reason,
                         metadata=md if isinstance(md, dict) else {},
-                    ),
-                    gate_meta,
-                )
+                    )
 
             if (
                 isinstance(position, dict)
@@ -1474,6 +1558,66 @@ class TradingBot:
                 and bool(cfg.get("force_exit_on_gate", True))
                 and gate_action == "EXIT"
             ):
+                hard_block = bool(gate_details.get("hard_block", False))
+                exit_score_threshold = self._to_float(cfg.get("exit_score_threshold"), 0.12)
+                exit_confirm_bars = max(1, int(self._to_float(cfg.get("exit_confirm_bars"), 2)))
+                exit_min_hold_seconds = max(0, int(self._to_float(cfg.get("exit_min_hold_seconds"), 300)))
+                exit_require_price_followthrough = bool(cfg.get("exit_require_price_followthrough", True))
+                exit_price_change_min = abs(self._to_float(cfg.get("exit_price_change_min"), 0.0006))
+                exit_drawdown_override = abs(self._to_float(cfg.get("exit_drawdown_override"), 0.01))
+                exit_streak = int(self._pre_risk_exit_streak_by_pos.get(pos_key, 0) or 0) if pos_key else 0
+
+                hold_seconds = 0
+                if pos_key:
+                    first_seen = self._position_first_seen_ts.get(pos_key)
+                    if first_seen is not None:
+                        hold_seconds = max(0, int(time.time() - float(first_seen)))
+
+                score_ok = gate_score <= (-1.0 * exit_score_threshold)
+                hold_ok = hold_seconds >= exit_min_hold_seconds
+                drawdown_override = drawdown >= exit_drawdown_override
+                if direction == "LONG":
+                    price_followthrough = price_change <= (-1.0 * exit_price_change_min)
+                elif direction == "SHORT":
+                    price_followthrough = price_change >= exit_price_change_min
+                else:
+                    price_followthrough = False
+
+                exit_confirmed = hard_block or (
+                    score_ok
+                    and exit_streak >= exit_confirm_bars
+                    and (drawdown_override or hold_ok)
+                    and ((not exit_require_price_followthrough) or drawdown_override or price_followthrough)
+                )
+                gate_meta["exit_streak"] = exit_streak
+                gate_meta["exit_confirmed"] = bool(exit_confirmed)
+                gate_meta["exit_hold_seconds"] = hold_seconds
+                gate_meta["exit_price_change"] = price_change
+                gate_meta["exit_drawdown"] = drawdown
+                if isinstance(md, dict):
+                    md["pretrade_risk_gate"] = gate_meta
+
+                if not exit_confirmed:
+                    base_reason = str(decision.reason or "").strip()
+                    delay_reason = (
+                        "PRE_RISK_EXIT_DELAY "
+                        f"score={gate_score:.3f}/{-exit_score_threshold:.3f} "
+                        f"streak={exit_streak}/{exit_confirm_bars} "
+                        f"hold={hold_seconds}s/{exit_min_hold_seconds}s "
+                        f"pc={price_change:+.4f}"
+                    )
+                    return (
+                        FundFlowDecision(
+                            operation=FundFlowOperation.HOLD,
+                            symbol=symbol,
+                            target_portion_of_balance=0.0,
+                            leverage=decision.leverage,
+                            reason=f"{base_reason} | {delay_reason}" if base_reason else delay_reason,
+                            metadata=md if isinstance(md, dict) else {},
+                        ),
+                        gate_meta,
+                    )
+
                 close_ratio = self._to_float(cfg.get("exit_close_ratio"), 1.0)
                 base_reason = str(decision.reason or "").strip()
                 exit_reason = f"PRE_RISK_EXIT action={gate_action} score={gate_score:.3f}"
@@ -2280,6 +2424,34 @@ class TradingBot:
     def _position_track_key(symbol: str, side: str) -> str:
         return f"{str(symbol).upper()}:{str(side).upper()}"
 
+    def _update_position_extrema(self, symbol: str, position: Dict[str, Any], current_price: float) -> None:
+        side = str(position.get("side", "")).upper()
+        if side not in ("LONG", "SHORT") or current_price <= 0:
+            return
+        entry_price = self._to_float(position.get("entry_price"), 0.0)
+        if entry_price <= 0:
+            return
+        if side == "LONG":
+            pnl_ratio = (current_price - entry_price) / entry_price
+        else:
+            pnl_ratio = (entry_price - current_price) / entry_price
+        key = self._position_track_key(symbol, side)
+        rec_raw = self._position_extrema_by_pos.get(key)
+        rec: Dict[str, float] = rec_raw if isinstance(rec_raw, dict) else {}
+        if not rec:
+            self._position_extrema_by_pos[key] = {
+                "max_favorable_ratio": float(pnl_ratio),
+                "max_adverse_ratio": float(pnl_ratio),
+                "last_ratio": float(pnl_ratio),
+                "updated_ts": float(time.time()),
+            }
+            return
+        rec["max_favorable_ratio"] = max(float(rec.get("max_favorable_ratio", pnl_ratio)), float(pnl_ratio))
+        rec["max_adverse_ratio"] = min(float(rec.get("max_adverse_ratio", pnl_ratio)), float(pnl_ratio))
+        rec["last_ratio"] = float(pnl_ratio)
+        rec["updated_ts"] = float(time.time())
+        self._position_extrema_by_pos[key] = rec
+
     def _clear_dca_tracking_for_symbol(self, symbol: str, keep_key: Optional[str] = None) -> None:
         prefix = f"{str(symbol).upper()}:"
         keys = [k for k in list(self._dca_stage_by_pos.keys()) if k.startswith(prefix) and (keep_key is None or k != keep_key)]
@@ -2293,8 +2465,10 @@ class TradingBot:
         prefix = f"{str(symbol).upper()}:"
         for store in (
             self._position_first_seen_ts,
+            self._position_extrema_by_pos,
             self._protection_missing_since_ts,
             self._protection_last_alert_ts,
+            self._pre_risk_exit_streak_by_pos,
         ):
             keys = [k for k in list(store.keys()) if k.startswith(prefix) and (keep_key is None or k != keep_key)]
             for key in keys:
@@ -2483,6 +2657,8 @@ class TradingBot:
         current_price: float,
         force_break_even: bool = False,
         tighten_ratio: float = 0.5,
+        atr_pct: Optional[float] = None,
+        min_atr_multiple: float = 1.8,
         cooldown_sec: float = 60.0,
     ) -> Dict[str, Any]:
         """
@@ -2494,6 +2670,8 @@ class TradingBot:
             current_price: 当前价格
             force_break_even: 是否强制保本止损
             tighten_ratio: 收紧比例 (0.5 表示止损距离减半)
+            atr_pct: 当前周期 ATR 百分比（例如 0.0035）
+            min_atr_multiple: 收紧后至少保留的 ATR 距离倍数
             cooldown_sec: 冷却时间（秒），避免频繁撤挂
 
         Returns:
@@ -2510,6 +2688,11 @@ class TradingBot:
 
         ff_cfg = self.config.get("fund_flow", {}) or {}
         risk_cfg = self.config.get("risk", {}) or {}
+        conflict_cfg = (
+            risk_cfg.get("conflict_protection", {})
+            if isinstance(risk_cfg.get("conflict_protection"), dict)
+            else {}
+        )
         sl_raw = ff_cfg.get("stop_loss_pct", risk_cfg.get("stop_loss_default_percent"))
         sl_pct = self._normalize_percent(sl_raw, 0.01)
 
@@ -2520,6 +2703,18 @@ class TradingBot:
         else:
             # 按比例收紧
             sl_pct_tightened = sl_pct * tighten_ratio
+
+        # 允许配置覆盖默认 ATR 保护距离
+        atr_multiple = max(
+            0.5,
+            self._to_float(conflict_cfg.get("tighten_min_atr_multiple"), float(min_atr_multiple)),
+        )
+        atr_pct_use = abs(self._to_float(atr_pct, 0.0))
+        if atr_pct_use <= 0:
+            atr_pct_use = abs(self._to_float(conflict_cfg.get("atr_pct_fallback", 0.0), 0.0))
+        min_sl_distance_ratio = 0.0
+        if atr_pct_use > 0:
+            min_sl_distance_ratio = min(0.20, atr_pct_use * atr_multiple)
 
         # 计算新的止损价格
         # IMPORTANT: 保本止损方向必须正确，避免立即触发
@@ -2538,6 +2733,20 @@ class TradingBot:
                 stop_loss = current_price * (1.0 + sl_pct_tightened)
             side_enum = IntentPositionSide.SHORT
 
+        # ATR 防过紧：保留最小波动呼吸空间，避免 1 根K 噪声扫损
+        atr_guard_applied = False
+        if min_sl_distance_ratio > 0 and current_price > 0:
+            if side == "LONG":
+                max_allowed_sl = current_price * (1.0 - min_sl_distance_ratio)
+                if stop_loss > max_allowed_sl:
+                    stop_loss = max_allowed_sl
+                    atr_guard_applied = True
+            else:
+                min_allowed_sl = current_price * (1.0 + min_sl_distance_ratio)
+                if stop_loss < min_allowed_sl:
+                    stop_loss = min_allowed_sl
+                    atr_guard_applied = True
+
         # ========== avoid frequent cancel/recreate ==========
         if not hasattr(self, "_sl_tighten_last_ts"):
             self._sl_tighten_last_ts = {}
@@ -2549,6 +2758,9 @@ class TradingBot:
                 "message": f"cooldown_active: {symbol} {side} ({now_ts - last_ts:.0f}s < {cooldown_sec:.0f}s)",
                 "old_sl": None,
                 "new_sl": float(stop_loss),
+                "atr_guard_applied": atr_guard_applied,
+                "atr_pct": atr_pct_use,
+                "min_sl_distance_ratio": min_sl_distance_ratio,
             }
 
         # 取消现有止损单
@@ -2569,6 +2781,9 @@ class TradingBot:
                     "message": "not_tighter",
                     "old_sl": old_sl,
                     "new_sl": new_sl,
+                    "atr_guard_applied": atr_guard_applied,
+                    "atr_pct": atr_pct_use,
+                    "min_sl_distance_ratio": min_sl_distance_ratio,
                 }
 
             for order in existing_orders:
@@ -2597,10 +2812,27 @@ class TradingBot:
             f"🛡️ {symbol} {action_desc} | side={side} "
             f"entry={entry_price:.6f} "
             f"old_sl={old_sl:.6f} → new_sl={float(stop_loss):.6f} "
-            f"qty={qty:.4f}"
+            f"qty={qty:.4f} "
+            f"atr={atr_pct_use:.4f} min_dist={min_sl_distance_ratio:.4f} guard={'Y' if atr_guard_applied else 'N'}"
         )
 
-        return result
+        if isinstance(result, dict):
+            enriched = dict(result)
+            enriched.setdefault("old_sl", old_sl)
+            enriched["new_sl"] = float(stop_loss)
+            enriched["atr_guard_applied"] = atr_guard_applied
+            enriched["atr_pct"] = atr_pct_use
+            enriched["min_sl_distance_ratio"] = min_sl_distance_ratio
+            return enriched
+        return {
+            "status": "unknown",
+            "old_sl": old_sl,
+            "new_sl": float(stop_loss),
+            "atr_guard_applied": atr_guard_applied,
+            "atr_pct": atr_pct_use,
+            "min_sl_distance_ratio": min_sl_distance_ratio,
+            "raw": result,
+        }
 
     def _maybe_log_conflict_protection_stats(self, interval_sec: float = 600.0):
         """定期打印冲突保护统计摘要（每 10 分钟一条）"""
@@ -2943,6 +3175,66 @@ class TradingBot:
             f"当前占比={current_portion:.2f} | "
             f"杠杆(请求/实际)={lev_req}x/{lev_applied}x"
         )
+        if decision.operation == FundFlowOperation.CLOSE:
+            pre_side = str(position.get("side", "")).upper() if isinstance(position, dict) else ""
+            pre_key = self._position_track_key(symbol, pre_side) if pre_side in ("LONG", "SHORT") else ""
+            first_seen_ts = self._position_first_seen_ts.get(pre_key) if pre_key else None
+            hold_minutes = max(0.0, (time.time() - float(first_seen_ts))) / 60.0 if first_seen_ts is not None else 0.0
+            ext_raw = self._position_extrema_by_pos.get(pre_key) if pre_key else None
+            ext: Dict[str, float] = ext_raw if isinstance(ext_raw, dict) else {}
+            mfe_pct = max(0.0, float(ext.get("max_favorable_ratio", 0.0))) * 100.0
+            mae_pct = min(0.0, float(ext.get("max_adverse_ratio", 0.0))) * 100.0
+
+            def _pos_snapshot_text(pos_obj: Any) -> str:
+                if not isinstance(pos_obj, dict):
+                    return "FLAT:0"
+                side = str(pos_obj.get("side") or pos_obj.get("positionSide") or "").upper()
+                amt_raw = self._to_float(
+                    pos_obj.get("amount", pos_obj.get("positionAmt", 0.0)),
+                    0.0,
+                )
+                amt = abs(amt_raw)
+                if side not in ("LONG", "SHORT"):
+                    if amt_raw > 0:
+                        side = "LONG"
+                    elif amt_raw < 0:
+                        side = "SHORT"
+                    else:
+                        side = "FLAT"
+                if amt <= 0:
+                    return "FLAT:0"
+                return f"{side}:{amt:.6f}"
+
+            pre_snap = _pos_snapshot_text(position)
+            post_snap = _pos_snapshot_text(position_for_log)
+            sync_live_txt = "-"
+            position_sync = execution_result.get("position_sync") if isinstance(execution_result, dict) else None
+            if isinstance(position_sync, dict):
+                live_side = str(position_sync.get("live_side") or "").upper()
+                live_size = self._to_float(position_sync.get("live_size"), 0.0)
+                if live_size <= 0:
+                    sync_live_txt = "FLAT:0"
+                else:
+                    if live_side not in ("LONG", "SHORT"):
+                        live_side = "UNK"
+                    sync_live_txt = f"{live_side}:{live_size:.6f}"
+            print(
+                f"   平仓前后仓位快照: pre={pre_snap} -> post={post_snap} | exch_live={sync_live_txt} | status={display_status}"
+            )
+            print(
+                f"   回合摘要: hold_min={hold_minutes:.1f}, "
+                f"mfe={mfe_pct:.2f}%, mae={mae_pct:.2f}%, "
+                f"exit_reason={str(decision.reason or '').strip()[:180]}"
+            )
+
+            post_amt = self._to_float(
+                position_for_log.get("amount", position_for_log.get("positionAmt", 0.0))
+                if isinstance(position_for_log, dict)
+                else 0.0,
+                0.0,
+            )
+            if pre_key and abs(post_amt) <= 0:
+                self._position_extrema_by_pos.pop(pre_key, None)
         print(
             f"   信号评分: long={long_score:.3f}, short={short_score:.3f} | "
             f"触发类型={trigger_type}"
@@ -3287,6 +3579,7 @@ class TradingBot:
                             pos_key = self._position_track_key(symbol, side)
                             if pos_key not in self._position_first_seen_ts:
                                 self._position_first_seen_ts[pos_key] = now_ts
+                            self._update_position_extrema(symbol, leg_position, current_price)
 
                             coverage = self._protection_coverage(symbol, side=side)
                             covered = bool(coverage.get("has_tp")) and bool(coverage.get("has_sl"))
@@ -3400,6 +3693,7 @@ class TradingBot:
                     self._clear_dca_tracking_for_symbol(symbol, keep_key=pos_key)
                     if pos_key not in self._position_first_seen_ts:
                         self._position_first_seen_ts[pos_key] = now_ts
+                    self._update_position_extrema(symbol, position, current_price)
 
                     coverage = self._protection_coverage(symbol, side=side)
                     covered = bool(coverage.get("has_tp")) and bool(coverage.get("has_sl"))
@@ -3702,9 +3996,16 @@ class TradingBot:
                 )
                 gate_action = str(gate_meta.get("action", "BYPASS")).upper()
                 if gate_action in ("HOLD", "EXIT", "ERROR"):
+                    extra = ""
+                    if gate_action == "EXIT":
+                        extra = (
+                            f", streak={int(self._to_float(gate_meta.get('exit_streak'), 0)):d}, "
+                            f"confirmed={1 if bool(gate_meta.get('exit_confirmed', False)) else 0}, "
+                            f"hold={int(self._to_float(gate_meta.get('exit_hold_seconds'), 0)):d}s"
+                        )
                     print(
                         f"🧭 {symbol} 前置风控Gate: action={gate_action}, "
-                        f"score={self._to_float(gate_meta.get('score'), 0.0):.3f}"
+                        f"score={self._to_float(gate_meta.get('score'), 0.0):.3f}{extra}"
                     )
                 if risk_guard_enabled and self._is_cooldown_active() and decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                     print(
@@ -3776,9 +4077,24 @@ class TradingBot:
                             lw_direction=str(decision_md.get("lw_direction", "BOTH")),
                             lw_score=self._to_float(decision_md.get("lw_score"), 0.0),
                             now_ts=time.time(),
+                            market_regime=str(decision_md.get("engine") or decision_md.get("regime") or "").upper(),
                         )
                         protection_level = protection.get("level", "neutral")
                         cooldown_active = bool(protection.get("cooldown_active", False))
+                        protection_action = "none"
+                        if protection_level == "conflict_hard":
+                            protection_action = "reduce+breakeven"
+                        elif protection_level == "conflict_light":
+                            protection_action = "freeze_add+tighten" if bool(protection.get("tighten_trailing", False)) else "freeze_add_only"
+                        gate_score_now = self._to_float(gate_meta.get("score"), 0.0)
+                        print(
+                            "🧪 风控摘要 "
+                            f"symbol={symbol} engine={str(decision_md.get('engine') or decision_md.get('regime') or '-').upper()} "
+                            f"side={current_side} entry={self._to_float(position.get('entry_price'), 0.0):.6f} "
+                            f"atr={self._to_float(decision_md.get('regime_atr_pct'), 0.0):.4f} "
+                            f"gate_score={gate_score_now:+.3f} protect={protection_level} "
+                            f"bars={int(protection.get('conflict_bars', 0) or 0)} action={protection_action}"
+                        )
 
                         # 把 allow_add 透传到 metadata，供后续"禁止加仓/禁止新开同向"逻辑使用
                         try:
@@ -3806,6 +4122,7 @@ class TradingBot:
                                         position=position,
                                         current_price=current_price,
                                         force_break_even=True,
+                                        atr_pct=self._to_float(decision_md.get("regime_atr_pct"), 0.0),
                                         cooldown_sec=60.0,
                                     )
                                     if isinstance(r, dict) and r.get("status") == "skipped":
@@ -3861,6 +4178,7 @@ class TradingBot:
                                         current_price=current_price,
                                         force_break_even=False,
                                         tighten_ratio=0.5,
+                                        atr_pct=self._to_float(decision_md.get("regime_atr_pct"), 0.0),
                                         cooldown_sec=60.0,
                                     )
                                     if isinstance(r, dict) and r.get("status") == "skipped":

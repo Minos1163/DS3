@@ -205,6 +205,25 @@ class FundFlowExecutionRouter:
         )
         return any(k in msg for k in keys)
 
+    def _is_reduce_only_rejected(self, result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        code = result.get("code")
+        try:
+            if code is not None and int(float(code)) == -2022:
+                return True
+        except Exception:
+            pass
+        msg = self._extract_message(result).lower()
+        keys = (
+            "reduceonly order is rejected",
+            "reduceonly rejected",
+            "reduce only order is rejected",
+            "reduceonly",
+            "-2022",
+        )
+        return any(k in msg for k in keys)
+
     def _sync_symbol_leverage(self, symbol: str, target_leverage: int) -> Dict[str, Any]:
         """
         将交易所该交易对杠杆同步到目标值，避免“策略显示杠杆”和“实盘实际杠杆”不一致。
@@ -246,6 +265,95 @@ class FundFlowExecutionRouter:
         side = str(position.get("side", "")).upper()
         size = float(position.get("amount", 0.0) or position.get("positionAmt", 0.0) or 0.0)
         return side, abs(size)
+
+    @staticmethod
+    def _infer_position_side(raw_position: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(raw_position, dict):
+            return ""
+        side = str(raw_position.get("positionSide", "")).upper()
+        if side in ("LONG", "SHORT"):
+            return side
+        amt = FundFlowExecutionRouter._to_float(raw_position.get("positionAmt"), 0.0)
+        if amt > 0:
+            return "LONG"
+        if amt < 0:
+            return "SHORT"
+        return ""
+
+    def _fetch_live_position_state(self, symbol: str, preferred_side: str = "") -> Dict[str, Any]:
+        """
+        从交易所实时拉取仓位，避免使用快照导致 reduce-only 方向/数量失配。
+        """
+        symbol_up = str(symbol or "").upper()
+        side_pref = str(preferred_side or "").upper()
+        try:
+            if side_pref in ("LONG", "SHORT"):
+                pos_side = self.client.get_position(symbol_up, side=side_pref)
+                amt_side = abs(self._to_float((pos_side or {}).get("positionAmt"), 0.0)) if isinstance(pos_side, dict) else 0.0
+                if amt_side > 0:
+                    return {
+                        "ok": True,
+                        "symbol": symbol_up,
+                        "side": side_pref,
+                        "size": amt_side,
+                        "source": "get_position(side)",
+                        "raw": pos_side,
+                    }
+
+            pos_any = self.client.get_position(symbol_up)
+            amt_any = abs(self._to_float((pos_any or {}).get("positionAmt"), 0.0)) if isinstance(pos_any, dict) else 0.0
+            if amt_any > 0:
+                side_any = self._infer_position_side(pos_any) or side_pref
+                return {
+                    "ok": True,
+                    "symbol": symbol_up,
+                    "side": side_any,
+                    "size": amt_any,
+                    "source": "get_position(any)",
+                    "raw": pos_any,
+                }
+
+            all_positions = self.client.get_all_positions() if hasattr(self.client, "get_all_positions") else []
+            candidates: List[Dict[str, Any]] = []
+            for p in all_positions or []:
+                if not isinstance(p, dict):
+                    continue
+                if str(p.get("symbol") or "").upper() != symbol_up:
+                    continue
+                amt = abs(self._to_float(p.get("positionAmt"), 0.0))
+                if amt <= 0:
+                    continue
+                candidates.append(p)
+            if candidates:
+                primary = max(candidates, key=lambda x: abs(self._to_float(x.get("positionAmt"), 0.0)))
+                amt_primary = abs(self._to_float(primary.get("positionAmt"), 0.0))
+                side_primary = self._infer_position_side(primary) or side_pref
+                return {
+                    "ok": True,
+                    "symbol": symbol_up,
+                    "side": side_primary,
+                    "size": amt_primary,
+                    "source": "get_all_positions",
+                    "raw": primary,
+                }
+
+            return {
+                "ok": True,
+                "symbol": symbol_up,
+                "side": "",
+                "size": 0.0,
+                "source": "flat",
+                "raw": {},
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "symbol": symbol_up,
+                "side": "",
+                "size": 0.0,
+                "source": "error",
+                "error": str(e),
+            }
 
     def _place_limit_order(
         self,
@@ -760,9 +868,41 @@ class FundFlowExecutionRouter:
                 return result
 
             if decision.operation == Operation.CLOSE:
-                position_side, position_size = self._position_from_snapshot(position)
+                snapshot_side, snapshot_size = self._position_from_snapshot(position)
+                live_position = self._fetch_live_position_state(decision.symbol, preferred_side=snapshot_side)
+                position_side = snapshot_side
+                position_size = snapshot_size
+                if live_position.get("ok"):
+                    live_side = str(live_position.get("side", "")).upper()
+                    live_size = self._to_float(live_position.get("size"), 0.0)
+                    if live_size <= 0:
+                        result = {
+                            "status": "noop",
+                            "message": "无可平仓位（交易所实时仓位为0）",
+                            "position_sync": {
+                                "snapshot_side": snapshot_side,
+                                "snapshot_size": snapshot_size,
+                                "live_side": live_side,
+                                "live_size": live_size,
+                                "source": live_position.get("source"),
+                            },
+                        }
+                        self.attribution.log_execution(decision, result)
+                        return result
+                    position_size = live_size
+                    if live_side in ("LONG", "SHORT"):
+                        position_side = live_side
                 if position_size <= 0 or position_side not in ("LONG", "SHORT"):
-                    result = {"status": "noop", "message": "无可平仓位"}
+                    result = {
+                        "status": "noop",
+                        "message": "无可平仓位",
+                        "position_sync": {
+                            "snapshot_side": snapshot_side,
+                            "snapshot_size": snapshot_size,
+                            "live_ok": bool(live_position.get("ok")),
+                            "live_error": live_position.get("error"),
+                        },
+                    }
                     self.attribution.log_execution(decision, result)
                     return result
 
@@ -828,6 +968,7 @@ class FundFlowExecutionRouter:
                             "success": self._is_success(retry_result),
                             "filled": self._is_filled(retry_result),
                             "fully_filled": self._is_fully_filled(retry_result),
+                            "reduce_only_rejected": self._is_reduce_only_rejected(retry_result),
                         }
                     )
                     if remaining_close_qty <= 0:
@@ -889,6 +1030,7 @@ class FundFlowExecutionRouter:
                                     "price": boundary_price,
                                     "success": self._is_success(fallback),
                                     "filled": self._is_filled(fallback),
+                                    "reduce_only_rejected": self._is_reduce_only_rejected(fallback),
                                 }
                             )
                             fallback_status = (
@@ -955,6 +1097,7 @@ class FundFlowExecutionRouter:
                                 "remaining_quantity": remaining_close_qty,
                                 "success": self._is_success(market_fallback),
                                 "filled": self._is_filled(market_fallback),
+                                "reduce_only_rejected": self._is_reduce_only_rejected(market_fallback),
                             }
                         )
                         market_status = (
@@ -970,6 +1113,40 @@ class FundFlowExecutionRouter:
                             "filled_quantity": filled_close_qty,
                             "remaining_quantity": remaining_close_qty,
                             "fallback": "market_reduce_only",
+                        }
+
+                reduce_only_rejected = self._is_reduce_only_rejected(final_result.get("order")) or any(
+                    bool(step.get("reduce_only_rejected")) for step in close_path
+                )
+                if final_result.get("status") == "error" and reduce_only_rejected:
+                    live_after_reject = self._fetch_live_position_state(decision.symbol, preferred_side=position_side)
+                    live_after_size = self._to_float(live_after_reject.get("size"), 0.0)
+                    if live_after_reject.get("ok") and live_after_size <= 0:
+                        final_result = {
+                            "status": "success",
+                            "operation": "close",
+                            "message": "ReduceOnly rejected，但交易所实时仓位已为0，按已平仓处理",
+                            "quantity": close_qty,
+                            "filled_quantity": filled_close_qty,
+                            "remaining_quantity": 0.0,
+                            "fallback": "reduce_only_reconciled_flat",
+                            "position_sync": {
+                                "snapshot_side": snapshot_side,
+                                "snapshot_size": snapshot_size,
+                                "live_side": live_after_reject.get("side"),
+                                "live_size": live_after_size,
+                                "source": live_after_reject.get("source"),
+                            },
+                        }
+                    else:
+                        final_result["position_sync"] = {
+                            "snapshot_side": snapshot_side,
+                            "snapshot_size": snapshot_size,
+                            "live_side": live_after_reject.get("side"),
+                            "live_size": live_after_size,
+                            "live_ok": bool(live_after_reject.get("ok")),
+                            "source": live_after_reject.get("source"),
+                            "error": live_after_reject.get("error"),
                         }
 
                 if final_result.get("status") == "error" and not final_result.get("message"):

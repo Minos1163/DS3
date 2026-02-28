@@ -27,7 +27,14 @@
     "consecutive_loss_cooldown_seconds": 1800,
     "daily_reset_timezone": "Asia/Tokyo",
     "stop_loss_default_percent": 0.012,
-    "take_profit_default_percent": 0.0
+    "take_profit_default_percent": 0.0,
+    "conflict_protection": {
+      "light_confirm_bars": 2,
+      "hard_confirm_bars": 3,
+      "cooldown_sec": 60,
+      "trend_light_tighten": false,
+      "tighten_min_atr_multiple": 1.8
+    }
   },
   "strategy": {
     "mode": "FUND_FLOW"
@@ -406,6 +413,12 @@
       "enabled": true,
       "force_exit_on_gate": true,
       "exit_close_ratio": 1.0,
+      "exit_score_threshold": 0.12,
+      "exit_confirm_bars": 2,
+      "exit_min_hold_seconds": 300,
+      "exit_require_price_followthrough": true,
+      "exit_price_change_min": 0.0006,
+      "exit_drawdown_override": 0.01,
       "entry_threshold": 0.46,
       "max_drawdown": 0.018,
       "max_exposure_per_trade": 0.3,
