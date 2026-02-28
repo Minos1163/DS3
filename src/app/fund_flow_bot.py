@@ -4087,13 +4087,26 @@ class TradingBot:
                         elif protection_level == "conflict_light":
                             protection_action = "freeze_add+tighten" if bool(protection.get("tighten_trailing", False)) else "freeze_add_only"
                         gate_score_now = self._to_float(gate_meta.get("score"), 0.0)
+                        pos_key_runtime = self._position_track_key(symbol, current_side)
+                        first_seen_runtime = self._position_first_seen_ts.get(pos_key_runtime)
+                        hold_seconds_runtime = (
+                            max(0, int(time.time() - float(first_seen_runtime)))
+                            if first_seen_runtime is not None
+                            else 0
+                        )
+                        ext_runtime_raw = self._position_extrema_by_pos.get(pos_key_runtime)
+                        ext_runtime: Dict[str, float] = ext_runtime_raw if isinstance(ext_runtime_raw, dict) else {}
+                        mfe_runtime = max(0.0, float(ext_runtime.get("max_favorable_ratio", 0.0))) * 100.0
+                        mae_runtime = min(0.0, float(ext_runtime.get("max_adverse_ratio", 0.0))) * 100.0
                         print(
                             "🧪 风控摘要 "
                             f"symbol={symbol} engine={str(decision_md.get('engine') or decision_md.get('regime') or '-').upper()} "
                             f"side={current_side} entry={self._to_float(position.get('entry_price'), 0.0):.6f} "
                             f"atr={self._to_float(decision_md.get('regime_atr_pct'), 0.0):.4f} "
                             f"gate_score={gate_score_now:+.3f} protect={protection_level} "
-                            f"bars={int(protection.get('conflict_bars', 0) or 0)} action={protection_action}"
+                            f"bars={int(protection.get('conflict_bars', 0) or 0)} "
+                            f"hold={hold_seconds_runtime}s mfe={mfe_runtime:.2f}% mae={mae_runtime:.2f}% "
+                            f"action={protection_action}"
                         )
 
                         # 把 allow_add 透传到 metadata，供后续"禁止加仓/禁止新开同向"逻辑使用
@@ -4108,9 +4121,22 @@ class TradingBot:
                         if protection_level == "conflict_hard":
                             # 重度冲突：减仓、保本止损、禁止加仓
                             reduce_pct = float(protection.get("reduce_position_pct", 0.0))
+                            k_open_hard = self._to_float(decision_md.get("last_open"), 0.0)
+                            k_close_hard = self._to_float(decision_md.get("last_close"), 0.0)
+                            price_change_hard = ((k_close_hard - k_open_hard) / k_open_hard) if k_open_hard > 0 else 0.0
+                            gate_cfg_hard = self._pretrade_risk_gate_config()
+                            hard_price_change_min = abs(self._to_float(gate_cfg_hard.get("exit_price_change_min"), 0.0012))
+                            hard_drawdown_override = abs(self._to_float(gate_cfg_hard.get("exit_drawdown_override"), 0.015))
+                            drawdown_hard = self._position_drawdown_ratio(position, current_price)
+                            if current_side == "LONG":
+                                reduce_price_confirmed = price_change_hard <= (-1.0 * hard_price_change_min)
+                            else:
+                                reduce_price_confirmed = price_change_hard >= hard_price_change_min
+                            reduce_confirmed = bool(reduce_price_confirmed or drawdown_hard >= hard_drawdown_override)
                             print(
                                 f"🛡️ {symbol} 冲突保护 HARD: {protection.get('reason')} | "
-                                f"freeze_add reduce_pos={reduce_pct:.0%} force_break_even cd={'Y' if cooldown_active else 'N'}"
+                                f"freeze_add reduce_pos={reduce_pct:.0%} force_break_even cd={'Y' if cooldown_active else 'N'} "
+                                f"reduce_confirmed={int(reduce_confirmed)}"
                             )
                             # 收紧止损（保本止损）
                             if bool(protection.get("force_break_even", False)):
@@ -4140,7 +4166,7 @@ class TradingBot:
                                     print(f"⚠️ {symbol} 保本止损失败: {e}")
                                     self.risk_manager.record_protection_action(symbol, current_side, "breakeven", "error", level=protection_level, detail={"error": str(e)})
                             # 减仓：CLOSE 的 target_portion_of_balance 在 execution_router 中解释为"持仓比例"
-                            if reduce_pct > 0:
+                            if reduce_pct > 0 and reduce_confirmed:
                                 # stats: reduce triggered
                                 self.risk_manager.record_protection_action(symbol, current_side, "reduce", "triggered", level=protection_level, detail={"reduce_pct": reduce_pct})
                                 decision = FundFlowDecision(
@@ -4159,16 +4185,42 @@ class TradingBot:
                                     "trigger_context": trigger_context,
                                 })
                                 continue
+                            if reduce_pct > 0 and not reduce_confirmed:
+                                print(
+                                    f"🛡️ {symbol} HARD减仓暂缓: "
+                                    f"drawdown={drawdown_hard:.4f}/{hard_drawdown_override:.4f}, "
+                                    f"price_change={price_change_hard:+.4f}, "
+                                    f"min_move={hard_price_change_min:.4f}"
+                                )
                             # 否则禁止加仓
                             continue
 
                         if protection_level == "conflict_light":
+                            risk_cfg_light = self.config.get("risk", {}) if isinstance(self.config, dict) else {}
+                            conflict_cfg_light = (
+                                risk_cfg_light.get("conflict_protection", {})
+                                if isinstance(risk_cfg_light.get("conflict_protection"), dict)
+                                else {}
+                            )
+                            light_min_hold_seconds = max(
+                                0,
+                                int(self._to_float(conflict_cfg_light.get("light_tighten_min_hold_seconds", 600), 600)),
+                            )
+                            light_min_mfe_ratio = max(
+                                0.0,
+                                self._normalize_percent_to_ratio(conflict_cfg_light.get("light_tighten_min_mfe", 0.0025), 0.0025),
+                            )
+                            allow_light_tighten = (
+                                hold_seconds_runtime >= light_min_hold_seconds
+                                and (mfe_runtime / 100.0) >= light_min_mfe_ratio
+                            )
                             print(
                                 f"🛡️ {symbol} 冲突保护 LIGHT: {protection.get('reason')} | "
-                                f"freeze_add tighten_trailing cd={'Y' if cooldown_active else 'N'}"
+                                f"freeze_add tighten_trailing cd={'Y' if cooldown_active else 'N'} "
+                                f"allow_tighten={int(allow_light_tighten)}"
                             )
                             # 收紧止损
-                            if bool(protection.get("tighten_trailing", False)):
+                            if bool(protection.get("tighten_trailing", False)) and allow_light_tighten:
                                 try:
                                     # stats: attempt
                                     self.risk_manager.record_protection_action(symbol, current_side, "tighten", "attempt", level=protection_level)
@@ -4195,6 +4247,25 @@ class TradingBot:
                                 except Exception as e:
                                     print(f"⚠️ {symbol} 收紧止损失败: {e}")
                                     self.risk_manager.record_protection_action(symbol, current_side, "tighten", "error", level=protection_level, detail={"error": str(e)})
+                            elif bool(protection.get("tighten_trailing", False)):
+                                print(
+                                    f"🛡️ {symbol} LIGHT收紧止损暂缓: "
+                                    f"hold={hold_seconds_runtime}s/{light_min_hold_seconds}s, "
+                                    f"mfe={mfe_runtime/100.0:.4f}/{light_min_mfe_ratio:.4f}"
+                                )
+                                self.risk_manager.record_protection_action(
+                                    symbol,
+                                    current_side,
+                                    "tighten",
+                                    "skipped_not_ready",
+                                    level=protection_level,
+                                    detail={
+                                        "hold_seconds": hold_seconds_runtime,
+                                        "hold_threshold": light_min_hold_seconds,
+                                        "mfe_ratio": mfe_runtime / 100.0,
+                                        "mfe_threshold": light_min_mfe_ratio,
+                                    },
+                                )
                             # 轻度冲突：冻结加仓/新开同向（保留持仓管理/止盈止损继续运行）
                             continue
 
