@@ -159,6 +159,58 @@ class FundFlowExecutionRouter:
 
         return qty, info
 
+    def _resolve_close_quantity(
+        self,
+        *,
+        symbol: str,
+        position_size: float,
+        target_portion: float,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        计算平仓数量。
+        当目标平仓量被交易所步长量化为 0 时，自动升级为可执行数量（优先全平当前微仓位），
+        避免风控减仓持续 noop（"平仓数量为0"）而被动等待止损。
+        """
+        info: Dict[str, Any] = {
+            "position_size": max(0.0, self._to_float(position_size, 0.0)),
+            "target_portion": max(0.0, self._to_float(target_portion, 0.0)),
+            "raw_close_quantity": 0.0,
+            "formatted_close_quantity": 0.0,
+            "promoted_to_full_close": False,
+            "promotion_reason": "",
+        }
+        pos_size = info["position_size"]
+        tgt = info["target_portion"]
+        raw_close_qty = max(0.0, pos_size * tgt)
+        info["raw_close_quantity"] = raw_close_qty
+        close_qty = raw_close_qty
+        try:
+            close_qty = float(self.client.format_quantity(symbol, close_qty))
+        except Exception:
+            pass
+        info["formatted_close_quantity"] = close_qty
+        if close_qty > 0:
+            return close_qty, info
+
+        if raw_close_qty <= 0 or pos_size <= 0:
+            info["reject_reason"] = "close_qty_zero_after_format"
+            return 0.0, info
+
+        # 微仓位兜底：若部分平仓量被格式化为 0，升级为全平当前可执行仓位。
+        full_close_qty = pos_size
+        try:
+            full_close_qty = float(self.client.format_quantity(symbol, full_close_qty))
+        except Exception:
+            pass
+        if full_close_qty > 0:
+            info["promoted_to_full_close"] = True
+            info["promotion_reason"] = "partial_qty_rounded_to_zero"
+            info["formatted_close_quantity"] = full_close_qty
+            return full_close_qty, info
+
+        info["reject_reason"] = "full_close_qty_zero_after_format"
+        return 0.0, info
+
     def _format_price(self, symbol: str, price: float) -> float:
         """Format price to exchange tick/precision to avoid -1111 precision errors."""
         if price <= 0:
@@ -906,20 +958,26 @@ class FundFlowExecutionRouter:
                     self.attribution.log_execution(decision, result)
                     return result
 
-                close_qty = round(position_size * decision.target_portion_of_balance, 6)
-                try:
-                    close_qty = float(self.client.format_quantity(decision.symbol, close_qty))
-                except Exception:
-                    pass
+                close_qty, close_qty_info = self._resolve_close_quantity(
+                    symbol=decision.symbol,
+                    position_size=position_size,
+                    target_portion=decision.target_portion_of_balance,
+                )
                 if close_qty <= 0:
-                    result = {"status": "noop", "message": "平仓数量为0"}
+                    result = {
+                        "status": "noop",
+                        "message": "平仓数量为0",
+                        "quantity_info": close_qty_info,
+                    }
                     self.attribution.log_execution(decision, result)
                     return result
 
                 base_close_price = self.risk.pick_close_price(decision, current_price, position_side)
                 base_close_price = self.risk.align_close_price(base_close_price, current_price, position_side)
                 close_side = "SELL" if position_side == "LONG" else "BUY"
-                is_full_close_target = decision.target_portion_of_balance >= 1.0
+                is_full_close_target = bool(close_qty_info.get("promoted_to_full_close")) or (
+                    decision.target_portion_of_balance >= 1.0
+                )
 
                 final_result: Dict[str, Any] = {}
                 close_path: List[Dict[str, Any]] = []
@@ -1177,6 +1235,7 @@ class FundFlowExecutionRouter:
                     )
                     final_result["remaining_quantity"] = remaining_close_qty
                 final_result["degradation_path"] = close_path
+                final_result["quantity_info"] = close_qty_info
 
                 self.attribution.log_execution(decision, final_result)
                 return final_result

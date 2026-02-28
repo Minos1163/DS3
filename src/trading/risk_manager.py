@@ -380,6 +380,8 @@ class RiskManager:
         macd_strength: Optional[float] = None,
         now_ts: Optional[float] = None,
         market_regime: Optional[str] = None,
+        ma10_ltf: Optional[float] = None,
+        last_close: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         检查持仓保护状态（基于 MACD/CVD 冲突）
@@ -400,6 +402,8 @@ class RiskManager:
             lw_score: LW 分数
             macd_strength: MACD 强度（可选，默认用 abs(macd_hist_norm)）
             now_ts: 当前时间戳（可选，用于 cooldown 检查）
+            ma10_ltf: 低周期 MA10（可选，用于趋势结构判定）
+            last_close: 低周期最新收盘价（可选，用于趋势结构判定）
 
         Returns:
             {
@@ -408,6 +412,8 @@ class RiskManager:
                 "tighten_trailing": bool,       # 是否收紧 trailing
                 "reduce_position_pct": float,   # 减仓比例 (0.0 ~ 1.0)
                 "force_break_even": bool,       # 是否强制保本止损
+                "breakeven_mode": str,          # "profit_only" / "emergency_tighten"
+                "breakeven_fee_buffer": float,  # 手续费buffer（比例）
                 "risk_penalty": float,          # 风险惩罚系数 [0, 1]
                 "conflict_bars": int,           # 连续冲突次数
                 "cooldown_active": bool,        # 是否处于 cooldown 期间
@@ -420,7 +426,7 @@ class RiskManager:
         conflict_hard = cfg["conflict_hard"]
         macd_weak = cfg["macd_weak"]
         light_confirm_bars = max(1, int(cfg.get("light_confirm_bars", 2)))
-        hard_confirm_bars = max(light_confirm_bars, int(cfg.get("hard_confirm_bars", 3)))
+        hard_confirm_bars = max(light_confirm_bars, int(cfg.get("hard_confirm_bars", 4)))
         same_macd_min = cfg.get("same_macd_min", 0.25)
         cooldown_sec = float(cfg.get("cooldown_sec", 60.0))
         neutral_decay = int(cfg.get("neutral_decay", 1))
@@ -428,6 +434,17 @@ class RiskManager:
 
         regime = str(market_regime or "").upper()
         is_trend = regime == "TREND"
+        ma10_ref = abs(float(ma10_ltf or 0.0))
+        close_ref = float(last_close or 0.0)
+
+        def _trend_structure_intact() -> bool:
+            if (not is_trend) or ma10_ref <= 0 or close_ref <= 0:
+                return False
+            if position_side == "LONG":
+                return close_ref >= ma10_ref
+            if position_side == "SHORT":
+                return close_ref <= ma10_ref
+            return False
 
         key = (symbol, str(position_side).upper())
         # caller can pass loop timestamp; otherwise fallback to "now"
@@ -440,6 +457,8 @@ class RiskManager:
             "tighten_trailing": False,
             "reduce_position_pct": 0.0,
             "force_break_even": False,
+            "breakeven_mode": "",
+            "breakeven_fee_buffer": 0.0,
             "risk_penalty": 0.0,
             "conflict_bars": 0,
             "cooldown_active": False,
@@ -491,7 +510,11 @@ class RiskManager:
                 return result
 
             if against_ev and ev_score_abs >= ev_conflict_light_min:
-                self._conflict_counters[key] = self._conflict_counters.get(key, 0) + 1
+                if _trend_structure_intact():
+                    prev = int(self._conflict_counters.get(key, 0) or 0)
+                    self._conflict_counters[key] = max(0, prev - 1)
+                else:
+                    self._conflict_counters[key] = int(self._conflict_counters.get(key, 0) or 0) + 1
                 conflict_bars = self._conflict_counters[key]
                 conflict_score = ev_score_abs
                 # LW 与 EV 同向（都反持仓）时，提升冲突等级；反之降级
@@ -538,6 +561,8 @@ class RiskManager:
                         "tighten_trailing": True,
                         "reduce_position_pct": 0.25,
                         "force_break_even": True,
+                        "breakeven_mode": "profit_only",
+                        "breakeven_fee_buffer": max(0.0, float(cfg.get("breakeven_fee_buffer", 0.0010))),
                         "risk_penalty": conflict_score,
                         "conflict_bars": conflict_bars,
                         "reason": (
@@ -593,7 +618,11 @@ class RiskManager:
 
         if conflict:
             # 更新冲突计数
-            self._conflict_counters[key] = self._conflict_counters.get(key, 0) + 1
+            if _trend_structure_intact():
+                prev = int(self._conflict_counters.get(key, 0) or 0)
+                self._conflict_counters[key] = max(0, prev - 1)
+            else:
+                self._conflict_counters[key] = int(self._conflict_counters.get(key, 0) or 0) + 1
             conflict_bars = self._conflict_counters[key]
 
             # 风险惩罚系数
@@ -640,6 +669,8 @@ class RiskManager:
                     "tighten_trailing": True,
                     "reduce_position_pct": 0.25,  # 减仓 25%
                     "force_break_even": True,
+                    "breakeven_mode": "profit_only",
+                    "breakeven_fee_buffer": max(0.0, float(cfg.get("breakeven_fee_buffer", 0.0010))),
                     "risk_penalty": risk_penalty,
                     "conflict_bars": conflict_bars,
                     "reason": (

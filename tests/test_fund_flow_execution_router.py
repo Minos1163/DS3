@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 from src.fund_flow.attribution_engine import FundFlowAttributionEngine
@@ -36,6 +37,13 @@ class _FakeClient:
     def cancel_all_open_orders(self, symbol):
         self.cancel_calls.append(symbol)
         return {"status": "success"}
+
+
+class _FloorQtyClient(_FakeClient):
+    def format_quantity(self, _symbol, qty):
+        step = 0.001
+        val = math.floor(float(qty) / step) * step
+        return round(val, 3)
 
 
 def _risk_cfg():
@@ -110,3 +118,35 @@ def test_close_ioc_retry_then_success(tmp_path: Path):
     assert result["retry_index"] == 2
     assert len(client.calls) == 3
     assert client.calls[0]["reduce_only"] is True
+
+
+def test_close_partial_qty_rounded_to_zero_promotes_to_full_close(tmp_path: Path):
+    client = _FloorQtyClient(
+        responses=[
+            {"status": "FILLED", "executedQty": "0.002", "orderId": 777},
+        ]
+    )
+    risk = FundFlowRiskEngine(_risk_cfg(), symbol_whitelist=["BTCUSDT"])
+    attr = FundFlowAttributionEngine(str(tmp_path))
+    router = FundFlowExecutionRouter(client, risk, attr, close_retry_times=2)
+
+    decision = FundFlowDecision(
+        operation=Operation.CLOSE,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.25,
+        leverage=2,
+        min_price=99.0,
+    )
+    result = router.execute_decision(
+        decision=decision,
+        account_state={"available_balance": 1000.0},
+        current_price=100.0,
+        position={"side": "LONG", "amount": 0.002},
+    )
+
+    assert result["status"] == "success"
+    assert result["quantity"] == 0.002
+    assert result["quantity_info"]["promoted_to_full_close"] is True
+    assert result["quantity_info"]["promotion_reason"] == "partial_qty_rounded_to_zero"
+    assert len(client.calls) == 1
+    assert client.calls[0]["params"]["quantity"] == 0.002

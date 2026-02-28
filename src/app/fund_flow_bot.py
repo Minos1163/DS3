@@ -1287,6 +1287,50 @@ class TradingBot:
             ),
         }
 
+    def _ma10_macd_confluence_config(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) or {}
+        raw = ff_cfg.get("ma10_macd_confluence", {}) if isinstance(ff_cfg.get("ma10_macd_confluence"), dict) else {}
+        tf_exec = str(raw.get("tf_exec", raw.get("exec_tf", "5m")) or "5m").strip().lower()
+        tf_anchor = str(raw.get("tf_anchor", raw.get("anchor_tf", "1h")) or "1h").strip().lower()
+        allowed_tf = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"}
+        if tf_exec not in allowed_tf:
+            tf_exec = "5m"
+        if tf_anchor not in allowed_tf:
+            tf_anchor = "1h"
+        return {
+            "enabled": bool(raw.get("enabled", True)),
+            "tf_exec": tf_exec,
+            "tf_anchor": tf_anchor,
+            "ma_period": max(2, int(self._to_float(raw.get("ma_period", 10), 10))),
+            "macd_fast": max(2, int(self._to_float(raw.get("macd_fast", 12), 12))),
+            "macd_slow": max(3, int(self._to_float(raw.get("macd_slow", 26), 26))),
+            "macd_signal": max(2, int(self._to_float(raw.get("macd_signal", 9), 9))),
+            "kline_limit_exec": max(40, int(self._to_float(raw.get("kline_limit_exec", 160), 160))),
+            "kline_limit_anchor": max(20, int(self._to_float(raw.get("kline_limit_anchor", 80), 80))),
+            "entry_hard_filter": bool(raw.get("entry_hard_filter", True)),
+            "entry_require_macd_trigger": bool(raw.get("entry_require_macd_trigger", True)),
+            "block_on_opposite_bias": bool(raw.get("block_on_opposite_bias", True)),
+            "buy_cross": str(raw.get("buy_cross", "GOLDEN") or "GOLDEN").upper(),
+            "sell_cross": str(raw.get("sell_cross", "DEAD") or "DEAD").upper(),
+            "buy_block_zone": str(raw.get("buy_block_zone", "BELOW_ZERO") or "BELOW_ZERO").upper(),
+            "sell_block_zone": str(raw.get("sell_block_zone", "ABOVE_ZERO") or "ABOVE_ZERO").upper(),
+            "neutral_bias_mode": str(raw.get("neutral_bias_mode", "degrade") or "degrade").strip().lower(),
+            "neutral_bias_portion_scale": min(
+                1.0,
+                max(0.1, self._to_float(raw.get("neutral_bias_portion_scale", 0.6), 0.6)),
+            ),
+            "neutral_bias_leverage_cap": max(1, int(self._to_float(raw.get("neutral_bias_leverage_cap", 2), 2))),
+            "bias_boost": min(0.5, max(0.0, self._to_float(raw.get("bias_boost", 0.12), 0.12))),
+            "bias_penalty": min(0.5, max(0.0, self._to_float(raw.get("bias_penalty", 0.10), 0.10))),
+            "cross_boost": min(0.5, max(0.0, self._to_float(raw.get("cross_boost", 0.06), 0.06))),
+            "zone_boost": min(0.5, max(0.0, self._to_float(raw.get("zone_boost", 0.04), 0.04))),
+            "hist_boost": min(0.5, max(0.0, self._to_float(raw.get("hist_boost", 0.03), 0.03))),
+            "max_adjust": min(1.0, max(0.0, self._to_float(raw.get("max_adjust", 0.25), 0.25))),
+            "exit_anchor_enabled": bool(raw.get("exit_anchor_enabled", True)),
+            "exit_anchor_require_hist_expand": bool(raw.get("exit_anchor_require_hist_expand", True)),
+            "exit_anchor_skip_on_hard_block": bool(raw.get("exit_anchor_skip_on_hard_block", True)),
+        }
+
     @staticmethod
     def _timeframe_seconds(tf: str) -> int:
         mapping = {
@@ -1306,6 +1350,195 @@ class TradingBot:
         ts = float(now_ts) if now_ts is not None else time.time()
         bucket = int(ts // sec)
         return f"{str(tf).strip().lower()}:{bucket}"
+
+    @staticmethod
+    def _sma(values: List[float], period: int) -> float:
+        n = int(period)
+        if n <= 0 or not values or len(values) < n:
+            return 0.0
+        window = values[-n:]
+        return float(sum(window) / float(n))
+
+    @staticmethod
+    def _ema_series(values: List[float], period: int) -> List[float]:
+        n = int(period)
+        if n <= 0 or not values:
+            return []
+        k = 2.0 / (float(n) + 1.0)
+        ema: List[float] = []
+        prev = float(values[0])
+        for raw in values:
+            x = float(raw)
+            prev = (x - prev) * k + prev
+            ema.append(prev)
+        return ema
+
+    @staticmethod
+    def _extract_closes_from_klines(klines: Any) -> List[float]:
+        closes: List[float] = []
+        if not isinstance(klines, list):
+            return closes
+        for item in klines:
+            try:
+                if isinstance(item, (list, tuple)) and len(item) > 4:
+                    closes.append(float(item[4]))
+                elif isinstance(item, dict):
+                    closes.append(float(item.get("close", item.get("c", 0.0)) or 0.0))
+            except Exception:
+                continue
+        return [x for x in closes if x > 0]
+
+    def _macd_state_from_closes(
+        self,
+        closes: List[float],
+        *,
+        fast: int = 12,
+        slow: int = 26,
+        signal: int = 9,
+    ) -> Dict[str, Any]:
+        min_len = max(int(slow), int(signal)) + 5
+        if len(closes) < min_len:
+            return {
+                "macd": 0.0,
+                "signal": 0.0,
+                "hist": 0.0,
+                "cross": "NONE",
+                "zone": "NEAR_ZERO",
+                "hist_expand": False,
+                "hist_expand_up": False,
+                "hist_expand_down": False,
+            }
+        ema_fast = self._ema_series(closes, int(fast))
+        ema_slow = self._ema_series(closes, int(slow))
+        macd_line = [a - b for a, b in zip(ema_fast, ema_slow)]
+        sig_line = self._ema_series(macd_line, int(signal))
+        hist = [m - s for m, s in zip(macd_line, sig_line)]
+        if len(macd_line) < 3 or len(sig_line) < 3 or len(hist) < 3:
+            return {
+                "macd": 0.0,
+                "signal": 0.0,
+                "hist": 0.0,
+                "cross": "NONE",
+                "zone": "NEAR_ZERO",
+                "hist_expand": False,
+                "hist_expand_up": False,
+                "hist_expand_down": False,
+            }
+
+        m0, s0, h0 = float(macd_line[-1]), float(sig_line[-1]), float(hist[-1])
+        m1, s1 = float(macd_line[-2]), float(sig_line[-2])
+        cross = "NONE"
+        if (m1 <= s1) and (m0 > s0):
+            cross = "GOLDEN"
+        elif (m1 >= s1) and (m0 < s0):
+            cross = "DEAD"
+
+        if m0 > 0:
+            zone = "ABOVE_ZERO"
+        elif m0 < 0:
+            zone = "BELOW_ZERO"
+        else:
+            zone = "NEAR_ZERO"
+
+        hist_expand_up = hist[-1] > hist[-2] > hist[-3]
+        hist_expand_down = hist[-1] < hist[-2] < hist[-3]
+        hist_expand = abs(hist[-1]) > abs(hist[-2]) > abs(hist[-3])
+        return {
+            "macd": m0,
+            "signal": s0,
+            "hist": h0,
+            "cross": cross,
+            "zone": zone,
+            "hist_expand": bool(hist_expand),
+            "hist_expand_up": bool(hist_expand_up),
+            "hist_expand_down": bool(hist_expand_down),
+        }
+
+    def _compute_ma10_macd_confluence(self, symbol: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        tf_exec = str(cfg.get("tf_exec", "5m"))
+        tf_anchor = str(cfg.get("tf_anchor", "1h"))
+        limit_exec = int(cfg.get("kline_limit_exec", 160))
+        limit_anchor = int(cfg.get("kline_limit_anchor", 80))
+        ma_period = int(cfg.get("ma_period", 10))
+        macd_fast = int(cfg.get("macd_fast", 12))
+        macd_slow = int(cfg.get("macd_slow", 26))
+        macd_signal = int(cfg.get("macd_signal", 9))
+        if macd_slow <= macd_fast:
+            macd_slow = macd_fast + 1
+
+        k_exec = self.client.get_klines(symbol=symbol, interval=tf_exec, limit=limit_exec) or []
+        k_anchor = self.client.get_klines(symbol=symbol, interval=tf_anchor, limit=limit_anchor) or []
+        closes_exec = self._extract_closes_from_klines(k_exec)
+        closes_anchor = self._extract_closes_from_klines(k_anchor)
+
+        ma10_5m = self._sma(closes_exec, ma_period)
+        ma10_1h = self._sma(closes_anchor, ma_period)
+        ma10_1h_prev = self._sma(closes_anchor[:-1], ma_period) if len(closes_anchor) > ma_period else 0.0
+        slope = float(ma10_1h - ma10_1h_prev) if ma10_1h > 0 and ma10_1h_prev > 0 else 0.0
+        last_close_exec = float(closes_exec[-1]) if closes_exec else 0.0
+        last_close_anchor = float(closes_anchor[-1]) if closes_anchor else 0.0
+
+        if last_close_anchor > ma10_1h and slope > 0:
+            bias = 1
+        elif last_close_anchor < ma10_1h and slope < 0:
+            bias = -1
+        else:
+            bias = 0
+
+        macd_state = self._macd_state_from_closes(
+            closes_exec,
+            fast=macd_fast,
+            slow=macd_slow,
+            signal=macd_signal,
+        )
+        return {
+            "ma10_5m": float(ma10_5m),
+            "ma10_1h": float(ma10_1h),
+            "ma10_1h_slope": float(slope),
+            "ma10_1h_bias": int(bias),
+            "last_close_5m": float(last_close_exec),
+            "last_close_1h": float(last_close_anchor),
+            "macd_5m": float(macd_state.get("macd", 0.0)),
+            "macd_5m_signal": float(macd_state.get("signal", 0.0)),
+            "macd_5m_hist": float(macd_state.get("hist", 0.0)),
+            "macd_5m_cross": str(macd_state.get("cross", "NONE")),
+            "macd_5m_zone": str(macd_state.get("zone", "NEAR_ZERO")),
+            "macd_5m_hist_expand": bool(macd_state.get("hist_expand", False)),
+            "macd_5m_hist_expand_up": bool(macd_state.get("hist_expand_up", False)),
+            "macd_5m_hist_expand_down": bool(macd_state.get("hist_expand_down", False)),
+        }
+
+    def _apply_ma10_macd_entry_filter(self, symbol: str, decision: FundFlowDecision) -> FundFlowDecision:
+        cfg = self._ma10_macd_confluence_config()
+        if not bool(cfg.get("enabled", True)) or not bool(cfg.get("entry_hard_filter", True)):
+            return decision
+        if decision.operation not in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+            return decision
+
+        md_raw = getattr(decision, "metadata", None)
+        md: Dict[str, Any] = md_raw if isinstance(md_raw, dict) else {}
+        bias = int(self._to_float(md.get("ma10_1h_bias"), 0.0))
+
+        def _to_hold(tag: str) -> FundFlowDecision:
+            base_reason = str(decision.reason or "").strip()
+            return FundFlowDecision(
+                operation=FundFlowOperation.HOLD,
+                symbol=symbol,
+                target_portion_of_balance=0.0,
+                leverage=decision.leverage,
+                reason=f"{base_reason} | {tag}" if base_reason else tag,
+                metadata=md,
+            )
+
+        if bool(cfg.get("block_on_opposite_bias", True)) and bias != 0:
+            is_opposite = (
+                (bias > 0 and decision.operation == FundFlowOperation.SELL)
+                or (bias < 0 and decision.operation == FundFlowOperation.BUY)
+            )
+            if is_opposite:
+                op_token = decision.operation.value if hasattr(decision.operation, "value") else str(decision.operation)
+                return _to_hold(f"MA10_BIAS_BLOCK bias={bias} op={op_token}")
+        return decision
 
     def _update_extreme_volatility_state(self, symbol: str, flow_context: Dict[str, Any]) -> Dict[str, Any]:
         cfg = self._extreme_volatility_cooldown_config()
@@ -1404,8 +1637,8 @@ class TradingBot:
 
         md_raw = getattr(decision, "metadata", None)
         md: Dict[str, Any] = md_raw if isinstance(md_raw, dict) else {}
-        long_score = self._to_float(md.get("long_score"), 0.0)
-        short_score = self._to_float(md.get("short_score"), 0.0)
+        long_score = self._to_float(md.get("long_score_adj", md.get("long_score")), 0.0)
+        short_score = self._to_float(md.get("short_score_adj", md.get("short_score")), 0.0)
         trend_strength = min(1.0, max(0.0, max(long_score, short_score)))
         cvd_momentum = self._to_float(flow_context.get("cvd_momentum"), self._to_float(md.get("cvd_norm"), 0.0))
         momentum_strength = min(1.0, abs(cvd_momentum) * self._to_float(cfg.get("momentum_scale"), 300.0))
@@ -1617,6 +1850,50 @@ class TradingBot:
                         ),
                         gate_meta,
                     )
+
+                confluence_cfg = self._ma10_macd_confluence_config()
+                if (
+                    bool(confluence_cfg.get("enabled", True))
+                    and bool(confluence_cfg.get("exit_anchor_enabled", True))
+                    and direction in ("LONG", "SHORT")
+                ):
+                    skip_on_hard_block = bool(confluence_cfg.get("exit_anchor_skip_on_hard_block", True))
+                    skip_anchor = bool(drawdown_override) or (skip_on_hard_block and bool(hard_block))
+                    if not skip_anchor:
+                        ma10_5m = self._to_float(md.get("ma10_5m"), 0.0)
+                        last_close_5m = self._to_float(md.get("last_close_5m"), self._to_float(md.get("last_close"), 0.0))
+                        macd_zone = str(md.get("macd_5m_zone", "NEAR_ZERO")).upper()
+                        require_hist_expand = bool(confluence_cfg.get("exit_anchor_require_hist_expand", True))
+                        if direction == "LONG":
+                            hist_ok = bool(md.get("macd_5m_hist_expand_up", md.get("macd_5m_hist_expand", False)))
+                            zone_ok = macd_zone != "BELOW_ZERO"
+                            structure_ok = ma10_5m > 0 and last_close_5m >= ma10_5m
+                        else:
+                            hist_ok = bool(md.get("macd_5m_hist_expand_down", md.get("macd_5m_hist_expand", False)))
+                            zone_ok = macd_zone != "ABOVE_ZERO"
+                            structure_ok = ma10_5m > 0 and last_close_5m <= ma10_5m
+                        still_trending = bool(structure_ok and zone_ok and ((not require_hist_expand) or hist_ok))
+                        gate_meta["exit_anchor_hold"] = bool(still_trending)
+                        if isinstance(md, dict):
+                            md["pretrade_risk_gate"] = gate_meta
+                        if still_trending:
+                            base_reason = str(decision.reason or "").strip()
+                            delay_reason = (
+                                "MA10_MACD_HOLD_ANCHOR "
+                                f"ma10_5m={ma10_5m:.6f} last_close_5m={last_close_5m:.6f} "
+                                f"zone={macd_zone} hist_expand={1 if hist_ok else 0}"
+                            )
+                            return (
+                                FundFlowDecision(
+                                    operation=FundFlowOperation.HOLD,
+                                    symbol=symbol,
+                                    target_portion_of_balance=0.0,
+                                    leverage=decision.leverage,
+                                    reason=f"{base_reason} | {delay_reason}" if base_reason else delay_reason,
+                                    metadata=md if isinstance(md, dict) else {},
+                                ),
+                                gate_meta,
+                            )
 
                 close_ratio = self._to_float(cfg.get("exit_close_ratio"), 1.0)
                 base_reason = str(decision.reason or "").strip()
@@ -2660,6 +2937,8 @@ class TradingBot:
         atr_pct: Optional[float] = None,
         min_atr_multiple: float = 1.8,
         cooldown_sec: float = 60.0,
+        breakeven_mode: str = "",
+        breakeven_fee_buffer: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         冲突保护时收紧止损/保本止损
@@ -2673,6 +2952,8 @@ class TradingBot:
             atr_pct: 当前周期 ATR 百分比（例如 0.0035）
             min_atr_multiple: 收紧后至少保留的 ATR 距离倍数
             cooldown_sec: 冷却时间（秒），避免频繁撤挂
+            breakeven_mode: "profit_only" 时仅盈利后保本；其它值立即按保本价挂单
+            breakeven_fee_buffer: 保本手续费buffer（比例），None 时读取配置
 
         Returns:
             执行结果
@@ -2696,14 +2977,6 @@ class TradingBot:
         sl_raw = ff_cfg.get("stop_loss_pct", risk_cfg.get("stop_loss_default_percent"))
         sl_pct = self._normalize_percent(sl_raw, 0.01)
 
-        # 收紧止损
-        if force_break_even:
-            # 保本止损 buffer：建议略大于手续费/滑点
-            sl_pct_tightened = 0.0015  # 0.15%
-        else:
-            # 按比例收紧
-            sl_pct_tightened = sl_pct * tighten_ratio
-
         # 允许配置覆盖默认 ATR 保护距离
         atr_multiple = max(
             0.5,
@@ -2712,40 +2985,66 @@ class TradingBot:
         atr_pct_use = abs(self._to_float(atr_pct, 0.0))
         if atr_pct_use <= 0:
             atr_pct_use = abs(self._to_float(conflict_cfg.get("atr_pct_fallback", 0.0), 0.0))
-        min_sl_distance_ratio = 0.0
-        if atr_pct_use > 0:
-            min_sl_distance_ratio = min(0.20, atr_pct_use * atr_multiple)
+        atr_distance_ratio = min(0.20, atr_pct_use * atr_multiple) if atr_pct_use > 0 else 0.0
+        pct_distance_ratio = max(0.0005, sl_pct * max(0.1, float(tighten_ratio)))
+        tighten_distance_ratio = max(pct_distance_ratio, atr_distance_ratio)
+        atr_guard_applied = tighten_distance_ratio > (pct_distance_ratio + 1e-12)
+
+        # 预先读取当前保护单，确保 cooldown 分支也能输出 old_sl/new_sl
+        existing_orders: List[Dict[str, Any]] = []
+        old_sl = 0.0
+        try:
+            existing_orders = self._open_protection_orders(symbol, side=side)
+            old_sl = float(self._get_existing_sl_price(existing_orders))
+        except Exception:
+            existing_orders = []
+            old_sl = 0.0
+
+        be_mode = "na"
+        be_trigger_price = 0.0
+        side_enum = IntentPositionSide.LONG if side == "LONG" else IntentPositionSide.SHORT
 
         # 计算新的止损价格
-        # IMPORTANT: 保本止损方向必须正确，避免立即触发
-        if side == "LONG":
-            if force_break_even:
-                # LONG break-even SL must be BELOW entry to avoid immediate trigger / invalid params
-                stop_loss = entry_price * (1.0 - sl_pct_tightened)
+        # BREAK-EVEN 仅在已有利润时启用，否则退化为防守止损，避免 entry 附近噪声扫损。
+        if force_break_even:
+            if breakeven_fee_buffer is None:
+                fee_buffer = max(
+                    0.0,
+                    self._normalize_percent_to_ratio(conflict_cfg.get("breakeven_fee_buffer", 0.0010), 0.0010),
+                )
             else:
-                stop_loss = current_price * (1.0 - sl_pct_tightened)
-            side_enum = IntentPositionSide.LONG
-        else:
-            if force_break_even:
-                # SHORT break-even SL must be ABOVE entry
-                stop_loss = entry_price * (1.0 + sl_pct_tightened)
-            else:
-                stop_loss = current_price * (1.0 + sl_pct_tightened)
-            side_enum = IntentPositionSide.SHORT
+                fee_buffer = min(0.005, max(0.0, abs(float(breakeven_fee_buffer))))
+            arm_buffer = max(
+                0.0,
+                self._normalize_percent_to_ratio(conflict_cfg.get("breakeven_arm_buffer", 0.0005), 0.0005),
+            )
+            fallback_ratio = max(
+                tighten_distance_ratio,
+                self._normalize_percent_to_ratio(conflict_cfg.get("breakeven_fallback_ratio", sl_pct * 0.8), sl_pct * 0.8),
+            )
+            mode_pref = str(breakeven_mode or conflict_cfg.get("breakeven_mode", "profit_only")).strip().lower()
 
-        # ATR 防过紧：保留最小波动呼吸空间，避免 1 根K 噪声扫损
-        atr_guard_applied = False
-        if min_sl_distance_ratio > 0 and current_price > 0:
             if side == "LONG":
-                max_allowed_sl = current_price * (1.0 - min_sl_distance_ratio)
-                if stop_loss > max_allowed_sl:
-                    stop_loss = max_allowed_sl
-                    atr_guard_applied = True
+                be_trigger_price = entry_price * (1.0 + fee_buffer + arm_buffer)
+                if mode_pref != "profit_only" or current_price >= be_trigger_price:
+                    stop_loss = entry_price * (1.0 + fee_buffer)
+                    be_mode = "armed"
+                else:
+                    stop_loss = current_price * (1.0 - fallback_ratio)
+                    be_mode = "defensive"
             else:
-                min_allowed_sl = current_price * (1.0 + min_sl_distance_ratio)
-                if stop_loss < min_allowed_sl:
-                    stop_loss = min_allowed_sl
-                    atr_guard_applied = True
+                be_trigger_price = entry_price * (1.0 - fee_buffer - arm_buffer)
+                if mode_pref != "profit_only" or current_price <= be_trigger_price:
+                    stop_loss = entry_price * (1.0 - fee_buffer)
+                    be_mode = "armed"
+                else:
+                    stop_loss = current_price * (1.0 + fallback_ratio)
+                    be_mode = "defensive"
+        else:
+            if side == "LONG":
+                stop_loss = current_price * (1.0 - tighten_distance_ratio)
+            else:
+                stop_loss = current_price * (1.0 + tighten_distance_ratio)
 
         # ========== avoid frequent cancel/recreate ==========
         if not hasattr(self, "_sl_tighten_last_ts"):
@@ -2756,17 +3055,17 @@ class TradingBot:
             return {
                 "status": "skipped",
                 "message": f"cooldown_active: {symbol} {side} ({now_ts - last_ts:.0f}s < {cooldown_sec:.0f}s)",
-                "old_sl": None,
+                "old_sl": old_sl,
                 "new_sl": float(stop_loss),
                 "atr_guard_applied": atr_guard_applied,
                 "atr_pct": atr_pct_use,
-                "min_sl_distance_ratio": min_sl_distance_ratio,
+                "min_sl_distance_ratio": tighten_distance_ratio,
+                "break_even_mode": be_mode,
+                "be_trigger_price": be_trigger_price,
             }
 
         # 取消现有止损单
         try:
-            existing_orders = self._open_protection_orders(symbol, side=side)
-            old_sl = float(self._get_existing_sl_price(existing_orders))
             new_sl = float(stop_loss)
 
             tighter = self._is_new_sl_tighter(side, old_sl, new_sl)
@@ -2783,7 +3082,9 @@ class TradingBot:
                     "new_sl": new_sl,
                     "atr_guard_applied": atr_guard_applied,
                     "atr_pct": atr_pct_use,
-                    "min_sl_distance_ratio": min_sl_distance_ratio,
+                    "min_sl_distance_ratio": tighten_distance_ratio,
+                    "break_even_mode": be_mode,
+                    "be_trigger_price": be_trigger_price,
                 }
 
             for order in existing_orders:
@@ -2805,7 +3106,10 @@ class TradingBot:
             quantity=qty,
         )
 
-        action_desc = "保本止损" if force_break_even else f"收紧止损({tighten_ratio:.0%})"
+        if force_break_even:
+            action_desc = "保本止损" if be_mode == "armed" else "防守止损(未到保本触发)"
+        else:
+            action_desc = f"收紧止损({tighten_ratio:.0%})"
         self._sl_tighten_last_ts[(symbol, side)] = now_ts
 
         print(
@@ -2813,7 +3117,8 @@ class TradingBot:
             f"entry={entry_price:.6f} "
             f"old_sl={old_sl:.6f} → new_sl={float(stop_loss):.6f} "
             f"qty={qty:.4f} "
-            f"atr={atr_pct_use:.4f} min_dist={min_sl_distance_ratio:.4f} guard={'Y' if atr_guard_applied else 'N'}"
+            f"atr={atr_pct_use:.4f} min_dist={tighten_distance_ratio:.4f} guard={'Y' if atr_guard_applied else 'N'} "
+            f"be_mode={be_mode}"
         )
 
         if isinstance(result, dict):
@@ -2822,7 +3127,9 @@ class TradingBot:
             enriched["new_sl"] = float(stop_loss)
             enriched["atr_guard_applied"] = atr_guard_applied
             enriched["atr_pct"] = atr_pct_use
-            enriched["min_sl_distance_ratio"] = min_sl_distance_ratio
+            enriched["min_sl_distance_ratio"] = tighten_distance_ratio
+            enriched["break_even_mode"] = be_mode
+            enriched["be_trigger_price"] = be_trigger_price
             return enriched
         return {
             "status": "unknown",
@@ -2830,7 +3137,9 @@ class TradingBot:
             "new_sl": float(stop_loss),
             "atr_guard_applied": atr_guard_applied,
             "atr_pct": atr_pct_use,
-            "min_sl_distance_ratio": min_sl_distance_ratio,
+            "min_sl_distance_ratio": tighten_distance_ratio,
+            "break_even_mode": be_mode,
+            "be_trigger_price": be_trigger_price,
             "raw": result,
         }
 
@@ -3879,6 +4188,84 @@ class TradingBot:
                     )
                     print(f"⏭️ {symbol} 非开仓窗口，开仓信号降级为HOLD并继续执行持仓风控")
                     decision_md = decision.metadata if isinstance(decision.metadata, dict) else decision_md
+
+                confluence_cfg = self._ma10_macd_confluence_config()
+                if bool(confluence_cfg.get("enabled", True)):
+                    try:
+                        confluence = self._compute_ma10_macd_confluence(symbol, confluence_cfg)
+                        decision_md.update(confluence)
+                        if not isinstance(getattr(decision, "metadata", None), dict):
+                            decision.metadata = decision_md
+
+                        # Soft-calibrate long/short scores with 1h MA10 bias + 5m MACD confluence.
+                        # Keep raw scores for attribution and diagnostics.
+                        def _clamp01(x: float) -> float:
+                            if x < 0.0:
+                                return 0.0
+                            if x > 1.0:
+                                return 1.0
+                            return x
+
+                        long_raw = self._to_float(decision_md.get("long_score"), 0.0)
+                        short_raw = self._to_float(decision_md.get("short_score"), 0.0)
+                        decision_md["long_score_raw"] = float(long_raw)
+                        decision_md["short_score_raw"] = float(short_raw)
+
+                        bias = int(self._to_float(decision_md.get("ma10_1h_bias"), 0.0))
+                        macd_cross = str(decision_md.get("macd_5m_cross", "NONE")).upper()
+                        macd_zone = str(decision_md.get("macd_5m_zone", "NEAR_ZERO")).upper()
+                        hist_expand = bool(decision_md.get("macd_5m_hist_expand", False))
+
+                        bias_boost = self._to_float(confluence_cfg.get("bias_boost", 0.12), 0.12)
+                        bias_penalty = self._to_float(confluence_cfg.get("bias_penalty", 0.10), 0.10)
+                        cross_boost = self._to_float(confluence_cfg.get("cross_boost", 0.06), 0.06)
+                        zone_boost = self._to_float(confluence_cfg.get("zone_boost", 0.04), 0.04)
+                        hist_boost = self._to_float(confluence_cfg.get("hist_boost", 0.03), 0.03)
+                        max_adj = self._to_float(confluence_cfg.get("max_adjust", 0.25), 0.25)
+
+                        d_long = 0.0
+                        d_short = 0.0
+                        if bias > 0:
+                            d_long += bias_boost
+                            d_short -= bias_penalty
+                        elif bias < 0:
+                            d_short += bias_boost
+                            d_long -= bias_penalty
+
+                        if macd_cross == "GOLDEN":
+                            d_long += cross_boost
+                            if macd_zone == "ABOVE_ZERO":
+                                d_long += zone_boost
+                            elif macd_zone == "BELOW_ZERO":
+                                d_long -= zone_boost
+                        elif macd_cross == "DEAD":
+                            d_short += cross_boost
+                            if macd_zone == "BELOW_ZERO":
+                                d_short += zone_boost
+                            elif macd_zone == "ABOVE_ZERO":
+                                d_short -= zone_boost
+
+                        if hist_expand:
+                            if bias > 0:
+                                d_long += hist_boost
+                            elif bias < 0:
+                                d_short += hist_boost
+
+                        d_long = max(-max_adj, min(max_adj, d_long))
+                        d_short = max(-max_adj, min(max_adj, d_short))
+
+                        long_adj = _clamp01(long_raw + d_long)
+                        short_adj = _clamp01(short_raw + d_short)
+                        decision_md["long_score_adj"] = float(long_adj)
+                        decision_md["short_score_adj"] = float(short_adj)
+                        decision_md["long_score"] = float(long_adj)
+                        decision_md["short_score"] = float(short_adj)
+                        decision_md["ma10_macd_score_delta"] = {
+                            "long": float(d_long),
+                            "short": float(d_short),
+                        }
+                    except Exception as e:
+                        print(f"⚠️ {symbol} MA10+MACD 共振特征计算失败: {e}")
                 engine_override_raw = decision_md.get("params_override")
                 engine_override: Dict[str, Any] = (
                     engine_override_raw if isinstance(engine_override_raw, dict) else {}
@@ -3986,6 +4373,9 @@ class TradingBot:
                             f"score={self._to_float(pool_eval.get('score'), 0.0):.3f}"
                         )
                         continue
+
+                decision = self._apply_ma10_macd_entry_filter(symbol, decision)
+                decision_md = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else decision_md
                 decision, gate_meta = self._apply_pretrade_risk_gate(
                     symbol=symbol,
                     decision=decision,
@@ -4078,6 +4468,11 @@ class TradingBot:
                             lw_score=self._to_float(decision_md.get("lw_score"), 0.0),
                             now_ts=time.time(),
                             market_regime=str(decision_md.get("engine") or decision_md.get("regime") or "").upper(),
+                            ma10_ltf=self._to_float(decision_md.get("ma10_5m"), 0.0),
+                            last_close=self._to_float(
+                                decision_md.get("last_close_5m"),
+                                self._to_float(decision_md.get("last_close"), 0.0),
+                            ),
                         )
                         protection_level = protection.get("level", "neutral")
                         cooldown_active = bool(protection.get("cooldown_active", False))
@@ -4115,6 +4510,8 @@ class TradingBot:
                             decision_md["risk_allow_add"] = bool(protection.get("allow_add", True))
                             decision_md["risk_conflict_bars"] = int(protection.get("conflict_bars", 0))
                             decision_md["risk_penalty"] = float(protection.get("risk_penalty", 0.0))
+                            decision_md["risk_breakeven_mode"] = str(protection.get("breakeven_mode", "") or "")
+                            decision_md["risk_breakeven_fee_buffer"] = float(protection.get("breakeven_fee_buffer", 0.0) or 0.0)
                         except Exception:
                             pass
 
@@ -4150,6 +4547,8 @@ class TradingBot:
                                         force_break_even=True,
                                         atr_pct=self._to_float(decision_md.get("regime_atr_pct"), 0.0),
                                         cooldown_sec=60.0,
+                                        breakeven_mode=str(decision_md.get("risk_breakeven_mode", "") or ""),
+                                        breakeven_fee_buffer=self._to_float(decision_md.get("risk_breakeven_fee_buffer"), 0.0),
                                     )
                                     if isinstance(r, dict) and r.get("status") == "skipped":
                                         msg = str(r.get("message", ""))
