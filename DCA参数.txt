@@ -1,0 +1,180 @@
+DCA 详情
+
+触发记录
+基本参数编辑
+方向
+做空3x
+首单保证金
+3.48 USDT 
+涨多少加仓
+0.8%
+加仓单保证金
+3.65 USDT 
+最大持仓币种个数2
+单次止盈目标
+1.5%
+最大加仓次数
+3
+最大挂单数量
+5
+下单币种
+XXX,XXX,XXX,XXXX,XXX,XXXXX,
+
+高级设置（可选）
+
+交易启动条件
+ RSI 触发
+冷却时间
+60秒
+加仓触发条件
+ TD 触发
+ DCA 终止时
+市价卖出持有币种
+加仓价差倍数
+1.0
+最长持仓周期
+1天
+加仓金额倍数
+1.05
+最低日成交量
+30USDT
+单个币种止损
+15%
+利润再投资
+100%
+总投入止损
+20%
+
+DOGEUSDT
+WIFUSDT 
+FARTCOINUSDT 
+ TRUMPUSDT 
+ PENGUUSDT 
+ PIPPINUSDT 
+ PNUTUSDT 
+ SPXUSDT 
+ BOMEUSDT
+ TURBOUSDT 
+ PEOPLEUSDT 
+ ACTUSDT 
+ BRETTUSDT 
+ MEWUSDT 
+ NOTUSDT 
+ GOATUSDT 
+ MELANIAUSDT 
+BANANAS31USDT
+ HIPPOUSDT 
+ BANUSDT 
+ DOGSUSDT  
+ CHILLGUYUSDT 
+ DEGENUSDT
+ KOMAUSDT
+
+
+下面是你列出的这些 **USDT 交易对是否在币安 Binance 上存在** 的说明，以及如何通过 **币安官方 REST API 获取列表**：
+
+---
+
+## ✅ 1. 是否存在这些交易对？
+
+### **Spot（现货）市场**
+
+币安现货市场的所有交易对可以通过 **Spot API 的 `GET /api/v3/exchangeInfo`** 获取完整列表。这个返回的数据里包含所有活跃或已列出的 symbols（交易对）及其状态。([Binance][1])
+
+你列的这些 Spot/USDT 对中，目前**大多数都不是标准现货交易对**（即不会在 `/api/v3/exchangeInfo` 里找到）。例如：
+
+* ✅ **DOGEUSDT** 是一个存在的现货交易对（Dogecoin / USDT）。([Gist][2])
+* ❌ **FARTCOINUSDT, TRUMPUSDT, WIFUSDT, SPXUSDT, BOMEUSDT, TURBOUSDT, ACTUSDT, BRETTUSDT, MEWUSDT, NOTUSDT, BANANAS31USDT, HIPPOUSDT, DOGSUSDT, CHILLGUYUSDT, DEGENUSDT, KOMAUSDT** 等并非标准现货交易对（至少目前在主流 Binance 列表中未见常规支持）。
+
+### **Futures（永续合约 / 币本位）市场**
+
+你列出一些交易对确实出现在币安 **永续合约（USDⓈ-M Perpetual）** 的新增合约公告中，例如：
+
+* **ACTUSDT**、**PEOPLEUSDT**、**PIPPINUSDT**、**PNUTUSDT**、**GOATUSDT**、**MELANIAUSDT**、**BANUSDT** 等被官方公告作为永续合约新增过。([TradingView][3])
+
+不过需要注意：
+
+* 这些合约 *属于合约市场*，不等同于 Spot 现货交易对。
+* 永续合约列表需要通过 Futures API（如 `/fapi/v1/exchangeInfo`）来查询，而不是 Spot `/api/v3/exchangeInfo`。
+
+---
+
+## 🛠️ 2. 如何用 REST API 下载 Binance 交易对列表
+
+### 📌 Spot 现货交易对
+
+你可以调用官方 Spot REST API：
+
+```
+GET https://api.binance.com/api/v3/exchangeInfo
+```
+
+这个返回包括所有 spot 交易对及状态，例如：
+
+```json
+{
+  "symbols": [
+     {"symbol": "BTCUSDT", "status": "TRADING", ...},
+     {"symbol": "DOGEUSDT", "status": "TRADING", ...},
+     ...
+  ]
+}
+```
+
+要过滤出所有 USDT 交易对，可以在拿到返回后筛选：
+
+```python
+usdt_pairs = [s["symbol"] for s in data["symbols"] if s["quoteAsset"] == "USDT"]
+```
+
+📌 Spot API 文档说明见币安官方。([Binance][1])
+
+---
+
+### 📌 Futures 永续合约交易对
+
+币安的合约交易对需要调用 Futures API：
+
+```
+GET https://fapi.binance.com/fapi/v1/exchangeInfo
+```
+
+或者：
+
+```
+GET https://dapi.binance.com/dapi/v1/exchangeInfo  （USDⓈ-M 永续合约）
+```
+
+这会返回所有期货合约符号列表，包括永续合约。可用于判断像 **ACTUSDT**、**PEOPLEUSDT** 等是否存在。
+
+---
+
+## 📌 总结：你的交易对是否存在
+
+| 交易对                                                          | Spot 现货 | 永续合约 | 备注                     |
+| ------------------------------------------------------------ | ------- | ---- | ---------------------- |
+| **DOGEUSDT**                                                 | ✅       | ❌    | 标准现货交易对                |
+| **ACTUSDT**                                                  | ❌       | ✅    | 作为合约对出现过               |
+| **PEOPLEUSDT**                                               | ❌       | ✅    | 多次公告新增合约               |
+| **PIPPINUSDT / PNUTUSDT / GOATUSDT / MELANIAUSDT / BANUSDT** | ❌       | ✅    | 出现在合约新增公告              |
+| **WIFUSDT / FARTCOINUSDT / TRUMPUSDT / …**                   | ❌       | ❌    | 未见官方存在于 Spot 或 Futures |
+
+（以上判断基于公开列表和官方公告；具体是否交易，还需通过 API 实时验证）
+
+---
+
+## 📌 实时在 API 验证交易对是否有效
+
+可以用 `/api/v3/exchangeInfo?symbol=XXXUSDT` 检查 Spot 是否有效，例如：
+
+```
+GET https://api.binance.com/api/v3/exchangeInfo?symbol=DOGEUSDT
+```
+
+如果返回错误就是不存在。
+
+---
+
+[1]: https://www.binance.com/en/academy/articles/how-to-retrieve-binance-spot-symbols-via-api?utm_source=chatgpt.com "How to Retrieve Binance Spot Symbols via API?"
+[2]: https://gist.github.com/canhlinh/aba0b6ce51e87c247f313b5572d25ca7?utm_source=chatgpt.com "BINANCE.txt · GitHub"
+[3]: https://cn.tradingview.com/news/panews%3A1322117f6e3f9%3A0/?utm_source=chatgpt.com "币安合约跟单将新增50个U本位永续合约 — TradingView新闻"

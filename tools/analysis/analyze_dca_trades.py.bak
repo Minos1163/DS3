@@ -1,0 +1,37 @@
+import pandas as pd
+import sys
+
+# 从命令行获取文件路径，默认使用最新的
+if len(sys.argv) > 1:
+    log_file = sys.argv[1]
+else:
+    log_file = 'logs/dca_trades_20260201_145209.csv'
+
+df = pd.read_csv(log_file)
+
+print('=== 亏损最大的5笔交易 ===')
+print(df.nsmallest(5, 'pnl')[['exit_time','direction','avg_entry_price','exit_price','pnl','pnl_pct','dca_count']])
+
+print('\n=== 盈利最大的5笔交易 ===')
+print(df.nlargest(5, 'pnl')[['exit_time','direction','avg_entry_price','exit_price','pnl','pnl_pct','dca_count']])
+
+print(f'\n=== DCA使用统计 ===')
+print(df['dca_count'].value_counts().sort_index())
+
+print(f'\n=== 按DCA次数分组的胜率 ===')
+for dca in sorted(df['dca_count'].unique()):
+    sub = df[df['dca_count'] == dca]
+    wins = len(sub[sub['pnl'] > 0])
+    total = len(sub)
+    wr = wins / total * 100
+    avg_pnl = sub['pnl'].mean()
+    print(f'DCA {dca}次: {total}笔, 胜率{wr:.1f}%, 平均盈亏${avg_pnl:.2f}')
+
+print(f'\n=== 时间分布 ===')
+df['exit_time'] = pd.to_datetime(df['exit_time'])
+df['date'] = df['exit_time'].dt.date
+daily = df.groupby('date').agg({
+    'pnl': ['sum', 'count'],
+}).round(2)
+daily.columns = ['日盈亏', '交易数']
+print(daily)

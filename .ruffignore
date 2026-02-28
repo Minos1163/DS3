@@ -1,0 +1,13 @@
+<!-- markdownlint-disable MD022 MD025 MD047 -->
+# Ignore generated or third-party skill code that should not be linted
+.opencode/
+skills/
+tools/
+
+# Additional patterns to ensure both Unix and Windows-style paths are ignored
+**/.opencode/**
+**/.opencode/**
+**/skills/**
+**/skills/**
+**/tools/**
+**/tools/**

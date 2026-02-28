@@ -1,0 +1,274 @@
+"""
+配置加载器
+负责加载和验证配置文件
+"""
+
+import json
+import os
+from typing import Any, Dict
+
+
+class ConfigLoader:
+    """配置加载器"""
+
+    @staticmethod
+    def _project_root() -> str:
+        """返回项目根目录（src 的上级目录）。"""
+        return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    @staticmethod
+    def _resolve_config_path(file_path: str) -> str:
+        """将配置路径解析为绝对路径；相对路径按项目根目录解析。"""
+        if os.path.isabs(file_path):
+            return file_path
+        return os.path.join(ConfigLoader._project_root(), file_path)
+
+    @staticmethod
+    def load_json_config(file_path: str) -> Dict[str, Any]:
+        """
+        加载JSON配置文件
+
+        Args:
+            file_path: 配置文件路径
+
+        Returns:
+            配置字典
+
+        Raises:
+            FileNotFoundError: 文件不存在
+            json.JSONDecodeError: JSON格式错误
+        """
+        resolved_path = ConfigLoader._resolve_config_path(file_path)
+        if not os.path.exists(resolved_path):
+            raise FileNotFoundError(f"配置文件不存在: {file_path} (resolved: {resolved_path})")
+
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        return config
+
+    @staticmethod
+    def load_trading_config(
+        file_path: str = "config/trading_config_vps.json",
+    ) -> Dict[str, Any]:
+        """
+        加载交易配置
+
+        Returns:
+            {
+            'environment': {'mode': 'production', ...},
+                'trading': {...},
+                'risk': {...},
+                'ai': {...},
+                'schedule': {...}
+            }
+        """
+        try:
+            config = ConfigLoader.load_json_config(file_path)
+
+            # 验证必要的配置
+            ConfigLoader.validate_trading_config(config)
+
+            return config
+        except Exception as e:
+            print(f"❌ 加载交易配置失败: {e}")
+            raise
+
+    @staticmethod
+    def validate_trading_config(config: Dict[str, Any]) -> bool:
+        """
+        验证交易配置
+
+        Returns:
+            True if valid
+
+        Raises:
+            ValueError: 配置无效
+        """
+        # 检查必需字段
+        required_sections = ["trading"]
+        for section in required_sections:
+            if section not in config:
+                raise ValueError(f"配置缺少必要的部分: {section}")
+
+        trading = config["trading"]
+        if "symbols" not in trading or not trading["symbols"]:
+            raise ValueError("配置中必须指定至少一个交易币种")
+
+        return True
+
+    @staticmethod
+    def get_trading_symbols(config: Dict[str, Any]) -> list:
+        """
+        获取交易币种列表
+
+        """
+        symbols = config.get("trading", {}).get("symbols", [])
+        return symbols
+
+    @staticmethod
+    def get_default_leverage(config: Dict[str, Any]) -> int:
+        """获取默认杠杆"""
+        return config.get("trading", {}).get("default_leverage", 3)
+
+    @staticmethod
+    def get_position_limits(config: Dict[str, Any]) -> Dict[str, float]:
+        """获取仓位限制配置"""
+        trading = config.get("trading", {})
+        return {
+            "min_percent": trading.get("min_position_percent", 10) / 100,
+            "max_percent": trading.get("max_position_percent", 30) / 100,
+            "reserve_percent": trading.get("reserve_percent", 20) / 100,
+        }
+
+    @staticmethod
+    def get_risk_limits(config: Dict[str, Any]) -> Dict[str, float]:
+        """获取风险限制配置"""
+        risk = config.get("risk", {})
+        # 与 RiskManager 保持一致：接收两种格式，优先解释为整数百分比
+        raw_max = risk.get("max_daily_loss_percent", 10)
+        try:
+            rv = float(raw_max)
+        except Exception:
+            rv = 10.0
+        if rv > 1.0:
+            max_daily_loss_pct = rv / 100.0
+        else:
+            max_daily_loss_pct = rv
+
+        stop_loss_default = risk.get("stop_loss_default_percent", 2)
+        take_profit_default = risk.get("take_profit_default_percent", 5)
+
+        def _normalize_pct(val: Any) -> float:
+            try:
+                v = float(val)
+            except Exception:
+                return 0.0
+            v = abs(v)
+            # 统一兼容：
+            # - 0.006 => 0.6%
+            # - 0.6   => 0.6%
+            # - 1     => 1%
+            if v > 0.05:
+                return v / 100.0
+            return v
+
+        return {
+            "max_daily_loss_percent": max_daily_loss_pct,
+            "max_consecutive_losses": risk.get("max_consecutive_losses", 5),
+            "stop_loss_default_percent": _normalize_pct(stop_loss_default),
+            "take_profit_default_percent": _normalize_pct(take_profit_default),
+        }
+
+    @staticmethod
+    def get_ai_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        """获取AI配置"""
+        return config.get("ai", {})
+
+    @staticmethod
+    def get_monitoring_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        """获取监控/报警相关配置（monitoring 段）
+
+        Returns:
+            dict: monitoring 配置（如果不存在返回空字典）
+        """
+        return config.get("monitoring", {})
+
+    @staticmethod
+    def get_atr_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        """获取 ATR 止损相关配置（位于 risk 段）
+
+        返回字典，包含键：use_atr_stop_loss (bool), atr_multiplier (float), atr_timeframe (str)
+        """
+        risk = config.get("risk", {})
+        try:
+            use_atr = bool(risk.get("use_atr_stop_loss", False))
+        except Exception:
+            use_atr = False
+        try:
+            atr_multiplier = float(risk.get("atr_multiplier", 3.0))
+        except Exception:
+            atr_multiplier = 3.0
+        try:
+            atr_timeframe = str(risk.get("atr_timeframe", config.get("strategy", {}).get("interval", "1h")))
+        except Exception:
+            atr_timeframe = config.get("strategy", {}).get("interval", "1h")
+
+        return {
+            "use_atr_stop_loss": use_atr,
+            "atr_multiplier": atr_multiplier,
+            "atr_timeframe": atr_timeframe,
+        }
+
+    @staticmethod
+    def get_unrealized_pnl_threshold_usdt(config: Dict[str, Any]) -> float:
+        """获取未实现盈亏聚合阈值（单位 USDT）
+
+        读取优先级：monitoring.unrealized_pnl_threshold_usdt ->
+        risk.unrealized_aggregate_threshold_usdt -> 环境变量 UNREALIZED_AGGREGATE_THRESHOLD_USDT -> 默认 0.01
+        """
+        monitoring = ConfigLoader.get_monitoring_config(config)
+        risk = config.get("risk", {})
+        val = monitoring.get("unrealized_pnl_threshold_usdt")
+        if val is None:
+            val = risk.get("unrealized_aggregate_threshold_usdt")
+        if val is None:
+            try:
+                val = float(os.getenv("UNREALIZED_AGGREGATE_THRESHOLD_USDT", "0.01"))
+            except Exception:
+                val = 0.01
+        try:
+            return float(val)
+        except Exception:
+            return 0.01
+
+    @staticmethod
+    def get_max_stop_loss_abs(config: Dict[str, Any]) -> float:
+        """
+        获取并规范化最大止损绝对值（返回分数，例如 0.006 表示 0.6%）
+
+        支持多种书写方式：
+        - 小于 0.01 的数视为已是分数（例如 0.006 -> 0.6%）
+        - 大于等于 0.01 的数视为以百分比表示，需要除以100（例如 0.6 -> 0.6%）
+        - 优先读取位置：trading.max_stop_loss_abs -> risk.max_stop_loss_abs -> 环境变量 MAX_STOP_LOSS_ABS -> 默认 0.006
+        """
+        # 查找候选位置
+        val = None
+        val = config.get("trading", {}).get("max_stop_loss_abs")
+        if val is None:
+            val = config.get("risk", {}).get("max_stop_loss_abs")
+        if val is None:
+            ev = os.getenv("MAX_STOP_LOSS_ABS")
+            if ev is not None and ev != "":
+                try:
+                    val = float(ev)
+                except Exception:
+                    val = None
+        if val is None:
+            val = 0.006
+
+        try:
+            v = float(val)
+        except Exception:
+            return 0.006
+
+        # 规范化：如果 v < 0.01，视为分数；否则视为百分比数值，需要除以100
+        try:
+            if v < 0.01:
+                return abs(v)
+            # 将如 0.6 或 60 之类视为百分比表示，除以100
+            return abs(v) / 100.0
+        except Exception:
+            return 0.006
+
+    @staticmethod
+    def get_schedule_config(config: Dict[str, Any]) -> Dict[str, int]:
+        """获取调度配置"""
+        schedule = config.get("schedule", {})
+        return {
+            "interval_seconds": schedule.get("interval_seconds", 180),
+            "retry_times": schedule.get("retry_times", 3),
+            "retry_delay_seconds": schedule.get("retry_delay_seconds", 5),
+            # 启动/每次K线更新后等待多少秒再开始下载并分析（应小于等于30）
+            "download_delay_seconds": schedule.get("download_delay_seconds", 5),
+        }

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.coverage
+.pytest_cache/
+.ipynb_checkpoints
+.env
+.venv
+venv/
+ENV/
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+ehthumbs.db
+# Project specific
+logs/
+data/
+reports/
+run/
+.cache/
+.tmp/
+.tools/
+.agents/
+.codebuddy/
+*.bak
+*~
+config/backups/
+.mcp/
+mcp-*/

@@ -1,0 +1,23 @@
+{
+  "plugin": [
+    "oh-my-opencode",
+    "opencode-antigravity-auth@latest"
+  ],
+  "skills": {
+    "git-master": { "enabled": true },
+    "playwright": { "enabled": true },
+    "dev-browser": { "enabled": true }
+  },
+  "mcp_servers": {
+    "playwright": {
+      "type": "playwright",
+      "endpoint": "http://localhost:9222",
+      "notes": "示例：Playwright MCP 地址，实际部署请替换为你的 MCP 地址或 container endpoint"
+    },
+    "github": {
+      "type": "github",
+      "endpoint": "https://api.github.com",
+      "notes": "用于 gh API 操作，需提供 GH_TOKEN 或 gh auth 登录"
+    }
+  }
+}
