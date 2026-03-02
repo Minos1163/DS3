@@ -1029,6 +1029,44 @@ class FundFlowExecutionRouter:
                             "reduce_only_rejected": self._is_reduce_only_rejected(retry_result),
                         }
                     )
+
+                    if self._is_reduce_only_rejected(retry_result):
+                        # 立即重查实时仓位，避免在已平仓/错腿状态下继续重复提交，触发连续 -2022。
+                        live_after_retry = self._fetch_live_position_state(decision.symbol, preferred_side=position_side)
+                        live_retry_size = self._to_float(live_after_retry.get("size"), 0.0)
+                        live_retry_side = str(live_after_retry.get("side", "")).upper()
+                        close_path.append(
+                            {
+                                "step": "close_reduce_recheck",
+                                "retry_index": i,
+                                "live_ok": bool(live_after_retry.get("ok")),
+                                "live_side": live_retry_side,
+                                "live_size": live_retry_size,
+                                "source": live_after_retry.get("source"),
+                            }
+                        )
+                        if live_after_retry.get("ok") and live_retry_size <= 0:
+                            remaining_close_qty = 0.0
+                            final_result = {
+                                "status": "success",
+                                "operation": "close",
+                                "message": "ReduceOnly rejected 后实时仓位为0，终止重试并按已平仓处理",
+                                "quantity": close_qty,
+                                "filled_quantity": filled_close_qty,
+                                "remaining_quantity": 0.0,
+                                "fallback": "reduce_only_recheck_flat",
+                            }
+                            break
+                        if live_after_retry.get("ok") and live_retry_side in ("LONG", "SHORT") and live_retry_side != position_side:
+                            position_side = live_retry_side
+                            close_side = "SELL" if position_side == "LONG" else "BUY"
+                        if live_after_retry.get("ok") and live_retry_size > 0 and remaining_close_qty > live_retry_size:
+                            remaining_close_qty = live_retry_size
+                            try:
+                                remaining_close_qty = float(self.client.format_quantity(decision.symbol, remaining_close_qty))
+                            except Exception:
+                                pass
+
                     if remaining_close_qty <= 0:
                         final_result = {
                             "status": "success",

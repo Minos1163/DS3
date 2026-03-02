@@ -73,6 +73,79 @@ class OrderGateway:
         except Exception:
             return False
 
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _resolve_close_leg_state(
+        self,
+        symbol: str,
+        side: str,
+        final_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        在平仓请求下，解析目标腿并回读交易所实时仓位，避免 reduce-only 在无仓位/错腿时触发 -2022。
+        """
+        side_up = str(side or "").upper()
+        target_side = str(final_params.get("positionSide") or "").upper()
+        if target_side not in ("LONG", "SHORT"):
+            try:
+                if bool(self.broker.get_hedge_mode()):
+                    calc = str(self.broker.calculate_position_side(side_up, True) or "").upper()
+                    if calc in ("LONG", "SHORT"):
+                        target_side = calc
+            except Exception:
+                target_side = ""
+        if target_side not in ("LONG", "SHORT"):
+            if side_up == "SELL":
+                target_side = "LONG"
+            elif side_up == "BUY":
+                target_side = "SHORT"
+
+        matched_position: Optional[Dict[str, Any]] = None
+        matched_qty = 0.0
+        inferred_side = ""
+
+        if target_side in ("LONG", "SHORT"):
+            try:
+                pos_target = self.broker.position.get_position(symbol, side=target_side)
+            except Exception:
+                pos_target = None
+            amt_target = self._to_float((pos_target or {}).get("positionAmt"), 0.0) if isinstance(pos_target, dict) else 0.0
+            if abs(amt_target) > 0:
+                matched_position = pos_target
+                matched_qty = abs(amt_target)
+                inferred_side = "LONG" if amt_target > 0 else "SHORT"
+
+        if matched_qty <= 0:
+            try:
+                pos_any = self.broker.position.get_position(symbol)
+            except Exception:
+                pos_any = None
+            amt_any = self._to_float((pos_any or {}).get("positionAmt"), 0.0) if isinstance(pos_any, dict) else 0.0
+            if abs(amt_any) > 0:
+                side_any = "LONG" if amt_any > 0 else "SHORT"
+                if target_side in ("LONG", "SHORT") and side_any != target_side:
+                    return {
+                        "target_side": target_side,
+                        "inferred_side": side_any,
+                        "quantity": 0.0,
+                        "position": pos_any if isinstance(pos_any, dict) else None,
+                    }
+                matched_position = pos_any if isinstance(pos_any, dict) else None
+                matched_qty = abs(amt_any)
+                inferred_side = side_any
+
+        return {
+            "target_side": target_side,
+            "inferred_side": inferred_side,
+            "quantity": matched_qty,
+            "position": matched_position,
+        }
+
     def place_standard_order(
         self,
         symbol: str,
@@ -132,6 +205,35 @@ class OrderGateway:
             or final.get("closePosition") is True
             or str(final.get("closePosition")).lower() == "true"
         )
+
+        if is_close_request:
+            close_state = self._resolve_close_leg_state(symbol=symbol, side=side, final_params=final)
+            live_close_qty = self._to_float(close_state.get("quantity"), 0.0)
+            if live_close_qty <= 0:
+                return {
+                    "status": "noop",
+                    "message": "no position to close",
+                    "symbol": symbol,
+                    "side": side,
+                    "target_side": close_state.get("target_side"),
+                    "live_side": close_state.get("inferred_side"),
+                }
+
+            req_qty = self._to_float(final.get("quantity"), 0.0)
+            if req_qty > 0 and req_qty > live_close_qty + 1e-12:
+                try:
+                    adjusted_qty = float(self.broker.format_quantity(symbol, live_close_qty))
+                except Exception:
+                    adjusted_qty = live_close_qty
+                if adjusted_qty <= 0:
+                    return {
+                        "status": "noop",
+                        "message": "close quantity rounded to zero after live sync",
+                        "symbol": symbol,
+                        "side": side,
+                        "target_side": close_state.get("target_side"),
+                    }
+                final["quantity"] = adjusted_qty
 
         # 确保下单满足交易所最小名义(notional)要求，避免 -4164 错误
         try:

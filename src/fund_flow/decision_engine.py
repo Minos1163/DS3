@@ -98,6 +98,23 @@ class FundFlowDecisionEngine:
         self.range_trap_guard_enabled = bool(trap_guard_cfg.get("enabled", True))
         trap_guard_q = self._to_float(trap_guard_cfg.get("max_quantile"), 0.70)
         self.range_trap_guard_max_quantile = min(0.95, max(0.50, trap_guard_q))
+        # 反转平仓降噪: 要求连续确认 + 分差过滤，避免单根K线噪音触发平仓
+        self.reverse_close_confirm_bars = max(
+            1, int(self._to_float(ff.get("reverse_close_confirm_bars"), 2))
+        )
+        self.reverse_close_score_buffer = max(
+            0.0, self._to_float(ff.get("reverse_close_score_buffer"), 0.02)
+        )
+        self.reverse_close_min_gap = max(
+            0.0, self._to_float(ff.get("reverse_close_min_gap"), 0.08)
+        )
+        self.reverse_close_no_trade_extra_bars = max(
+            0, int(self._to_float(ff.get("reverse_close_no_trade_extra_bars"), 1))
+        )
+        self.reverse_close_require_direction_lock = bool(
+            ff.get("reverse_close_require_direction_lock", False)
+        )
+        self._reverse_close_streak: Dict[Tuple[str, str], int] = {}
         
         # DeepSeek Weight Router 配置
         ds_cfg = ff.get("deepseek_weight_router", {}) if isinstance(ff.get("deepseek_weight_router"), dict) else {}
@@ -143,10 +160,7 @@ class FundFlowDecisionEngine:
         self._ev_reliability: Dict[str, Tuple[float, float]] = {
             "macd": (16.0, 4.0),   # MACD 初始可靠度 0.80 -> reliability_factor=0.60
             "kdj": (15.0, 5.0),    # KDJ(J) 初始可靠度 0.75 -> reliability_factor=0.50
-            # 旧组合保留在线可靠度，用于实盘对照日志
-            "bbi": (14.0, 6.0),
-            "ema_diff": (13.0, 7.0),
-            "ema_slope": (12.0, 8.0),
+            "bb": (15.0, 5.0),     # Bollinger 初始可靠度 0.75 -> reliability_factor=0.50
             "cvd": (14.0, 6.0),    # CVD 初始可靠度 0.70 -> reliability_factor=0.40 (提升权重)
             "imbalance": (13.0, 7.0),  # imbalance 初始可靠度 0.65 -> reliability_factor=0.30 (提升权重)
         }
@@ -250,6 +264,19 @@ class FundFlowDecisionEngine:
         if v <= 0.05:
             return v
         return v / 100.0
+
+    def _clear_reverse_close_streak(self, symbol: str) -> None:
+        self._reverse_close_streak.pop((symbol, "LONG"), None)
+        self._reverse_close_streak.pop((symbol, "SHORT"), None)
+
+    def _update_reverse_close_streak(self, symbol: str, pos_side: str, triggered: bool) -> int:
+        key = (symbol, pos_side)
+        if not triggered:
+            self._reverse_close_streak.pop(key, None)
+            return 0
+        streak = int(self._reverse_close_streak.get(key, 0)) + 1
+        self._reverse_close_streak[key] = streak
+        return streak
 
     def _score_trend(self, market_flow_context: Dict[str, Any]) -> Dict[str, float]:
         cvd = self._to_float(market_flow_context.get("cvd_ratio"))
@@ -674,9 +701,9 @@ class FundFlowDecisionEngine:
         features: Dict[str, float] = {}
 
         # ========== 主指标 (决定方向) ==========
-        # 新主判：MACD + KDJ(J)
+        # 新主判：MACD + KDJ 与 MACD + Bollinger 双组合
 
-        # MACD hist (主指标)
+        # MACD hist
         macd_hist_norm = self._to_float(tf_ctx.get("macd_hist_norm"), 0.0)
         features["macd"] = max(-1.0, min(1.0, macd_hist_norm))
 
@@ -687,13 +714,33 @@ class FundFlowDecisionEngine:
             kdj_j_norm = (kdj_j - 50.0) / 50.0
         features["kdj"] = max(-1.0, min(1.0, kdj_j_norm))
 
-        # 旧组合分量（MACD+BBI+EMA）保留用于实盘对照日志
-        bbi_gap_norm = self._to_float(tf_ctx.get("bbi_gap_norm"), 0.0)
-        ema_diff_norm = self._to_float(tf_ctx.get("ema_diff_norm"), 0.0)
-        ema_slope_norm = self._to_float(tf_ctx.get("ema_slope_norm"), 0.0)
-        features["legacy_bbi"] = max(-1.0, min(1.0, bbi_gap_norm))
-        features["legacy_ema_diff"] = max(-1.0, min(1.0, ema_diff_norm))
-        features["legacy_ema_slope"] = max(-1.0, min(1.0, ema_slope_norm))
+        # Bollinger 方向特征：
+        # 优先用上游归一化字段，回退使用 upper/lower/middle + close(mid_price/last_close)估算
+        bb_pos_norm = self._to_float(tf_ctx.get("bb_pos_norm"), 0.0)
+        if abs(bb_pos_norm) < 1e-9:
+            bb_upper = self._to_float(tf_ctx.get("bb_upper"), 0.0)
+            bb_lower = self._to_float(tf_ctx.get("bb_lower"), 0.0)
+            bb_middle = self._to_float(tf_ctx.get("bb_middle"), 0.0)
+            close_price = self._to_float(tf_ctx.get("last_close"), 0.0)
+            if close_price <= 0:
+                close_price = self._to_float(tf_ctx.get("mid_price"), 0.0)
+            if bb_upper > bb_lower and close_price > 0:
+                band_w = max(bb_upper - bb_lower, 1e-12)
+                bb_pos_norm = (close_price - (bb_upper + bb_lower) * 0.5) / (band_w * 0.5)
+            elif bb_middle > 0 and close_price > 0:
+                bb_pos_norm = (close_price - bb_middle) / max(abs(bb_middle) * 0.02, 1e-12)
+        bb_pos_norm = max(-1.0, min(1.0, bb_pos_norm))
+
+        bb_width_norm = self._to_float(tf_ctx.get("bb_width_norm"), 0.0)
+        if abs(bb_width_norm) < 1e-9:
+            bb_upper = self._to_float(tf_ctx.get("bb_upper"), 0.0)
+            bb_lower = self._to_float(tf_ctx.get("bb_lower"), 0.0)
+            bb_middle = self._to_float(tf_ctx.get("bb_middle"), 0.0)
+            if bb_upper > bb_lower and bb_middle > 0:
+                bw = (bb_upper - bb_lower) / bb_middle
+                # 带宽大说明趋势性更强，小带宽降权
+                bb_width_norm = max(-1.0, min(1.0, (bw - 0.01) / 0.05))
+        features["bb"] = max(-1.0, min(1.0, 0.75 * bb_pos_norm + 0.25 * bb_width_norm))
 
         # ========== 确认/否决指标 (不决定方向，用于确认或否决) ==========
 
@@ -712,26 +759,42 @@ class FundFlowDecisionEngine:
 
         return features
 
-    def _score_legacy_combo(self, features: Dict[str, float]) -> Dict[str, Any]:
+    def _score_dual_combo(self, features: Dict[str, float]) -> Dict[str, Any]:
         """
-        旧方向组合（MACD + BBI + EMA diff + EMA slope），仅用于对照日志。
+        MACD+KDJ vs MACD+BB 双组合对比。
+        返回 winner 及两者分数，供 LW/EV 共享。
         """
-        legacy_weights = {
-            "macd": 0.40,
-            "legacy_bbi": 0.30,
-            "legacy_ema_diff": 0.18,
-            "legacy_ema_slope": 0.12,
+        macd_val = self._to_float(features.get("macd"), 0.0)
+        kdj_val = self._to_float(features.get("kdj"), 0.0)
+        bb_val = self._to_float(features.get("bb"), 0.0)
+        cvd_val = self._to_float(features.get("cvd"), 0.0)
+
+        score_macd_kdj = 0.60 * macd_val + 0.40 * kdj_val
+        score_macd_bb = 0.60 * macd_val + 0.40 * bb_val
+
+        # 与 CVD 同向时略微加分（只用于组合优先级，不直接改方向）
+        align_kdj = 1 if (score_macd_kdj * cvd_val > 0 and abs(cvd_val) > 0.05) else 0
+        align_bb = 1 if (score_macd_bb * cvd_val > 0 and abs(cvd_val) > 0.05) else 0
+        agility_kdj = abs(score_macd_kdj) + 0.05 * align_kdj
+        agility_bb = abs(score_macd_bb) + 0.05 * align_bb
+
+        winner = "MACD+KDJ" if agility_kdj >= agility_bb else "MACD+BB"
+        winner_score = score_macd_kdj if winner == "MACD+KDJ" else score_macd_bb
+        loser_score = score_macd_bb if winner == "MACD+KDJ" else score_macd_kdj
+
+        # 同向时混合一部分 loser，减少抖动；反向时只用 winner
+        mixed_score = winner_score
+        if winner_score * loser_score > 0:
+            mixed_score = 0.8 * winner_score + 0.2 * loser_score
+
+        return {
+            "winner": winner,
+            "winner_score": mixed_score,
+            "score_macd_kdj": score_macd_kdj,
+            "score_macd_bb": score_macd_bb,
+            "align_kdj": align_kdj,
+            "align_bb": align_bb,
         }
-        legacy_score = 0.0
-        for key, weight in legacy_weights.items():
-            legacy_score += self._to_float(features.get(key), 0.0) * weight
-        if abs(legacy_score) < self._direction_neutral_zone:
-            legacy_dir = "BOTH"
-        elif legacy_score > 0:
-            legacy_dir = "LONG_ONLY"
-        else:
-            legacy_dir = "SHORT_ONLY"
-        return {"dir": legacy_dir, "score": round(legacy_score, 3)}
 
     def _score_lw(
         self,
@@ -741,7 +804,7 @@ class FundFlowDecisionEngine:
         第二层A：线性加权法 (LW) - 当前决策用
 
         规则：
-        - MACD + KDJ 双振为主方向判断
+        - MACD+KDJ 与 MACD+BB 双组合对比，winner 决定主方向
         - CVD/imbalance 作为确认/否决项（不决定方向）
         - CVD与主方向冲突时，降低置信度
 
@@ -752,50 +815,24 @@ class FundFlowDecisionEngine:
                 "components": {"macd": ..., "kdj": ..., ...},
                 "conflict": bool,
                 "confirmation": float,  # 确认度 [-1, 1]
-                "legacy_combo": {"dir": ..., "score": ...},
+                "combo_compare": {...},
             }
         """
         components: Dict[str, float] = {}
-
-        # ========== 方向决定权重 (主指标: MACD + KDJ) ==========
-        direction_weights = {
-            "macd": 0.55,
-            "kdj": 0.45,
-        }
-
-        # ========== 计算 方向分数 ==========
-        lw_score = 0.0
-        for key, weight in direction_weights.items():
-            val = features.get(key, 0.0)
-            contribution = val * weight
-            lw_score += contribution
-            components[key] = round(contribution, 3)
-
-        # 双振增强：同向增强，反向衰减
-        macd_val = self._to_float(features.get("macd"), 0.0)
-        kdj_val = self._to_float(features.get("kdj"), 0.0)
-        dual_same = (macd_val * kdj_val) > 0
-        dual_strength = min(abs(macd_val), abs(kdj_val))
-        if dual_strength >= 0.05:
-            if dual_same:
-                resonance_boost = min(1.15, 1.0 + 0.12 * dual_strength)
-                lw_score *= resonance_boost
-                components["dual_boost"] = round(resonance_boost, 3)
-            else:
-                resonance_penalty = 0.78
-                lw_score *= resonance_penalty
-                components["dual_penalty"] = round(resonance_penalty, 3)
-        components["dual_same"] = 1.0 if dual_same else -1.0
+        combo_compare = self._score_dual_combo(features)
+        lw_score = self._to_float(combo_compare.get("winner_score"), 0.0)
+        components["combo_macd_kdj"] = round(self._to_float(combo_compare.get("score_macd_kdj"), 0.0), 3)
+        components["combo_macd_bb"] = round(self._to_float(combo_compare.get("score_macd_bb"), 0.0), 3)
+        components["combo_winner"] = 1.0 if str(combo_compare.get("winner")) == "MACD+KDJ" else -1.0
 
         # ========== 确认/否决指标 (CVD, imbalance) ==========
         # 不参与方向决定，只用于确认或否决
         cvd_val = features.get("cvd", 0.0)
         imb_val = features.get("imbalance", 0.0)
-        legacy_combo = self._score_legacy_combo(features)
 
         # ========== 主指标失效检测 ==========
         # 当所有主指标都接近0时，启用CVD/imbalance作为备用方向判断
-        primary_indicators_flat = all(abs(features.get(k, 0.0)) < 0.05 for k in direction_weights.keys())
+        primary_indicators_flat = all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "kdj", "bb"))
 
         if primary_indicators_flat and (abs(cvd_val) > 0.1 or abs(imb_val) > 0.1):
             # 主指标失效，使用CVD和imbalance作为方向判断
@@ -855,8 +892,8 @@ class FundFlowDecisionEngine:
             "components": components,
             "conflict": has_conflict,
             "confirmation": round(confirmation, 3),
-            "legacy_combo": legacy_combo,
-            "active_model": "MACD+KDJ",
+            "combo_compare": combo_compare,
+            "active_model": str(combo_compare.get("winner", "MACD+KDJ")),
         }
 
     def _score_ev(
@@ -867,7 +904,8 @@ class FundFlowDecisionEngine:
         第二层B：期望值法 (EV) - 用于对比评估
 
         使用在线可靠度 (Beta-Binomial)：
-        ev_score = Σ( w_i * (2*p_i - 1) * score_i )
+        先计算可靠度加权后的 MACD/KDJ/BB，再做
+        MACD+KDJ vs MACD+BB 双组合对比。
 
         注意：CVD/imbalance 作为确认项，不决定方向
 
@@ -882,14 +920,9 @@ class FundFlowDecisionEngine:
         components: Dict[str, float] = {}
         reliabilities: Dict[str, float] = {}
 
-        # ========== 方向决定权重 (主指标: MACD + KDJ) ==========
-        direction_weights = {
-            "macd": 0.55,
-            "kdj": 0.45,
-        }
-
-        ev_score = 0.0
-        for key, weight in direction_weights.items():
+        # ========== 可靠度加权后的主指标 ==========
+        reliability_weighted: Dict[str, float] = {}
+        for key in ("macd", "kdj", "bb"):
             val = features.get(key, 0.0)
 
             # 获取该指标的可靠度
@@ -901,33 +934,20 @@ class FundFlowDecisionEngine:
             # p=0.5 -> 0 (无信息), p=1.0 -> 1 (完全可靠)
             reliability_factor = 2 * p_i - 1
 
-            contribution = weight * reliability_factor * val
-            ev_score += contribution
-            components[key] = round(contribution, 3)
+            reliability_weighted[key] = reliability_factor * val
+            components[key] = round(reliability_weighted[key], 3)
 
-        # 双振一致性处理：同向增强，反向衰减
-        macd_val = self._to_float(features.get("macd"), 0.0)
-        kdj_val = self._to_float(features.get("kdj"), 0.0)
-        dual_same = (macd_val * kdj_val) > 0
-        dual_strength = min(abs(macd_val), abs(kdj_val))
-        if dual_strength >= 0.05:
-            if dual_same:
-                ev_boost = min(1.12, 1.0 + 0.10 * dual_strength)
-                ev_score *= ev_boost
-                components["dual_boost"] = round(ev_boost, 3)
-            else:
-                ev_penalty = 0.80
-                ev_score *= ev_penalty
-                components["dual_penalty"] = round(ev_penalty, 3)
-        components["dual_same"] = 1.0 if dual_same else -1.0
+        ev_combo = self._score_dual_combo(reliability_weighted)
+        ev_score = self._to_float(ev_combo.get("winner_score"), 0.0)
+        components["combo_macd_kdj"] = round(self._to_float(ev_combo.get("score_macd_kdj"), 0.0), 3)
+        components["combo_macd_bb"] = round(self._to_float(ev_combo.get("score_macd_bb"), 0.0), 3)
+        components["combo_winner"] = 1.0 if str(ev_combo.get("winner")) == "MACD+KDJ" else -1.0
 
         # ========== 确认/否决指标 (不参与方向决定) ==========
         cvd_val = features.get("cvd", 0.0)
         imb_val = features.get("imbalance", 0.0)
         components["cvd"] = round(cvd_val, 3)
         components["imbalance"] = round(imb_val, 3)
-        legacy_combo = self._score_legacy_combo(features)
-
         # 记录确认指标的可靠度
         for key in ("cvd", "imbalance"):
             alpha, beta = self._ev_reliability.get(key, (10.0, 10.0))
@@ -936,7 +956,7 @@ class FundFlowDecisionEngine:
 
         # ========== 主指标失效检测 ==========
         # 当所有主指标都接近0时，启用CVD/imbalance作为备用方向判断
-        primary_indicators_flat = all(abs(features.get(k, 0.0)) < 0.05 for k in direction_weights.keys())
+        primary_indicators_flat = all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "kdj", "bb"))
 
         if primary_indicators_flat and (abs(cvd_val) > 0.1 or abs(imb_val) > 0.1):
             # 主指标失效，使用CVD和imbalance作为方向判断
@@ -973,8 +993,8 @@ class FundFlowDecisionEngine:
             "score": round(ev_score, 3),
             "components": components,
             "reliabilities": reliabilities,
-            "legacy_combo": legacy_combo,
-            "active_model": "MACD+KDJ",
+            "combo_compare": ev_combo,
+            "active_model": str(ev_combo.get("winner", "MACD+KDJ")),
         }
 
     def _update_ev_reliability(
@@ -1056,7 +1076,8 @@ class FundFlowDecisionEngine:
         last_open = self._to_float(tf_ctx.get("last_open"), 0.0)
         last_close = self._to_float(tf_ctx.get("last_close"), 0.0)
 
-        if ema_fast <= 0 or ema_slow <= 0 or adx <= 0 or atr_pct <= 0:
+        # 趋势判定不再依赖 EMA（仅保留 EMA 数值用于观察日志）
+        if adx <= 0 or atr_pct <= 0:
             return {
                 "regime": "NO_TRADE",
                 "direction": "BOTH",
@@ -1096,27 +1117,26 @@ class FundFlowDecisionEngine:
         if need_confirm and abs(ev_score) < 0.1:
             direction = "BOTH"
 
-        legacy_combo = lw_result.get("legacy_combo", {}) if isinstance(lw_result.get("legacy_combo"), dict) else {}
-        legacy_dir = str(legacy_combo.get("dir", "BOTH"))
-        legacy_score = self._to_float(legacy_combo.get("score"), 0.0)
-        cvd_for_compare = self._to_float(features.get("cvd"), 0.0)
-        agility_new = abs(ev_score)
-        agility_old = abs(legacy_score)
-        align_new = 1 if (ev_score * cvd_for_compare > 0 and abs(cvd_for_compare) > 0.05) else 0
-        align_old = 1 if (legacy_score * cvd_for_compare > 0 and abs(cvd_for_compare) > 0.05) else 0
-        winner = "MACD+KDJ" if (agility_new + 0.05 * align_new) >= (agility_old + 0.05 * align_old) else "MACD+BBI+EMA"
+        lw_combo = lw_result.get("combo_compare", {}) if isinstance(lw_result.get("combo_compare"), dict) else {}
+        ev_combo = ev_result.get("combo_compare", {}) if isinstance(ev_result.get("combo_compare"), dict) else {}
+        # 日志对照采用固定映射：
+        # LW -> MACD+KDJ，EV -> MACD+布林带
+        # winner 仍保留动态优胜组合，便于观测两组合强弱
+        lw_winner = "MACD+KDJ"
+        ev_winner = "MACD+布林带"
+        winner = str(ev_combo.get("winner", "MACD+KDJ"))
+        active_model = "MACD+布林带"
         combo_compare = {
-            "active_model": "MACD+KDJ",
+            "active_model": active_model,
             "active_dir": ev_dir,
             "active_score": round(ev_score, 3),
-            "legacy_model": "MACD+BBI+EMA",
-            "legacy_dir": legacy_dir,
-            "legacy_score": round(legacy_score, 3),
-            "agility_new": round(agility_new, 3),
-            "agility_old": round(agility_old, 3),
-            "flow_align_new": align_new,
-            "flow_align_old": align_old,
+            "lw_winner": lw_winner,
+            "ev_winner": ev_winner,
+            "lw_combo_score": round(self._to_float(lw_combo.get("score_macd_kdj"), 0.0), 3),
+            "ev_combo_score": round(self._to_float(ev_combo.get("score_macd_bb"), 0.0), 3),
             "winner": winner,
+            "lw_dynamic_winner": str(lw_combo.get("winner", "MACD+KDJ")),
+            "ev_dynamic_winner": str(ev_combo.get("winner", "MACD+KDJ")),
         }
 
         # 构建日志原因
@@ -1124,9 +1144,8 @@ class FundFlowDecisionEngine:
         direction_reason = (
             f"dir_lw={lw_dir[:4]} score_lw={lw_score:+.2f} | "
             f"dir_ev={ev_dir[:4]} score_ev={ev_score:+.2f} | "
-            f"legacy={legacy_dir[:4]}({legacy_score:+.2f}) | "
             f"agree={1 if agree else 0} div={divergence:.2f} conf={abs(ev_score):.2f} | "
-            f"winner={winner} agile_new={agility_new:.2f}/{agility_old:.2f} | "
+            f"winner={winner} lw={lw_winner} ev={ev_winner} | "
             f"components({comp_str})"
         )
 
@@ -1152,8 +1171,8 @@ class FundFlowDecisionEngine:
             "lw_direction": lw_dir,
             "lw_score": lw_score,
             "lw_components": lw_result["components"],
-            "legacy_direction": legacy_dir,
-            "legacy_score": legacy_score,
+            "legacy_direction": "BOTH",
+            "legacy_score": 0.0,
             "combo_compare": combo_compare,
         }
 
@@ -1209,13 +1228,8 @@ class FundFlowDecisionEngine:
             return True
 
         adx = self._to_float(regime_info.get("adx"), 0.0)
-        ema_fast = self._to_float(regime_info.get("ema_fast"), 0.0)
-        ema_slow = self._to_float(regime_info.get("ema_slow"), 0.0)
-        denom = abs(ema_slow) if abs(ema_slow) > 1e-12 else 1.0
-        ema_gap_pct = abs(ema_fast - ema_slow) / denom
         adx_strong = adx >= (self.regime_adx_trend_on + self.direction_lock_soft_adx_buffer)
-        ema_clear = ema_gap_pct >= self.direction_lock_ema_band_pct
-        return bool(adx_strong and ema_clear)
+        return bool(adx_strong)
 
     def _extract_range_quantiles(self, market_flow_context: Dict[str, Any]) -> Dict[str, Any]:
         timeframes = market_flow_context.get("timeframes")
@@ -1507,6 +1521,8 @@ class FundFlowDecisionEngine:
         close_threshold = float(engine_params.get("close_threshold", self.close_threshold))
         current_pos = (portfolio.get("positions") or {}).get(symbol)
         pos_side = str((current_pos or {}).get("side", "")).upper()
+        if pos_side not in ("LONG", "SHORT"):
+            self._clear_reverse_close_streak(symbol)
 
         metadata_base = {
             "trigger": trigger_context,
@@ -1568,28 +1584,106 @@ class FundFlowDecisionEngine:
             # 资金流 3.0 一致性指标
             "flow_confirm": flow_confirm,
             "consistency_3bars": consistency_3bars,
+            "reverse_close_filter": {
+                "confirm_bars": int(self.reverse_close_confirm_bars),
+                "score_buffer": float(self.reverse_close_score_buffer),
+                "min_gap": float(self.reverse_close_min_gap),
+                "no_trade_extra_bars": int(self.reverse_close_no_trade_extra_bars),
+                "require_direction_lock": bool(self.reverse_close_require_direction_lock),
+            },
         }
 
-        if pos_side == "LONG" and short_score >= close_threshold:
-            return FundFlowDecision(
-                operation=Operation.CLOSE,
-                symbol=symbol,
-                target_portion_of_balance=1.0,
-                leverage=int(engine_params.get("default_leverage", self.default_leverage)),
-                max_price=price * 1.001,
-                reason=f"{regime}反转平多, short_score={short_score:.3f}>=close={close_threshold:.3f}",
-                metadata={**metadata_base, "long_score": long_score, "short_score": short_score},
+        reverse_close_threshold = close_threshold + self.reverse_close_score_buffer
+        required_reverse_bars = int(self.reverse_close_confirm_bars)
+        if regime == "NO_TRADE":
+            required_reverse_bars += int(self.reverse_close_no_trade_extra_bars)
+        required_reverse_bars = max(1, required_reverse_bars)
+
+        if pos_side == "LONG":
+            reverse_trigger = (
+                short_score >= reverse_close_threshold
+                and (short_score - long_score) >= self.reverse_close_min_gap
             )
-        if pos_side == "SHORT" and long_score >= close_threshold:
-            return FundFlowDecision(
-                operation=Operation.CLOSE,
-                symbol=symbol,
-                target_portion_of_balance=1.0,
-                leverage=int(engine_params.get("default_leverage", self.default_leverage)),
-                min_price=price * 0.999,
-                reason=f"{regime}反转平空, long_score={long_score:.3f}>=close={close_threshold:.3f}",
-                metadata={**metadata_base, "long_score": long_score, "short_score": short_score},
+            if self.reverse_close_require_direction_lock:
+                reverse_trigger = reverse_trigger and direction == "SHORT_ONLY"
+            streak = self._update_reverse_close_streak(symbol, pos_side, reverse_trigger)
+            if reverse_trigger and streak < required_reverse_bars:
+                return FundFlowDecision(
+                    operation=Operation.HOLD,
+                    symbol=symbol,
+                    target_portion_of_balance=0.0,
+                    leverage=int(engine_params.get("default_leverage", self.default_leverage)),
+                    reason=(
+                        f"{regime}反转待确认(平多) {streak}/{required_reverse_bars}, "
+                        f"short={short_score:.3f} long={long_score:.3f} "
+                        f"thr={reverse_close_threshold:.3f} gap={short_score - long_score:.3f}"
+                    ),
+                    metadata={
+                        **metadata_base,
+                        "long_score": long_score,
+                        "short_score": short_score,
+                        "reverse_close_streak": streak,
+                        "reverse_close_required_bars": required_reverse_bars,
+                        "reverse_close_triggered": True,
+                    },
+                )
+            if reverse_trigger and streak >= required_reverse_bars:
+                self._update_reverse_close_streak(symbol, pos_side, False)
+                return FundFlowDecision(
+                    operation=Operation.CLOSE,
+                    symbol=symbol,
+                    target_portion_of_balance=1.0,
+                    leverage=int(engine_params.get("default_leverage", self.default_leverage)),
+                    max_price=price * 1.001,
+                    reason=(
+                        f"{regime}反转平多(确认{streak}/{required_reverse_bars}), "
+                        f"short={short_score:.3f}>=close={reverse_close_threshold:.3f}"
+                    ),
+                    metadata={**metadata_base, "long_score": long_score, "short_score": short_score},
+                )
+
+        if pos_side == "SHORT":
+            reverse_trigger = (
+                long_score >= reverse_close_threshold
+                and (long_score - short_score) >= self.reverse_close_min_gap
             )
+            if self.reverse_close_require_direction_lock:
+                reverse_trigger = reverse_trigger and direction == "LONG_ONLY"
+            streak = self._update_reverse_close_streak(symbol, pos_side, reverse_trigger)
+            if reverse_trigger and streak < required_reverse_bars:
+                return FundFlowDecision(
+                    operation=Operation.HOLD,
+                    symbol=symbol,
+                    target_portion_of_balance=0.0,
+                    leverage=int(engine_params.get("default_leverage", self.default_leverage)),
+                    reason=(
+                        f"{regime}反转待确认(平空) {streak}/{required_reverse_bars}, "
+                        f"long={long_score:.3f} short={short_score:.3f} "
+                        f"thr={reverse_close_threshold:.3f} gap={long_score - short_score:.3f}"
+                    ),
+                    metadata={
+                        **metadata_base,
+                        "long_score": long_score,
+                        "short_score": short_score,
+                        "reverse_close_streak": streak,
+                        "reverse_close_required_bars": required_reverse_bars,
+                        "reverse_close_triggered": True,
+                    },
+                )
+            if reverse_trigger and streak >= required_reverse_bars:
+                self._update_reverse_close_streak(symbol, pos_side, False)
+                return FundFlowDecision(
+                    operation=Operation.CLOSE,
+                    symbol=symbol,
+                    target_portion_of_balance=1.0,
+                    leverage=int(engine_params.get("default_leverage", self.default_leverage)),
+                    min_price=price * 0.999,
+                    reason=(
+                        f"{regime}反转平空(确认{streak}/{required_reverse_bars}), "
+                        f"long={long_score:.3f}>=close={reverse_close_threshold:.3f}"
+                    ),
+                    metadata={**metadata_base, "long_score": long_score, "short_score": short_score},
+                )
 
         if regime == "NO_TRADE":
             return FundFlowDecision(

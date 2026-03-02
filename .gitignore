@@ -38,3 +38,12 @@ run/
 config/backups/
 .mcp/
 mcp-*/
+# npm cache and node_modules
+.npm-cache/
+node_modules/
+# Additional ignores
+*.png
+tmp/
+user/skills/
+*.status
+*[0-9].backup.json
