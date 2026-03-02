@@ -1388,6 +1388,41 @@ class TradingBot:
                 continue
         return [x for x in closes if x > 0]
 
+    @staticmethod
+    def _extract_ohlc_from_klines(klines: Any) -> Tuple[List[float], List[float], List[float], List[float]]:
+        opens: List[float] = []
+        highs: List[float] = []
+        lows: List[float] = []
+        closes: List[float] = []
+        if not isinstance(klines, list):
+            return opens, highs, lows, closes
+        for item in klines:
+            try:
+                if isinstance(item, (list, tuple)) and len(item) > 4:
+                    o = float(item[1])
+                    h = float(item[2])
+                    l = float(item[3])
+                    c = float(item[4])
+                elif isinstance(item, dict):
+                    o = float(item.get("open", item.get("o", 0.0)) or 0.0)
+                    h = float(item.get("high", item.get("h", 0.0)) or 0.0)
+                    l = float(item.get("low", item.get("l", 0.0)) or 0.0)
+                    c = float(item.get("close", item.get("c", 0.0)) or 0.0)
+                else:
+                    continue
+                if o > 0 and h > 0 and l > 0 and c > 0 and h >= l:
+                    opens.append(o)
+                    highs.append(h)
+                    lows.append(l)
+                    closes.append(c)
+            except Exception:
+                continue
+        return opens, highs, lows, closes
+
+    @staticmethod
+    def _clip_unit(value: float) -> float:
+        return max(-1.0, min(1.0, float(value)))
+
     def _macd_state_from_closes(
         self,
         closes: List[float],
@@ -1443,15 +1478,142 @@ class TradingBot:
         hist_expand_up = hist[-1] > hist[-2] > hist[-3]
         hist_expand_down = hist[-1] < hist[-2] < hist[-3]
         hist_expand = abs(hist[-1]) > abs(hist[-2]) > abs(hist[-3])
+        hist_delta = float(hist[-1] - hist[-2])
+        tail = hist[-20:] if len(hist) >= 20 else hist
+        hist_abs_mean = sum(abs(float(x)) for x in tail) / max(1, len(tail))
+        hist_norm = self._clip_unit(h0 / max(hist_abs_mean * 2.5, 1e-9))
         return {
             "macd": m0,
             "signal": s0,
             "hist": h0,
+            "hist_norm": hist_norm,
+            "hist_delta": hist_delta,
             "cross": cross,
             "zone": zone,
             "hist_expand": bool(hist_expand),
             "hist_expand_up": bool(hist_expand_up),
             "hist_expand_down": bool(hist_expand_down),
+        }
+
+    def _kdj_state_from_ohlc(
+        self,
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+        *,
+        period: int = 9,
+        smooth: int = 3,
+    ) -> Dict[str, Any]:
+        min_len = max(int(period) + 2, 12)
+        if len(highs) < min_len or len(lows) < min_len or len(closes) < min_len:
+            return {
+                "k": 50.0,
+                "d": 50.0,
+                "j": 50.0,
+                "k_norm": 0.0,
+                "d_norm": 0.0,
+                "j_norm": 0.0,
+                "cross": "NONE",
+                "zone": "MID",
+            }
+        p = max(2, int(period))
+        alpha = 1.0 / float(max(1, int(smooth)))
+        k_series: List[float] = []
+        d_series: List[float] = []
+        k_prev = 50.0
+        d_prev = 50.0
+        for i in range(len(closes)):
+            if i < p - 1:
+                k_series.append(k_prev)
+                d_series.append(d_prev)
+                continue
+            ll = min(lows[i - p + 1 : i + 1])
+            hh = max(highs[i - p + 1 : i + 1])
+            span = max(hh - ll, 1e-9)
+            rsv = (closes[i] - ll) / span * 100.0
+            k_prev = (1.0 - alpha) * k_prev + alpha * rsv
+            d_prev = (1.0 - alpha) * d_prev + alpha * k_prev
+            k_series.append(k_prev)
+            d_series.append(d_prev)
+        k0 = float(k_series[-1])
+        d0 = float(d_series[-1])
+        k1 = float(k_series[-2])
+        d1 = float(d_series[-2])
+        j0 = float(3.0 * k0 - 2.0 * d0)
+        cross = "NONE"
+        if k1 <= d1 and k0 > d0:
+            cross = "GOLDEN"
+        elif k1 >= d1 and k0 < d0:
+            cross = "DEAD"
+        if j0 >= 80.0:
+            zone = "HIGH"
+        elif j0 <= 20.0:
+            zone = "LOW"
+        else:
+            zone = "MID"
+        return {
+            "k": k0,
+            "d": d0,
+            "j": j0,
+            "k_norm": self._clip_unit((k0 - 50.0) / 50.0),
+            "d_norm": self._clip_unit((d0 - 50.0) / 50.0),
+            "j_norm": self._clip_unit((j0 - 50.0) / 50.0),
+            "cross": cross,
+            "zone": zone,
+        }
+
+    def _bollinger_state_from_closes(
+        self,
+        closes: List[float],
+        *,
+        period: int = 20,
+        num_std: float = 2.0,
+    ) -> Dict[str, Any]:
+        n = max(5, int(period))
+        if len(closes) < n:
+            return {
+                "middle": 0.0,
+                "upper": 0.0,
+                "lower": 0.0,
+                "width": 0.0,
+                "width_norm": 0.0,
+                "pos_norm": 0.0,
+                "break": "NONE",
+                "trend": "MID",
+                "squeeze": False,
+            }
+        window = closes[-n:]
+        middle = sum(window) / float(n)
+        var = sum((x - middle) ** 2 for x in window) / float(n)
+        std = math.sqrt(max(var, 0.0))
+        upper = middle + num_std * std
+        lower = middle - num_std * std
+        close = float(closes[-1])
+        band = max(upper - lower, 1e-9)
+        width = band / max(abs(middle), 1e-9)
+        pos_norm = self._clip_unit((close - (upper + lower) * 0.5) / max(band * 0.5, 1e-9))
+        width_norm = self._clip_unit((width - 0.01) / 0.05)
+        bb_break = "NONE"
+        if close > upper:
+            bb_break = "UPPER"
+        elif close < lower:
+            bb_break = "LOWER"
+        trend = "MID"
+        if close >= upper * 0.995:
+            trend = "ALONG_UPPER"
+        elif close <= lower * 1.005:
+            trend = "ALONG_LOWER"
+        squeeze = bool(width <= 0.02)
+        return {
+            "middle": float(middle),
+            "upper": float(upper),
+            "lower": float(lower),
+            "width": float(width),
+            "width_norm": float(width_norm),
+            "pos_norm": float(pos_norm),
+            "break": bb_break,
+            "trend": trend,
+            "squeeze": squeeze,
         }
 
     def _compute_ma10_macd_confluence(self, symbol: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -1468,7 +1630,7 @@ class TradingBot:
 
         k_exec = self.client.get_klines(symbol=symbol, interval=tf_exec, limit=limit_exec) or []
         k_anchor = self.client.get_klines(symbol=symbol, interval=tf_anchor, limit=limit_anchor) or []
-        closes_exec = self._extract_closes_from_klines(k_exec)
+        opens_exec, highs_exec, lows_exec, closes_exec = self._extract_ohlc_from_klines(k_exec)
         closes_anchor = self._extract_closes_from_klines(k_anchor)
 
         ma10_5m = self._sma(closes_exec, ma_period)
@@ -1476,6 +1638,7 @@ class TradingBot:
         ma10_1h_prev = self._sma(closes_anchor[:-1], ma_period) if len(closes_anchor) > ma_period else 0.0
         slope = float(ma10_1h - ma10_1h_prev) if ma10_1h > 0 and ma10_1h_prev > 0 else 0.0
         last_close_exec = float(closes_exec[-1]) if closes_exec else 0.0
+        last_open_exec = float(opens_exec[-1]) if opens_exec else 0.0
         last_close_anchor = float(closes_anchor[-1]) if closes_anchor else 0.0
 
         if last_close_anchor > ma10_1h and slope > 0:
@@ -1491,22 +1654,123 @@ class TradingBot:
             slow=macd_slow,
             signal=macd_signal,
         )
+        kdj_state = self._kdj_state_from_ohlc(
+            highs_exec,
+            lows_exec,
+            closes_exec,
+            period=9,
+            smooth=3,
+        )
+        bb_state = self._bollinger_state_from_closes(closes_exec, period=20, num_std=2.0)
+
+        bb_break_bias = 0.0
+        if bb_state.get("break") == "UPPER":
+            bb_break_bias = 1.0
+        elif bb_state.get("break") == "LOWER":
+            bb_break_bias = -1.0
+        bb_trend_bias = 0.0
+        if bb_state.get("trend") == "ALONG_UPPER":
+            bb_trend_bias = 1.0
+        elif bb_state.get("trend") == "ALONG_LOWER":
+            bb_trend_bias = -1.0
+
+        macd_cross = str(macd_state.get("cross", "NONE")).upper()
+        macd_cross_bias = 1.0 if macd_cross == "GOLDEN" else (-1.0 if macd_cross == "DEAD" else 0.0)
+        kdj_cross = str(kdj_state.get("cross", "NONE")).upper()
+        kdj_cross_bias = 1.0 if kdj_cross == "GOLDEN" else (-1.0 if kdj_cross == "DEAD" else 0.0)
+
         return {
             "ma10_5m": float(ma10_5m),
             "ma10_1h": float(ma10_1h),
             "ma10_1h_slope": float(slope),
             "ma10_1h_bias": int(bias),
+            "last_open_5m": float(last_open_exec),
             "last_close_5m": float(last_close_exec),
             "last_close_1h": float(last_close_anchor),
             "macd_5m": float(macd_state.get("macd", 0.0)),
             "macd_5m_signal": float(macd_state.get("signal", 0.0)),
             "macd_5m_hist": float(macd_state.get("hist", 0.0)),
+            "macd_5m_hist_norm": float(macd_state.get("hist_norm", 0.0)),
+            "macd_5m_hist_delta": float(macd_state.get("hist_delta", 0.0)),
             "macd_5m_cross": str(macd_state.get("cross", "NONE")),
             "macd_5m_zone": str(macd_state.get("zone", "NEAR_ZERO")),
             "macd_5m_hist_expand": bool(macd_state.get("hist_expand", False)),
             "macd_5m_hist_expand_up": bool(macd_state.get("hist_expand_up", False)),
             "macd_5m_hist_expand_down": bool(macd_state.get("hist_expand_down", False)),
+            "kdj_k": float(kdj_state.get("k", 50.0)),
+            "kdj_d": float(kdj_state.get("d", 50.0)),
+            "kdj_j": float(kdj_state.get("j", 50.0)),
+            "kdj_k_norm": float(kdj_state.get("k_norm", 0.0)),
+            "kdj_d_norm": float(kdj_state.get("d_norm", 0.0)),
+            "kdj_j_norm": float(kdj_state.get("j_norm", 0.0)),
+            "kdj_cross": str(kdj_state.get("cross", "NONE")),
+            "kdj_zone": str(kdj_state.get("zone", "MID")),
+            "bb_middle": float(bb_state.get("middle", 0.0)),
+            "bb_upper": float(bb_state.get("upper", 0.0)),
+            "bb_lower": float(bb_state.get("lower", 0.0)),
+            "bb_width": float(bb_state.get("width", 0.0)),
+            "bb_width_norm": float(bb_state.get("width_norm", 0.0)),
+            "bb_pos_norm": float(bb_state.get("pos_norm", 0.0)),
+            "bb_break": str(bb_state.get("break", "NONE")),
+            "bb_break_bias": float(bb_break_bias),
+            "bb_trend": str(bb_state.get("trend", "MID")),
+            "bb_trend_bias": float(bb_trend_bias),
+            "bb_squeeze": bool(bb_state.get("squeeze", False)),
+            "macd_cross_bias": float(macd_cross_bias),
+            "kdj_cross_bias": float(kdj_cross_bias),
+            # DecisionEngine 读取的统一别名（避免只写 *_5m 导致主判特征缺失）
+            "macd_hist_norm": float(macd_state.get("hist_norm", 0.0)),
+            "macd_hist_delta": float(macd_state.get("hist_delta", 0.0)),
+            "macd_cross": str(macd_state.get("cross", "NONE")),
+            "macd_zone": str(macd_state.get("zone", "NEAR_ZERO")),
         }
+
+    def _inject_confluence_into_flow_context(
+        self,
+        flow_context: Dict[str, Any],
+        confluence: Dict[str, Any],
+        cfg: Dict[str, Any],
+    ) -> None:
+        if not isinstance(flow_context, dict) or not isinstance(confluence, dict):
+            return
+        timeframes_raw = flow_context.get("timeframes")
+        timeframes: Dict[str, Any] = timeframes_raw if isinstance(timeframes_raw, dict) else {}
+        tf_exec = str(cfg.get("tf_exec", "5m") or "5m").strip().lower()
+        tf_ctx_raw = timeframes.get(tf_exec)
+        tf_ctx: Dict[str, Any] = tf_ctx_raw if isinstance(tf_ctx_raw, dict) else {}
+        tf_ctx.update(
+            {
+                "last_open": self._to_float(confluence.get("last_open_5m"), self._to_float(tf_ctx.get("last_open"), 0.0)),
+                "last_close": self._to_float(confluence.get("last_close_5m"), self._to_float(tf_ctx.get("last_close"), 0.0)),
+                "macd_hist_norm": self._to_float(confluence.get("macd_hist_norm"), self._to_float(tf_ctx.get("macd_hist_norm"), 0.0)),
+                "macd_hist_delta": self._to_float(confluence.get("macd_hist_delta"), self._to_float(tf_ctx.get("macd_hist_delta"), 0.0)),
+                "macd_cross": str(confluence.get("macd_cross", tf_ctx.get("macd_cross", "NONE"))),
+                "macd_zone": str(confluence.get("macd_zone", tf_ctx.get("macd_zone", "NEAR_ZERO"))),
+                "kdj_k": self._to_float(confluence.get("kdj_k"), self._to_float(tf_ctx.get("kdj_k"), 50.0)),
+                "kdj_d": self._to_float(confluence.get("kdj_d"), self._to_float(tf_ctx.get("kdj_d"), 50.0)),
+                "kdj_j": self._to_float(confluence.get("kdj_j"), self._to_float(tf_ctx.get("kdj_j"), 50.0)),
+                "kdj_k_norm": self._to_float(confluence.get("kdj_k_norm"), self._to_float(tf_ctx.get("kdj_k_norm"), 0.0)),
+                "kdj_d_norm": self._to_float(confluence.get("kdj_d_norm"), self._to_float(tf_ctx.get("kdj_d_norm"), 0.0)),
+                "kdj_j_norm": self._to_float(confluence.get("kdj_j_norm"), self._to_float(tf_ctx.get("kdj_j_norm"), 0.0)),
+                "kdj_cross": str(confluence.get("kdj_cross", tf_ctx.get("kdj_cross", "NONE"))),
+                "kdj_zone": str(confluence.get("kdj_zone", tf_ctx.get("kdj_zone", "MID"))),
+                "bb_middle": self._to_float(confluence.get("bb_middle"), self._to_float(tf_ctx.get("bb_middle"), 0.0)),
+                "bb_upper": self._to_float(confluence.get("bb_upper"), self._to_float(tf_ctx.get("bb_upper"), 0.0)),
+                "bb_lower": self._to_float(confluence.get("bb_lower"), self._to_float(tf_ctx.get("bb_lower"), 0.0)),
+                "bb_width": self._to_float(confluence.get("bb_width"), self._to_float(tf_ctx.get("bb_width"), 0.0)),
+                "bb_width_norm": self._to_float(confluence.get("bb_width_norm"), self._to_float(tf_ctx.get("bb_width_norm"), 0.0)),
+                "bb_pos_norm": self._to_float(confluence.get("bb_pos_norm"), self._to_float(tf_ctx.get("bb_pos_norm"), 0.0)),
+                "bb_break": str(confluence.get("bb_break", tf_ctx.get("bb_break", "NONE"))),
+                "bb_break_bias": self._to_float(confluence.get("bb_break_bias"), self._to_float(tf_ctx.get("bb_break_bias"), 0.0)),
+                "bb_trend": str(confluence.get("bb_trend", tf_ctx.get("bb_trend", "MID"))),
+                "bb_trend_bias": self._to_float(confluence.get("bb_trend_bias"), self._to_float(tf_ctx.get("bb_trend_bias"), 0.0)),
+                "bb_squeeze": bool(confluence.get("bb_squeeze", tf_ctx.get("bb_squeeze", False))),
+                "macd_cross_bias": self._to_float(confluence.get("macd_cross_bias"), self._to_float(tf_ctx.get("macd_cross_bias"), 0.0)),
+                "kdj_cross_bias": self._to_float(confluence.get("kdj_cross_bias"), self._to_float(tf_ctx.get("kdj_cross_bias"), 0.0)),
+            }
+        )
+        timeframes[tf_exec] = tf_ctx
+        flow_context["timeframes"] = timeframes
 
     def _apply_ma10_macd_entry_filter(self, symbol: str, decision: FundFlowDecision) -> FundFlowDecision:
         cfg = self._ma10_macd_confluence_config()
@@ -1831,6 +2095,7 @@ class TradingBot:
                     md["pretrade_risk_gate"] = gate_meta
 
                 if not exit_confirmed:
+                    gate_meta["action"] = "HOLD"
                     base_reason = str(decision.reason or "").strip()
                     delay_reason = (
                         "PRE_RISK_EXIT_DELAY "
@@ -4294,6 +4559,15 @@ class TradingBot:
                 "total_assets": self._to_float(account_summary.get("equity"), 0.0),
             }
             trigger_context = {"trigger_type": trigger_type, "signal_pool_id": None}
+
+            confluence_cfg = self._ma10_macd_confluence_config()
+            confluence: Dict[str, Any] = {}
+            if bool(confluence_cfg.get("enabled", True)):
+                try:
+                    confluence = self._compute_ma10_macd_confluence(symbol, confluence_cfg)
+                    self._inject_confluence_into_flow_context(flow_context, confluence, confluence_cfg)
+                except Exception as e:
+                    print(f"⚠️ {symbol} MA10+MACD/KDJ/布林 帧内特征注入失败: {e}")
             
             decision = self.fund_flow_decision_engine.decide(
                 symbol=symbol,
@@ -4324,10 +4598,8 @@ class TradingBot:
                 print(f"⏭️ {symbol} 非开仓窗口，开仓信号降级为HOLD并继续执行持仓风控")
                 decision_md = decision.metadata if isinstance(decision.metadata, dict) else decision_md
             
-            confluence_cfg = self._ma10_macd_confluence_config()
-            if bool(confluence_cfg.get("enabled", True)):
+            if confluence:
                 try:
-                    confluence = self._compute_ma10_macd_confluence(symbol, confluence_cfg)
                     decision_md.update(confluence)
                     if not isinstance(getattr(decision, "metadata", None), dict):
                         decision.metadata = decision_md

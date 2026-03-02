@@ -100,7 +100,7 @@ class FundFlowDecisionEngine:
         self.range_trap_guard_max_quantile = min(0.95, max(0.50, trap_guard_q))
         # 反转平仓降噪: 要求连续确认 + 分差过滤，避免单根K线噪音触发平仓
         self.reverse_close_confirm_bars = max(
-            1, int(self._to_float(ff.get("reverse_close_confirm_bars"), 2))
+            1, int(self._to_float(ff.get("reverse_close_confirm_bars"), 1))
         )
         self.reverse_close_score_buffer = max(
             0.0, self._to_float(ff.get("reverse_close_score_buffer"), 0.02)
@@ -705,7 +705,29 @@ class FundFlowDecisionEngine:
 
         # MACD hist
         macd_hist_norm = self._to_float(tf_ctx.get("macd_hist_norm"), 0.0)
+        if abs(macd_hist_norm) < 1e-9:
+            macd_hist_norm = self._to_float(tf_ctx.get("macd_5m_hist_norm"), 0.0)
+        if abs(macd_hist_norm) < 1e-9:
+            macd_hist_raw = self._to_float(tf_ctx.get("macd_5m_hist"), self._to_float(tf_ctx.get("macd_hist"), 0.0))
+            macd_hist_norm = max(-1.0, min(1.0, macd_hist_raw / 0.003))
         features["macd"] = max(-1.0, min(1.0, macd_hist_norm))
+
+        macd_cross = str(tf_ctx.get("macd_cross", tf_ctx.get("macd_5m_cross", "NONE"))).upper()
+        macd_cross_bias = self._to_float(tf_ctx.get("macd_cross_bias"), 0.0)
+        if abs(macd_cross_bias) < 1e-9:
+            macd_cross_bias = 1.0 if macd_cross == "GOLDEN" else (-1.0 if macd_cross == "DEAD" else 0.0)
+        features["macd_cross"] = max(-1.0, min(1.0, macd_cross_bias))
+
+        macd_hist_delta = self._to_float(
+            tf_ctx.get("macd_hist_delta"),
+            self._to_float(tf_ctx.get("macd_5m_hist_delta"), 0.0),
+        )
+        if abs(macd_hist_delta) < 1e-9:
+            if bool(tf_ctx.get("macd_5m_hist_expand_up", False)):
+                macd_hist_delta = 1.0
+            elif bool(tf_ctx.get("macd_5m_hist_expand_down", False)):
+                macd_hist_delta = -1.0
+        features["macd_hist_mom"] = max(-1.0, min(1.0, macd_hist_delta))
 
         # KDJ(J) 归一化值：优先读取 kdj_j_norm，回退使用 (J-50)/50
         kdj_j_norm = self._to_float(tf_ctx.get("kdj_j_norm"), 0.0)
@@ -713,6 +735,20 @@ class FundFlowDecisionEngine:
             kdj_j = self._to_float(tf_ctx.get("kdj_j"), 50.0)
             kdj_j_norm = (kdj_j - 50.0) / 50.0
         features["kdj"] = max(-1.0, min(1.0, kdj_j_norm))
+        kdj_cross = str(tf_ctx.get("kdj_cross", "NONE")).upper()
+        kdj_cross_bias = self._to_float(tf_ctx.get("kdj_cross_bias"), 0.0)
+        if abs(kdj_cross_bias) < 1e-9:
+            kdj_cross_bias = 1.0 if kdj_cross == "GOLDEN" else (-1.0 if kdj_cross == "DEAD" else 0.0)
+        features["kdj_cross"] = max(-1.0, min(1.0, kdj_cross_bias))
+        kdj_zone = str(tf_ctx.get("kdj_zone", "MID")).upper()
+        kdj_zone_bias = 0.0
+        if kdj_zone == "LOW":
+            kdj_zone_bias = 0.5
+        elif kdj_zone == "HIGH":
+            kdj_zone_bias = -0.5
+        if abs(kdj_j_norm) > 0.7:
+            kdj_zone_bias += -0.2 if kdj_j_norm > 0 else 0.2
+        features["kdj_zone"] = max(-1.0, min(1.0, kdj_zone_bias))
 
         # Bollinger 方向特征：
         # 优先用上游归一化字段，回退使用 upper/lower/middle + close(mid_price/last_close)估算
@@ -741,6 +777,23 @@ class FundFlowDecisionEngine:
                 # 带宽大说明趋势性更强，小带宽降权
                 bb_width_norm = max(-1.0, min(1.0, (bw - 0.01) / 0.05))
         features["bb"] = max(-1.0, min(1.0, 0.75 * bb_pos_norm + 0.25 * bb_width_norm))
+        bb_break_bias = self._to_float(tf_ctx.get("bb_break_bias"), 0.0)
+        if abs(bb_break_bias) < 1e-9:
+            bb_break = str(tf_ctx.get("bb_break", "NONE")).upper()
+            if bb_break == "UPPER":
+                bb_break_bias = 1.0
+            elif bb_break == "LOWER":
+                bb_break_bias = -1.0
+        features["bb_break"] = max(-1.0, min(1.0, bb_break_bias))
+        bb_trend_bias = self._to_float(tf_ctx.get("bb_trend_bias"), 0.0)
+        if abs(bb_trend_bias) < 1e-9:
+            bb_trend = str(tf_ctx.get("bb_trend", "MID")).upper()
+            if bb_trend == "ALONG_UPPER":
+                bb_trend_bias = 1.0
+            elif bb_trend == "ALONG_LOWER":
+                bb_trend_bias = -1.0
+        features["bb_trend"] = max(-1.0, min(1.0, bb_trend_bias))
+        features["bb_squeeze"] = 1.0 if bool(tf_ctx.get("bb_squeeze", False)) else 0.0
 
         # ========== 确认/否决指标 (不决定方向，用于确认或否决) ==========
 
@@ -767,10 +820,37 @@ class FundFlowDecisionEngine:
         macd_val = self._to_float(features.get("macd"), 0.0)
         kdj_val = self._to_float(features.get("kdj"), 0.0)
         bb_val = self._to_float(features.get("bb"), 0.0)
+        macd_cross = self._to_float(features.get("macd_cross"), 0.0)
+        macd_hist_mom = self._to_float(features.get("macd_hist_mom"), 0.0)
+        kdj_cross = self._to_float(features.get("kdj_cross"), 0.0)
+        kdj_zone = self._to_float(features.get("kdj_zone"), 0.0)
+        bb_break = self._to_float(features.get("bb_break"), 0.0)
+        bb_trend = self._to_float(features.get("bb_trend"), 0.0)
+        bb_squeeze = self._to_float(features.get("bb_squeeze"), 0.0)
         cvd_val = self._to_float(features.get("cvd"), 0.0)
 
-        score_macd_kdj = 0.60 * macd_val + 0.40 * kdj_val
-        score_macd_bb = 0.60 * macd_val + 0.40 * bb_val
+        # MACD+KDJ: 更偏向拐点确认（方向 + 交叉 + 区间）
+        score_macd_kdj = (
+            0.40 * macd_val
+            + 0.20 * kdj_val
+            + 0.14 * macd_cross
+            + 0.10 * kdj_cross
+            + 0.10 * macd_hist_mom
+            + 0.06 * kdj_zone
+        )
+        # MACD+BB: 更偏向趋势延续（方向 + 突破 + 轨道运行）
+        score_macd_bb = (
+            0.40 * macd_val
+            + 0.20 * bb_val
+            + 0.14 * macd_cross
+            + 0.10 * bb_break
+            + 0.10 * bb_trend
+            + 0.06 * macd_hist_mom
+        )
+
+        # 布林压缩区减少趋势分数，避免横盘误判
+        if bb_squeeze > 0.5:
+            score_macd_bb *= 0.72
 
         # 与 CVD 同向时略微加分（只用于组合优先级，不直接改方向）
         align_kdj = 1 if (score_macd_kdj * cvd_val > 0 and abs(cvd_val) > 0.05) else 0
@@ -786,6 +866,10 @@ class FundFlowDecisionEngine:
         mixed_score = winner_score
         if winner_score * loser_score > 0:
             mixed_score = 0.8 * winner_score + 0.2 * loser_score
+
+        mixed_score = max(-1.0, min(1.0, mixed_score))
+        score_macd_kdj = max(-1.0, min(1.0, score_macd_kdj))
+        score_macd_bb = max(-1.0, min(1.0, score_macd_bb))
 
         return {
             "winner": winner,
@@ -824,6 +908,12 @@ class FundFlowDecisionEngine:
         components["combo_macd_kdj"] = round(self._to_float(combo_compare.get("score_macd_kdj"), 0.0), 3)
         components["combo_macd_bb"] = round(self._to_float(combo_compare.get("score_macd_bb"), 0.0), 3)
         components["combo_winner"] = 1.0 if str(combo_compare.get("winner")) == "MACD+KDJ" else -1.0
+        components["macd"] = round(self._to_float(features.get("macd"), 0.0), 3)
+        components["kdj"] = round(self._to_float(features.get("kdj"), 0.0), 3)
+        components["bb"] = round(self._to_float(features.get("bb"), 0.0), 3)
+        components["macd_cross"] = round(self._to_float(features.get("macd_cross"), 0.0), 3)
+        components["kdj_cross"] = round(self._to_float(features.get("kdj_cross"), 0.0), 3)
+        components["bb_break"] = round(self._to_float(features.get("bb_break"), 0.0), 3)
 
         # ========== 确认/否决指标 (CVD, imbalance) ==========
         # 不参与方向决定，只用于确认或否决
@@ -832,7 +922,12 @@ class FundFlowDecisionEngine:
 
         # ========== 主指标失效检测 ==========
         # 当所有主指标都接近0时，启用CVD/imbalance作为备用方向判断
-        primary_indicators_flat = all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "kdj", "bb"))
+        primary_indicators_flat = (
+            all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "kdj", "bb"))
+            and abs(features.get("macd_cross", 0.0)) < 0.5
+            and abs(features.get("kdj_cross", 0.0)) < 0.5
+            and abs(features.get("bb_break", 0.0)) < 0.5
+        )
 
         if primary_indicators_flat and (abs(cvd_val) > 0.1 or abs(imb_val) > 0.1):
             # 主指标失效，使用CVD和imbalance作为方向判断
@@ -942,6 +1037,9 @@ class FundFlowDecisionEngine:
         components["combo_macd_kdj"] = round(self._to_float(ev_combo.get("score_macd_kdj"), 0.0), 3)
         components["combo_macd_bb"] = round(self._to_float(ev_combo.get("score_macd_bb"), 0.0), 3)
         components["combo_winner"] = 1.0 if str(ev_combo.get("winner")) == "MACD+KDJ" else -1.0
+        components["macd_cross"] = round(self._to_float(features.get("macd_cross"), 0.0), 3)
+        components["kdj_cross"] = round(self._to_float(features.get("kdj_cross"), 0.0), 3)
+        components["bb_break"] = round(self._to_float(features.get("bb_break"), 0.0), 3)
 
         # ========== 确认/否决指标 (不参与方向决定) ==========
         cvd_val = features.get("cvd", 0.0)
@@ -956,7 +1054,12 @@ class FundFlowDecisionEngine:
 
         # ========== 主指标失效检测 ==========
         # 当所有主指标都接近0时，启用CVD/imbalance作为备用方向判断
-        primary_indicators_flat = all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "kdj", "bb"))
+        primary_indicators_flat = (
+            all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "kdj", "bb"))
+            and abs(features.get("macd_cross", 0.0)) < 0.5
+            and abs(features.get("kdj_cross", 0.0)) < 0.5
+            and abs(features.get("bb_break", 0.0)) < 0.5
+        )
 
         if primary_indicators_flat and (abs(cvd_val) > 0.1 or abs(imb_val) > 0.1):
             # 主指标失效，使用CVD和imbalance作为方向判断
