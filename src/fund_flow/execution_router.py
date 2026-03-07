@@ -610,7 +610,25 @@ class FundFlowExecutionRouter:
     def _place_tp_sl(self, decision: FundFlowDecision, position_side: str) -> Dict[str, Any]:
         tp = decision.take_profit_price
         sl = decision.stop_loss_price
-        if tp is None and sl is None:
+        metadata = decision.metadata if isinstance(decision.metadata, dict) else {}
+        tp_levels_raw = metadata.get("tp_levels") if isinstance(metadata, dict) else None
+        tp_levels: List[Tuple[float, float]] = []
+        if isinstance(tp_levels_raw, list):
+            for item in tp_levels_raw:
+                if not isinstance(item, dict):
+                    continue
+                level_price_raw = item.get("price")
+                reduce_pct_raw = item.get("reduce_pct")
+                if level_price_raw is None or reduce_pct_raw is None:
+                    continue
+                try:
+                    level_price = float(level_price_raw)
+                    reduce_pct = float(reduce_pct_raw)
+                except Exception:
+                    continue
+                if level_price > 0 and reduce_pct > 0:
+                    tp_levels.append((level_price, max(0.0, min(1.0, reduce_pct))))
+        if tp is None and sl is None and not tp_levels:
             return {"status": "noop", "message": "no tp/sl"}
         side = IntentPositionSide.LONG if position_side == "LONG" else IntentPositionSide.SHORT
         qty: Optional[float] = None
@@ -628,6 +646,7 @@ class FundFlowExecutionRouter:
                 tp=tp,
                 sl=sl,
                 quantity=qty,
+                tp_levels=tp_levels or None,
             )
         except Exception as e:
             return {"status": "error", "code": -1, "message": f"place_tp_sl exception: {e}"}

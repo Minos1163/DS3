@@ -226,6 +226,32 @@ class TriggerEngine:
             return {"triggered": False, "reason": "steady_true", "active": True}
         return {"triggered": False, "reason": "steady_false", "active": False}
 
+    def _sync_pool_edges_inactive(
+        self,
+        *,
+        symbol: str,
+        cfg: Dict[str, Any],
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        now = now or self._now()
+        if not isinstance(cfg, dict) or not cfg:
+            return {}
+        if not self._to_bool(cfg.get("edge_trigger_enabled", True), True):
+            return {}
+
+        pool_id = str(cfg.get("pool_id", cfg.get("id", "default")) or "default")
+        edge_cd = max(0, int(self._to_float(cfg.get("edge_cooldown_seconds", 0), 0.0)))
+        synced: Dict[str, Any] = {}
+        for operation in ("LONG", "SHORT"):
+            edge_key = f"{symbol.upper()}:{pool_id}:{operation}"
+            synced[operation] = self._edge_trigger(
+                key=edge_key,
+                condition_met=False,
+                now=now,
+                cooldown_seconds=edge_cd,
+            )
+        return synced
+
     def evaluate_signal_pool(
         self,
         *,
@@ -256,11 +282,13 @@ class TriggerEngine:
 
         operation = self._normalize_side(getattr(decision, "operation", ""))
         if operation not in ("LONG", "SHORT"):
-            return {"passed": True, "reason": "non_entry_operation"}
+            synced_edges = self._sync_pool_edges_inactive(symbol=symbol, cfg=cfg)
+            return {"passed": True, "reason": "non_entry_operation", "edge_sync": synced_edges}
 
         apply_when_position_exists = self._to_bool(cfg.get("apply_when_position_exists", False), False)
         if has_position and not apply_when_position_exists:
-            return {"passed": True, "reason": "position_exists_bypass"}
+            synced_edges = self._sync_pool_edges_inactive(symbol=symbol, cfg=cfg)
+            return {"passed": True, "reason": "position_exists_bypass", "edge_sync": synced_edges}
 
         scores = self._extract_scores(decision)
         side_score = scores["long_score"] if operation == "LONG" else scores["short_score"]

@@ -833,6 +833,9 @@ class BinanceClient:
     def get_open_interest(self, *args, **kwargs):
         return self.market.get_open_interest(*args, **kwargs)
 
+    def get_open_interest_hist(self, *args, **kwargs):
+        return self.market.get_open_interest_hist(*args, **kwargs)
+
     def get_order_book(self, *args, **kwargs):
         return self.market.get_order_book(*args, **kwargs)
 
@@ -985,6 +988,147 @@ class BinanceClient:
                         return [x for x in nested if isinstance(x, dict)]
         return []
 
+    @staticmethod
+    def _order_type_upper(order: Dict[str, Any]) -> str:
+        return str(order.get("type") or order.get("strategyType") or "").upper()
+
+    def _is_active_protection_order(self, order: Dict[str, Any]) -> bool:
+        otype = self._order_type_upper(order)
+        if "TAKE_PROFIT" not in otype and "STOP" not in otype:
+            return False
+        status = str(order.get("status") or order.get("strategyStatus") or "").upper()
+        if status in ("CANCELED", "CANCELLED", "EXPIRED", "FILLED"):
+            return False
+        return True
+
+    def _protection_order_matches_side(self, order: Dict[str, Any], side: IntentPositionSide) -> bool:
+        side_up = str(side.value if hasattr(side, "value") else side).upper()
+        if side_up not in ("LONG", "SHORT"):
+            return True
+
+        expected_close_side = "SELL" if side_up == "LONG" else "BUY"
+        order_close_side = str(order.get("side") or order.get("orderSide") or "").upper()
+        if order_close_side in ("BUY", "SELL") and order_close_side != expected_close_side:
+            return False
+
+        order_pos_side = str(order.get("positionSide") or "").upper()
+        try:
+            hedge_mode = bool(self.broker.get_hedge_mode())
+        except Exception:
+            hedge_mode = False
+
+        if hedge_mode and order_pos_side:
+            return order_pos_side == side_up
+        if order_pos_side and order_pos_side not in (side_up, "BOTH"):
+            return False
+        return True
+
+    def _collect_open_protection_orders(self, symbol: str, side: IntentPositionSide) -> List[Dict[str, Any]]:
+        combined: List[Dict[str, Any]] = []
+        try:
+            cond_orders = self.get_open_conditional_orders(symbol) or []
+            if isinstance(cond_orders, list):
+                combined.extend([x for x in cond_orders if isinstance(x, dict)])
+        except Exception:
+            pass
+        try:
+            open_orders = self.get_open_orders(symbol) or []
+            if isinstance(open_orders, list):
+                combined.extend([x for x in open_orders if isinstance(x, dict)])
+        except Exception:
+            pass
+
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for order in combined:
+            if not self._is_active_protection_order(order):
+                continue
+            if not self._protection_order_matches_side(order, side):
+                continue
+            key = (
+                str(order.get("orderId") or ""),
+                str(order.get("strategyId") or ""),
+                self._order_type_upper(order),
+                str(order.get("stopPrice") or order.get("price") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(order)
+        return deduped
+
+    def _cancel_single_papi_conditional_order(self, symbol: str, order: Dict[str, Any]) -> bool:
+        params: Dict[str, Any] = {"symbol": symbol}
+        order_id = order.get("orderId")
+        strategy_id = order.get("strategyId")
+        if order_id is None and strategy_id is None:
+            return False
+        if order_id is not None:
+            params["orderId"] = order_id
+        if strategy_id is not None:
+            params["strategyId"] = strategy_id
+        status_code, _ = self._papi_request_json(
+            method="DELETE",
+            path="/papi/v1/um/conditional/order",
+            params=params,
+        )
+        return status_code < 400
+
+    def _cancel_existing_protection_orders(
+        self,
+        symbol: str,
+        side: IntentPositionSide,
+        cancel_tp: bool,
+        cancel_sl: bool,
+    ) -> Dict[str, Any]:
+        if not cancel_tp and not cancel_sl:
+            return {
+                "status": "noop",
+                "symbol": symbol,
+                "checked": 0,
+                "cancelled": 0,
+                "failed": 0,
+            }
+
+        checked = 0
+        cancelled = 0
+        failed = 0
+        is_papi = "papi" in self.broker.um_base()
+        for order in self._collect_open_protection_orders(symbol, side):
+            otype = self._order_type_upper(order)
+            is_tp = "TAKE_PROFIT" in otype
+            is_sl = ("STOP" in otype) and (not is_tp)
+            if is_tp and not cancel_tp:
+                continue
+            if is_sl and not cancel_sl:
+                continue
+
+            checked += 1
+            ok = False
+            try:
+                if is_papi:
+                    ok = self._cancel_single_papi_conditional_order(symbol, order)
+                if not ok:
+                    order_id = order.get("orderId")
+                    if order_id is not None:
+                        self.cancel_order(symbol, int(order_id))
+                        ok = True
+            except Exception:
+                ok = False
+
+            if ok:
+                cancelled += 1
+            else:
+                failed += 1
+
+        return {
+            "status": "success" if failed == 0 else "partial",
+            "symbol": symbol,
+            "checked": checked,
+            "cancelled": cancelled,
+            "failed": failed,
+        }
+
     def _papi_request_json(
         self,
         method: str,
@@ -1044,6 +1188,7 @@ class BinanceClient:
         tp: Optional[float],
         sl: Optional[float],
         quantity: Optional[float] = None,
+        tp_levels: Optional[List[Tuple[float, float]]] = None,
     ) -> Dict[str, Any]:
         """由状态机调用的保护单下单接口"""
         if self.broker.dry_run:
@@ -1076,6 +1221,13 @@ class BinanceClient:
                 "message": f"Invalid entry_price for {symbol}: {entry_price}. Cannot place protection orders.",
                 "orders": [],
             }
+
+        cleanup = self._cancel_existing_protection_orders(
+            symbol=symbol,
+            side=side,
+            cancel_tp=(tp is not None),
+            cancel_sl=(sl is not None),
+        )
 
         def _normalize_protection_result(orders: Any) -> Dict[str, Any]:
             order_list = orders if isinstance(orders, list) else []
@@ -1128,9 +1280,11 @@ class BinanceClient:
                 quantity=quantity,
                 stop_loss_price=sl,
                 take_profit_price=tp,
+                take_profit_levels=tp_levels,
             )
             results = manager.place_tp_sl(cfg)
             normalized = _normalize_protection_result(results)
+            normalized["cleanup"] = cleanup
             return normalized
 
         results = self._order_gateway.place_protection_orders(
@@ -1139,7 +1293,9 @@ class BinanceClient:
             tp=tp,
             sl=sl,
         )
-        return _normalize_protection_result(results)
+        normalized = _normalize_protection_result(results)
+        normalized["cleanup"] = cleanup
+        return normalized
 
     def get_server_time(self):
         url = f"{self.broker.FAPI_BASE}/fapi/v1/time"

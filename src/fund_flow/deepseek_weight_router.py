@@ -420,6 +420,7 @@ class DeepSeekWeightRouter:
         market_flow_context: Dict[str, Any],
         quantile_context: Optional[Dict[str, Any]] = None,
         use_ai: bool = True,
+        request_mode: str = "generic",
     ) -> WeightMap:
         """
         获取动态权重
@@ -430,6 +431,7 @@ class DeepSeekWeightRouter:
             market_flow_context: 市场资金流上下文
             quantile_context: 分位数上下文（可选）
             use_ai: 是否允许调用 AI（False 时仅使用本地规则/缓存）
+            request_mode: AI 请求模式（entry_review / position_review / generic）
         
         Returns:
             WeightMap: 因子权重映射
@@ -487,7 +489,13 @@ class DeepSeekWeightRouter:
         
         # 尝试调用 AI 服务
         if self.ai_enabled and bool(use_ai):
-            weight_map = self._try_ai_weights(symbol, regime, market_flow_context, quantile_context)
+            weight_map = self._try_ai_weights(
+                symbol,
+                regime,
+                market_flow_context,
+                quantile_context,
+                request_mode=request_mode,
+            )
             if weight_map is not None:
                 self._set_cache(cache_key, symbol, regime, weight_map)
                 return weight_map
@@ -558,6 +566,7 @@ class DeepSeekWeightRouter:
         regime: str,
         market_flow_context: Dict[str, Any],
         quantile_context: Optional[Dict[str, Any]] = None,
+        request_mode: str = "generic",
     ) -> Optional[WeightMap]:
         """尝试使用 AI 获取权重"""
         ai_service = self._get_ai_service()
@@ -571,6 +580,7 @@ class DeepSeekWeightRouter:
                 regime=regime,
                 market_flow_context=market_flow_context,
                 quantile_context=quantile_context,
+                request_mode=request_mode,
             )
             
             if ai_response.fallback_used:
@@ -590,7 +600,7 @@ class DeepSeekWeightRouter:
                     trend_imbalance_weight=max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, weights.get("imbalance", 0.10))),
                     trend_liquidity_norm_weight=max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, weights.get("liquidity_delta", 0.08))),
                     confidence=ai_response.confidence,
-                    reason=f"ai:{';'.join(ai_response.reasoning_bullets[:3])}",
+                    reason="ai_weight_router",
                 )
             else:  # RANGE
                 weight_map = WeightMap(
@@ -598,7 +608,7 @@ class DeepSeekWeightRouter:
                     range_cvd_momentum_weight=max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, weights.get("cvd_momentum", 0.15))),
                     range_depth_weight=max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, weights.get("depth_ratio", 0.10))),
                     confidence=ai_response.confidence,
-                    reason=f"ai:{';'.join(ai_response.reasoning_bullets[:3])}",
+                    reason="ai_weight_router",
                 )
             
             self._stats["ai_successes"] += 1

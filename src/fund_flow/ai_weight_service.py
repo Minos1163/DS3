@@ -27,94 +27,28 @@ import logging
 logger = logging.getLogger(__name__)
 
 # 系统提示词 - 固定不变
-SYSTEM_PROMPT = """你是"加密货币资金流策略"的权重调度器（Weight Router）。
-你的任务：根据输入的市场状态(regime)、资金流特征(z-score/归一化)、微结构风险(trap/phantom/spread等)，输出用于打分的"因子权重"。
-注意：你【绝对不能】输出交易方向（LONG/SHORT）、交易动作（BUY/SELL/CLOSE）、阈值、仓位、杠杆、下单价格等任何执行建议。
-你只能输出权重、置信度、以及可解释的简短理由。
-
-必须遵守：
-1) 输出必须是严格 JSON（不允许 markdown、不允许多余文本、不允许注释）。
-2) 权重必须为 0~1 之间的小数，且 weights 总和必须=1（允许 1e-6 误差）。
-3) 必须包含：weights、confidence、regime_view、risk_flags、reasoning_bullets、version、fallback_used。
-4) 如果输入缺失或异常，必须触发 fallback：输出默认权重（在输入中给出），并将 fallback_used=true。
-5) 微结构风险（trap_score/phantom_score/spread_z）高时，降低"动量类"权重，提高"防陷阱/流动性/深度类"权重，并降低 confidence。
-6) 若 regime=RANGE，则强调均值回归/极值类（imbalance、micro、phantom、trap），弱化趋势延续类（cvd_momentum、oi_delta）。
-7) 若 regime=TREND，则强调趋势确认类（cvd、oi、funding、depth），但当资金不一致(flow_confirm=false)时必须降权并降低 confidence。"""
+SYSTEM_PROMPT = """你是加密货币资金流策略的 Weight Router。
+只根据输入生成因子权重与置信度，不输出方向、动作、阈值、仓位、杠杆、价格。
+本地脚本已负责 15m 状态过滤（TREND/RANGE/NO_TRADE）、5m 入场触发、3m 趋势加速/回踩确认、MACD/KDJ 方向判断、开平仓执行；你只能微调资金流因子权重与 confidence。
+tech/capture context 仅用于判断是否该降低或提高 confidence，以及微调权重，不能替代本地规则，也不能覆盖 15m/5m/3m 的本地决策链。
+输出必须是严格 JSON 对象，无 markdown、无解释文本。
+必需字段: weights, confidence, fallback_used。
+可选字段: version, regime_view, risk_flags。
+若 sample_ok=false 或 stale_seconds>30 或 missing_fields 非空，必须 fallback_used=true 并返回默认权重。
+TREND 偏向 cvd/oi_delta/funding/depth_ratio/liquidity_delta；RANGE 偏向 imbalance/micro_delta，并压低 cvd_momentum/oi_delta。
+trap/phantom/wide_spread/high_vol 时降低动量权重和 confidence。"""
 
 # 用户提示词模板
-USER_PROMPT_TEMPLATE = """请为本次输入生成打分因子权重（weights），并严格按 JSON schema 输出。
+USER_PROMPT_TEMPLATE = """返回严格JSON对象，仅包含脚本可消费字段。
+输入数据:
+{request_json}
 
-【背景】
-- 交易框架：15m 负责市场状态识别与主资金评分，5m 负责执行节奏评分；最终分数融合：FinalScore = 0.6*Score_15m + 0.4*Score_5m
-- 你只输出权重与置信度，不输出方向/动作/阈值/仓位/杠杆。
-
-【输入】
-timestamp_utc: {timestamp_utc}
-symbol: {symbol}
-
-regime:
-  name: {regime_name}
-  trend_strength: {trend_strength}
-  adx: {adx}
-  atr_pct: {atr_pct}
-  ema_bias: {ema_bias}
-
-flow_consistency:
-  flow_confirm: {flow_confirm}
-  consistency_3bars: {consistency_3bars}
-
-features_15m_z:
-  cvd_z: {cvd_z}
-  cvd_mom_z: {cvd_mom_z}
-  oi_delta_z: {oi_delta_z}
-  funding_z: {funding_z}
-  depth_ratio_z: {depth_ratio_z}
-  imbalance_z: {imbalance_z}
-  liquidity_delta_z: {liquidity_delta_z}
-  micro_delta_z: {micro_delta_z}
-
-microstructure_risk:
-  spread_z: {spread_z}
-  trap_score: {trap_score}
-  phantom_score: {phantom_score}
-  trap_confirmed: {trap_confirmed}
-  extreme_vol_cooldown: {extreme_vol_cooldown}
-
-# 风险摘要（用于降低动量权重/降低置信度；不用于输出交易动作）
-risk_flags: {risk_flags}
-
-data_quality:
-  missing_fields: {missing_fields}
-  stale_seconds: {stale_seconds}
-  sample_ok: {sample_ok}
-
-default_weights:
-  TREND:
-    cvd: {dw_trend_cvd}
-    cvd_momentum: {dw_trend_cvd_mom}
-    oi_delta: {dw_trend_oi}
-    funding: {dw_trend_funding}
-    depth_ratio: {dw_trend_depth}
-    imbalance: {dw_trend_imb}
-    liquidity_delta: {dw_trend_liq}
-    micro_delta: {dw_trend_micro}
-  RANGE:
-    cvd: {dw_range_cvd}
-    cvd_momentum: {dw_range_cvd_mom}
-    oi_delta: {dw_range_oi}
-    funding: {dw_range_funding}
-    depth_ratio: {dw_range_depth}
-    imbalance: {dw_range_imb}
-    liquidity_delta: {dw_range_liq}
-    micro_delta: {dw_range_micro}
-
-【输出要求】
-- 严格输出 JSON，字段必须齐全，且 weights 总和=1。
-- weights 必须包含以下键：
-  cvd, cvd_momentum, oi_delta, funding, depth_ratio, imbalance, liquidity_delta, micro_delta
-- confidence 范围 0~1。
-- reasoning_bullets 最多 5 条，每条不超过 20 个字。
-- 如果 sample_ok=false 或 stale_seconds>30 或 missing_fields 非空：fallback_used=true，并直接使用 default_weights 对应 regime 的权重（并归一化）。"""
+输出约束:
+1. weights 必须包含: cvd, cvd_momentum, oi_delta, funding, depth_ratio, imbalance, liquidity_delta, micro_delta
+2. 每个 weight 在 [0,1]，总和=1
+3. confidence 在 [0,1]
+4. fallback_used 为 true/false
+5. 不输出交易分析长文，不输出买卖建议，不输出 markdown"""
 
 # 禁止输出的词列表
 FORBIDDEN_WORDS = [
@@ -270,89 +204,186 @@ class DeepSeekAIService:
     
     def _build_user_prompt(self, context: Dict[str, Any]) -> str:
         """构建用户提示词"""
-        regime = context.get("regime", "NO_TRADE")
-        dw = self.default_weights
+        request_payload = self._build_request_payload(context)
+        request_json = json.dumps(request_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return USER_PROMPT_TEMPLATE.format(request_json=request_json)
 
-        def _b(x: Any) -> str:
-            """确保 bool 以 true/false 输出（而不是 Python 的 True/False）"""
-            return "true" if bool(x) else "false"
+    @staticmethod
+    def _request_profile(request_mode: str) -> Dict[str, Any]:
+        mode = str(request_mode or "generic").strip().lower()
+        if mode == "position_review":
+            return {
+                "mode": mode,
+                "freshness_timeframe": "5m",
+                "min_history_bars": 4,
+                "preferred_zscore_bars": 20,
+            }
+        if mode == "entry_review":
+            return {
+                "mode": mode,
+                "freshness_timeframe": "5m",
+                "min_history_bars": 4,
+                "preferred_zscore_bars": 20,
+            }
+        return {
+            "mode": mode,
+            "freshness_timeframe": "15m",
+            "min_history_bars": 4,
+            "preferred_zscore_bars": 20,
+        }
 
-        def _f(x: Any, default: float = 0.0, ndigits: int = 6) -> float:
-            """浮点归一精度，减少 prompt 抖动"""
+    def _default_weight_payload(self, regime: str, dw: "DefaultWeights") -> Dict[str, Any]:
+        def _f(x: Any, default: float = 0.0, ndigits: int = 4) -> float:
             try:
                 v = float(x)
             except Exception:
                 v = float(default)
-            # 防御：inf/nan
             if v != v or v == float("inf") or v == float("-inf"):
                 v = float(default)
             return round(v, ndigits)
 
-        # 构建缺失字段列表
+        regime_up = str(regime or "TREND").upper()
+        if regime_up == "RANGE":
+            return {
+                "cvd": _f(dw.range_cvd),
+                "cvd_momentum": _f(dw.range_cvd_momentum),
+                "oi_delta": _f(dw.range_oi_delta),
+                "funding": _f(dw.range_funding),
+                "depth_ratio": _f(dw.range_depth_ratio),
+                "imbalance": _f(dw.range_imbalance),
+                "liquidity_delta": _f(dw.range_liquidity_delta),
+                "micro_delta": _f(dw.range_micro_delta),
+            }
+
+        return {
+            "cvd": _f(dw.trend_cvd),
+            "cvd_momentum": _f(dw.trend_cvd_momentum),
+            "oi_delta": _f(dw.trend_oi_delta),
+            "funding": _f(dw.trend_funding),
+            "depth_ratio": _f(dw.trend_depth_ratio),
+            "imbalance": _f(dw.trend_imbalance),
+            "liquidity_delta": _f(dw.trend_liquidity_delta),
+            "micro_delta": _f(dw.trend_micro_delta),
+        }
+
+    def _build_request_payload(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """构建紧凑、稳定、低 token 的 AI 输入载荷"""
+        dw = self.default_weights
         missing = context.get("missing_fields", [])
         if not isinstance(missing, list):
             missing = []
-        missing_str = json.dumps(missing) if missing else "[]"
-
-        # risk_flags：优先用 context["risk_flags"]（你在 _build_context 已提供 dict）
         rf = context.get("risk_flags", {})
         if not isinstance(rf, dict):
             rf = {}
-        # 兼容：如果没给 dict，则用平铺字段推断一次
-        if not rf:
-            stale_seconds_tmp = int(self._to_float(context.get("stale_seconds"), 0))
-            rf = {
-                "trap": bool(context.get("trap_flag", False)),
-                "phantom": bool(context.get("phantom_flag", False)),
-                "wide_spread": bool(context.get("wide_spread", False)),
-                "data_stale": bool(stale_seconds_tmp > 30),
-            }
-        risk_flags_str = json.dumps(rf, ensure_ascii=False)
 
-        return USER_PROMPT_TEMPLATE.format(
-            timestamp_utc=context.get("timestamp_utc", datetime.now(timezone.utc).isoformat()),
-            symbol=context.get("symbol", "UNKNOWN"),
-            regime_name=regime,
-            trend_strength=_f(context.get("trend_strength"), 0.0, 4),
-            adx=_f(context.get("adx"), 0.0, 4),
-            atr_pct=_f(context.get("atr_pct"), 0.0, 6),
-            ema_bias=context.get("ema_bias", "FLAT"),
-            flow_confirm=_b(context.get("flow_confirm", False)),
-            consistency_3bars=int(self._to_float(context.get("consistency_3bars"), 0)),
-            cvd_z=_f(context.get("cvd_z"), 0.0, 4),
-            cvd_mom_z=_f(context.get("cvd_mom_z"), 0.0, 4),
-            oi_delta_z=_f(context.get("oi_delta_z"), 0.0, 4),
-            funding_z=_f(context.get("funding_z"), 0.0, 6),
-            depth_ratio_z=_f(context.get("depth_ratio_z"), 0.0, 4),
-            imbalance_z=_f(context.get("imbalance_z"), 0.0, 4),
-            liquidity_delta_z=_f(context.get("liquidity_delta_z"), 0.0, 4),
-            micro_delta_z=_f(context.get("micro_delta_z"), 0.0, 4),
-            spread_z=_f(context.get("spread_z"), 0.0, 4),
-            trap_score=_f(context.get("trap_score"), 0.0, 4),
-            phantom_score=_f(context.get("phantom_score"), 0.0, 4),
-            trap_confirmed=_b(context.get("trap_confirmed", False)),
-            extreme_vol_cooldown=_b(context.get("extreme_vol_cooldown", False)),
-            risk_flags=risk_flags_str,
-            missing_fields=missing_str,
-            stale_seconds=int(self._to_float(context.get("stale_seconds"), 0)),
-            sample_ok=_b(context.get("sample_ok", True)),
-            dw_trend_cvd=dw.trend_cvd,
-            dw_trend_cvd_mom=dw.trend_cvd_momentum,
-            dw_trend_oi=dw.trend_oi_delta,
-            dw_trend_funding=dw.trend_funding,
-            dw_trend_depth=dw.trend_depth_ratio,
-            dw_trend_imb=dw.trend_imbalance,
-            dw_trend_liq=dw.trend_liquidity_delta,
-            dw_trend_micro=dw.trend_micro_delta,
-            dw_range_cvd=dw.range_cvd,
-            dw_range_cvd_mom=dw.range_cvd_momentum,
-            dw_range_oi=dw.range_oi_delta,
-            dw_range_funding=dw.range_funding,
-            dw_range_depth=dw.range_depth_ratio,
-            dw_range_imb=dw.range_imbalance,
-            dw_range_liq=dw.range_liquidity_delta,
-            dw_range_micro=dw.range_micro_delta,
-        )
+        tech_context = context.get("tech_context", {})
+        if not isinstance(tech_context, dict):
+            tech_context = {}
+
+        def _f(x: Any, default: float = 0.0, ndigits: int = 4) -> float:
+            try:
+                v = float(x)
+            except Exception:
+                v = float(default)
+            if v != v or v == float("inf") or v == float("-inf"):
+                v = float(default)
+            return round(v, ndigits)
+
+        mode = str(context.get("request_mode") or "generic").strip().lower()
+        regime = str(context.get("regime", "NO_TRADE"))
+        common_payload = {
+            "mode": mode,
+            "symbol": str(context.get("symbol", "UNKNOWN")),
+            "regime": regime,
+            "flow": {
+                "confirm": bool(context.get("flow_confirm", False)),
+                "c3": int(self._to_float(context.get("consistency_3bars"), 0)),
+                "cvd": _f(context.get("cvd_z"), 0.0),
+                "cvdm": _f(context.get("cvd_mom_z"), 0.0),
+                "oi": _f(context.get("oi_delta_z"), 0.0),
+                "fund": _f(context.get("funding_z"), 0.0, 6),
+                "depth": _f(context.get("depth_ratio_z"), 0.0),
+                "imb": _f(context.get("imbalance_z"), 0.0),
+                "liq": _f(context.get("liquidity_delta_z"), 0.0),
+                "micro": _f(context.get("micro_delta_z"), 0.0),
+            },
+            "micro": {
+                "spread": _f(context.get("spread_z"), 0.0),
+                "trap": _f(context.get("trap_score"), 0.0),
+                "phantom": _f(context.get("phantom_score"), 0.0),
+                "trap_ok": bool(context.get("trap_confirmed", False)),
+                "vol_cool": bool(context.get("extreme_vol_cooldown", False)),
+            },
+            "tech": {
+                "ma": str(tech_context.get("ma10_bias_1h", "FLAT")),
+                "mc": str(tech_context.get("macd_cross_5m", "NONE")),
+                "mz": str(tech_context.get("macd_zone_5m", "NEAR_ZERO")),
+                "mh": bool(tech_context.get("macd_hist_expand_5m", False)),
+                "kc": str(tech_context.get("kdj_cross_5m", "NONE")),
+                "kz": str(tech_context.get("kdj_zone_5m", "MID")),
+            },
+            "capture": {
+                "r3": _f(context.get("ret_3m"), 0.0),
+                "side": str(context.get("capture_confirm_3m_side", "NONE")),
+                "mcl": bool(context.get("micro_confirm_3m_long", False)),
+                "mcs": bool(context.get("micro_confirm_3m_short", False)),
+                "c3l": bool(context.get("capture_confirm_3m_long", False)),
+                "c3s": bool(context.get("capture_confirm_3m_short", False)),
+            },
+            "risk": {
+                "trap": bool(rf.get("trap", False)),
+                "phantom": bool(rf.get("phantom", False)),
+                "wide": bool(rf.get("wide_spread", False)),
+                "stale": bool(rf.get("data_stale", False)),
+            },
+            "dq": {
+                "miss": [str(x) for x in missing[:6]],
+                "stale": int(self._to_float(context.get("stale_seconds"), 0)),
+                "ok": bool(context.get("sample_ok", True)),
+                "hist": int(self._to_float(context.get("history_bars"), 0)),
+                "cold": bool(context.get("cold_start", False)),
+                "fresh_tf": str(context.get("freshness_timeframe") or ""),
+            },
+            "dw": self._default_weight_payload(regime, dw),
+        }
+
+        if mode == "entry_review":
+            common_payload["regime_info"] = {
+                "trend": _f(context.get("trend_strength"), 0.0),
+                "adx": _f(context.get("adx"), 0.0),
+                "atr": _f(context.get("atr_pct"), 0.0, 6),
+                "ema": str(context.get("ema_bias", "FLAT")),
+            }
+            return common_payload
+
+        if mode == "position_review":
+            common_payload["position_regime"] = {
+                "trend": _f(context.get("trend_strength"), 0.0),
+                "ema": str(context.get("ema_bias", "FLAT")),
+            }
+            return common_payload
+
+        common_payload["regime_info"] = {
+            "trend": _f(context.get("trend_strength"), 0.0),
+            "adx": _f(context.get("adx"), 0.0),
+            "atr": _f(context.get("atr_pct"), 0.0, 6),
+            "ema": str(context.get("ema_bias", "FLAT")),
+        }
+        return common_payload
+
+    @staticmethod
+    def _build_response_log_payload(response: "AIWeightResponse") -> Dict[str, Any]:
+        """AI 决策日志摘要，不包含分析文本"""
+        return {
+            "symbol": str(response.symbol or ""),
+            "timestamp_utc": str(response.timestamp_utc or ""),
+            "confidence": round(float(response.confidence or 0.0), 4),
+            "fallback_used": bool(response.fallback_used),
+            "weights": dict(response.weights or {}),
+            "regime_view": dict(response.regime_view or {}),
+            "risk_flags": dict(response.risk_flags or {}),
+            "error": response.error,
+        }
     
     def _make_structured_cache_key(self, context: Dict[str, Any]) -> str:
         """
@@ -361,6 +392,7 @@ class DeepSeekAIService:
         """
         symbol = str(context.get("symbol", "UNKNOWN")).upper()
         regime = str(context.get("regime_name") or context.get("regime") or "NO_TRADE").upper()
+        request_mode = str(context.get("request_mode") or "generic").strip().lower()
 
         trend_strength = self._to_float(context.get("trend_strength"), 0.0)
         spread_z = self._to_float(context.get("spread_z"), 0.0)
@@ -393,6 +425,7 @@ class DeepSeekAIService:
         raw_key = (
             f"{symbol}|"
             f"{regime}|"
+            f"m{request_mode}|"
             f"ts{trend_bucket}|"
             f"sp{spread_bucket}|"
             f"cf{int(flow_confirm)}|"
@@ -457,12 +490,54 @@ class DeepSeekAIService:
         
         if not sample_ok:
             return True, "sample_not_ok"
-        if stale_seconds > 30:
+        if stale_seconds > 90:
             return True, f"data_stale({stale_seconds}s)"
         if missing_fields and isinstance(missing_fields, list) and len(missing_fields) > 0:
             return True, f"missing_fields:{','.join(missing_fields[:3])}"
         
         return False, ""
+
+    def _build_sample_quality_log_payload(
+        self,
+        context: Dict[str, Any],
+        reason: str,
+    ) -> Dict[str, Any]:
+        """构建 AI 样本质量日志，便于定位 sample_not_ok 的具体来源"""
+        missing_fields = context.get("missing_fields", [])
+        if not isinstance(missing_fields, list):
+            missing_fields = []
+
+        stale_seconds = int(self._to_float(context.get("stale_seconds"), 0))
+        history_bars = int(self._to_float(context.get("history_bars"), 0))
+        history_min_bars = int(self._to_float(context.get("history_min_bars"), 0))
+        request_mode = str(context.get("request_mode") or "generic")
+        freshness_timeframe = str(context.get("freshness_timeframe") or "")
+        sample_ok = bool(context.get("sample_ok", True))
+
+        details: List[str] = []
+        if missing_fields:
+            details.append(f"missing:{','.join(str(x) for x in missing_fields[:6])}")
+        if history_min_bars > 0 and history_bars < history_min_bars:
+            details.append(f"history:{history_bars}/{history_min_bars}")
+        if stale_seconds > 90:
+            details.append(f"stale:{stale_seconds}s")
+        if not details and not sample_ok:
+            details.append("sample_ok_false_without_expanded_detail")
+
+        return {
+            "symbol": str(context.get("symbol", "")),
+            "regime": str(context.get("regime", "")),
+            "request_mode": request_mode,
+            "reason": reason,
+            "detail": details,
+            "sample_ok": sample_ok,
+            "missing_fields": [str(x) for x in missing_fields[:6]],
+            "stale_seconds": stale_seconds,
+            "freshness_timeframe": freshness_timeframe,
+            "history_bars": history_bars,
+            "history_min_bars": history_min_bars,
+            "cold_start": bool(context.get("cold_start", False)),
+        }
     
     def _get_default_weights(self, regime: str) -> Dict[str, float]:
         """获取默认权重并归一化"""
@@ -603,7 +678,20 @@ class DeepSeekAIService:
             elif confidence < 0 or confidence > 1:
                 parsed["confidence"] = max(0, min(1, confidence))
         
-        # 8. 确保 fallback_used 字段存在
+        # 8. 填充可选字段默认值，保证脚本可安全消费
+        if "version" not in parsed or not isinstance(parsed.get("version"), str):
+            parsed["version"] = "weight-router-v1"
+        if "regime_view" not in parsed or not isinstance(parsed.get("regime_view"), dict):
+            parsed["regime_view"] = {}
+        if "risk_flags" not in parsed or not isinstance(parsed.get("risk_flags"), dict):
+            parsed["risk_flags"] = {}
+        bullets = parsed.get("reasoning_bullets")
+        if not isinstance(bullets, list):
+            parsed["reasoning_bullets"] = []
+        else:
+            parsed["reasoning_bullets"] = [str(x)[:20] for x in bullets[:3]]
+
+        # 9. 确保 fallback_used 字段存在
         if "fallback_used" not in parsed:
             parsed["fallback_used"] = False
         
@@ -631,7 +719,7 @@ class DeepSeekAIService:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.1,  # 低温度，更确定性输出
-            "max_tokens": 500,
+            "max_tokens": 220,
         }
         
         for attempt in range(self.max_retries):
@@ -674,6 +762,7 @@ class DeepSeekAIService:
         regime: str,
         market_flow_context: Dict[str, Any],
         quantile_context: Optional[Dict[str, Any]] = None,
+        request_mode: str = "generic",
     ) -> AIWeightResponse:
         """
         获取动态权重
@@ -688,36 +777,63 @@ class DeepSeekAIService:
             AIWeightResponse: 权重响应
         """
         self._stats["total_requests"] += 1
+        request_mode_norm = str(request_mode or "generic").strip().lower()
         
         # 构建上下文
         context = self._build_context(
-            symbol, regime, market_flow_context, quantile_context
+            symbol,
+            regime,
+            market_flow_context,
+            quantile_context,
+            request_mode=request_mode_norm,
         )
+        context["request_mode"] = request_mode_norm
+        request_payload = self._build_request_payload(context)
         
         # 检查是否应该直接降级
         should_fallback, fallback_reason = self._should_fallback(context)
         if should_fallback:
             self._stats["fallbacks"] += 1
+            print(
+                "🤖 AI权重跳过: "
+                f"{json.dumps(self._build_sample_quality_log_payload(context, fallback_reason), ensure_ascii=False, separators=(',', ':'))}"
+            )
             return self._create_fallback_response(context, fallback_reason)
         
         # 检查缓存
         cache_key = self._make_structured_cache_key(context)
         cached = self._get_cached(cache_key)
         if cached is not None:
+            print(
+                "🤖 AI权重缓存命中: "
+                f"{json.dumps(self._build_response_log_payload(cached), ensure_ascii=False, separators=(',', ':'))}"
+            )
             return cached
         
         # 如果未启用 AI，直接返回默认权重
         if not self.enabled:
             self._stats["fallbacks"] += 1
+            print(
+                "🤖 AI权重禁用: "
+                f"{json.dumps({'symbol': symbol, 'regime': regime, 'reason': 'ai_disabled'}, ensure_ascii=False, separators=(',', ':'))}"
+            )
             return self._create_fallback_response(context, "ai_disabled")
         
         # 调用 AI
         user_prompt = self._build_user_prompt(context)
+        print(
+            "🤖 AI权重请求: "
+            f"{json.dumps(request_payload, ensure_ascii=False, separators=(',', ':'))}"
+        )
         success, response_text, error = self._call_api(user_prompt)
         
         if not success:
             self._stats["errors"] += 1
             self._stats["fallbacks"] += 1
+            print(
+                "🤖 AI权重失败: "
+                f"{json.dumps({'symbol': symbol, 'regime': regime, 'error': error}, ensure_ascii=False, separators=(',', ':'))}"
+            )
             return self._create_fallback_response(context, f"api_error:{error}")
         
         # 校验响应
@@ -745,6 +861,10 @@ class DeepSeekAIService:
             fallback_used=bool(parsed_dict.get("fallback_used", False)),
             raw_response=response_text,
         )
+        print(
+            "🤖 AI权重决策: "
+            f"{json.dumps(self._build_response_log_payload(response), ensure_ascii=False, separators=(',', ':'))}"
+        )
         
         # 缓存结果
         self._set_cache(
@@ -761,11 +881,14 @@ class DeepSeekAIService:
         regime: str,
         market_flow_context: Dict[str, Any],
         quantile_context: Optional[Dict[str, Any]] = None,
+        request_mode: str = "generic",
     ) -> Dict[str, Any]:
         """构建完整上下文（V3.0 增强：语义正确的输入）"""
+        request_profile = self._request_profile(request_mode)
         timeframes = market_flow_context.get("timeframes", {})
         tf_15m = timeframes.get("15m", {}) if isinstance(timeframes, dict) else {}
         tf_5m = timeframes.get("5m", {}) if isinstance(timeframes, dict) else {}
+        tf_3m = timeframes.get("3m", {}) if isinstance(timeframes, dict) else {}
         
         # 优先从结构化输出取值
         ms = market_flow_context.get("microstructure_features", {})
@@ -795,13 +918,17 @@ class DeepSeekAIService:
         hist15 = tf_15m.get("history", [])
         if not isinstance(hist15, list):
             hist15 = []
+        history_bars = len(hist15)
+        min_history_bars = max(3, int(request_profile.get("min_history_bars", 4)))
+        preferred_zscore_bars = max(min_history_bars, int(request_profile.get("preferred_zscore_bars", 20)))
         
         # z-score 计算函数
-        def _zscore_from_hist(key: str, x: float, hist: list, min_n: int = 30, eps: float = 1e-9) -> float:
-            if not isinstance(hist, list) or len(hist) < min_n:
+        def _zscore_from_hist(key: str, x: float, hist: list, eps: float = 1e-9) -> float:
+            if not isinstance(hist, list) or len(hist) < min_history_bars:
                 return 0.0
+            window_n = min(len(hist), preferred_zscore_bars)
             vals = []
-            for row in hist[-min_n:]:
+            for row in hist[-window_n:]:
                 if isinstance(row, dict):
                     raw_v = row.get(key)
                     if raw_v is not None:
@@ -809,7 +936,7 @@ class DeepSeekAIService:
                             vals.append(float(raw_v))
                         except (TypeError, ValueError):
                             pass
-            if len(vals) < max(12, min_n // 2):
+            if len(vals) < min_history_bars:
                 return 0.0
             mu = sum(vals) / len(vals)
             var = sum((v - mu) ** 2 for v in vals) / max(1, (len(vals) - 1))
@@ -828,15 +955,30 @@ class DeepSeekAIService:
         liquidity_delta_z = _zscore_from_hist("liquidity_delta", liq_delta, hist15)
         micro_delta = self._to_float(ff.get("micro_delta"), self._to_float(tf_5m.get("micro_delta_last"), 0.0))
         micro_delta_z = _zscore_from_hist("micro_delta", micro_delta, hist15)
+        microprice_bias = self._to_float(
+            ms.get("microprice_bias"),
+            self._to_float(ms.get("microprice_delta"), self._to_float(market_flow_context.get("microprice_bias"), 0.0)),
+        )
+        ret_3m = self._to_float(tf_3m.get("ret_period"), 0.0)
+        micro_confirm_3m_long = micro_delta > 0 and microprice_bias > 0
+        micro_confirm_3m_short = micro_delta < 0 and microprice_bias < 0
+        capture_confirm_3m_long = ret_3m > 0 and micro_confirm_3m_long
+        capture_confirm_3m_short = ret_3m < 0 and micro_confirm_3m_short
+        if capture_confirm_3m_long and not capture_confirm_3m_short:
+            capture_confirm_3m_side = "LONG"
+        elif capture_confirm_3m_short and not capture_confirm_3m_long:
+            capture_confirm_3m_side = "SHORT"
+        else:
+            capture_confirm_3m_side = "NONE"
         
         # spread_z：优先用 microstructure_features 输出，否则从历史计算
         spread_z = self._to_float(ms.get("spread_z"), 0.0)
         if spread_z == 0.0 and spread_bps > 0:
             # fallback：用 5m history 算
             hist_spread = tf_5m.get("history_spread_bps", [])
-            if isinstance(hist_spread, list) and len(hist_spread) >= 30:
+            if isinstance(hist_spread, list) and len(hist_spread) >= min_history_bars:
                 spread_z = _zscore_from_hist("__spread__", spread_bps, 
-                             [{"__spread__": v} for v in hist_spread], min_n=30)
+                             [{"__spread__": v} for v in hist_spread])
         
         # 从 quantile_context 获取额外信息
         trap_confirmed = False
@@ -905,7 +1047,7 @@ class DeepSeekAIService:
         # 重要：0.0 不等于缺失（很多时候真实值就是0）
         # 缺失判定应基于“字段不存在/None/样本不足”而不是数值为0
         # 这里用最小集合：关键历史不足也算“不可用”
-        if not isinstance(hist15, list) or len(hist15) < 12:
+        if not isinstance(hist15, list) or history_bars < min_history_bars:
             missing_fields.append("hist15_insufficient")
         # 若 fund_flow_features/microstructure_features 块缺失关键键，才算缺失
         if "cvd" not in ff and "cvd_ratio" not in market_flow_context:
@@ -917,15 +1059,19 @@ class DeepSeekAIService:
         
         # stale_seconds：用当前时间与 tf_15m close 时间差
         stale_seconds = 0
-        tf_15m_ts = tf_15m.get("bucket_ts") or tf_15m.get("timestamp_close_utc")
-        if tf_15m_ts:
+        freshness_timeframe = str(request_profile.get("freshness_timeframe", "15m"))
+        freshness_ctx = tf_5m if freshness_timeframe == "5m" else tf_15m
+        freshness_ts = None
+        if isinstance(freshness_ctx, dict):
+            freshness_ts = freshness_ctx.get("bucket_ts") or freshness_ctx.get("timestamp_close_utc")
+        if freshness_ts:
             try:
-                if isinstance(tf_15m_ts, str):
-                    ts_close = datetime.fromisoformat(tf_15m_ts.replace("Z", "+00:00"))
-                elif isinstance(tf_15m_ts, (int, float)):
-                    ts_close = datetime.fromtimestamp(tf_15m_ts, tz=timezone.utc)
+                if isinstance(freshness_ts, str):
+                    ts_close = datetime.fromisoformat(freshness_ts.replace("Z", "+00:00"))
+                elif isinstance(freshness_ts, (int, float)):
+                    ts_close = datetime.fromtimestamp(freshness_ts, tz=timezone.utc)
                 else:
-                    ts_close = tf_15m_ts
+                    ts_close = freshness_ts
                 stale_seconds = int((datetime.now(timezone.utc) - ts_close).total_seconds())
             except Exception:
                 pass
@@ -936,23 +1082,66 @@ class DeepSeekAIService:
 
         # sample_ok：数据新鲜 + 关键字段存在 + 历史足够做 zscore
         # 注意：adx==0 可能是指标尚未形成，不强制失败；但缺失 adx 键则失败
-        sample_ok = (len(missing_fields) == 0) and (stale_seconds <= 30)
+        sample_ok = (len(missing_fields) == 0) and (stale_seconds <= 90)
+        cold_start = history_bars < 12
         
         # 极端波动冷却
         atr_pct = self._to_float(tf_15m.get("atr_pct"), 0)
         extreme_vol_cooldown = atr_pct > 0.02
-        
+
+        ma10_bias_raw = market_flow_context.get("ma10_1h_bias")
+        ma10_bias_num = int(self._to_float(ma10_bias_raw, 0))
+        if ma10_bias_num > 0:
+            ma10_bias_1h = "UP"
+        elif ma10_bias_num < 0:
+            ma10_bias_1h = "DOWN"
+        else:
+            ma10_bias_1h = "FLAT"
+        macd_cross_5m = str(
+            tf_5m.get("macd_cross", market_flow_context.get("macd_5m_cross", "NONE"))
+        ).upper()
+        macd_zone_5m = str(
+            tf_5m.get("macd_zone", market_flow_context.get("macd_5m_zone", "NEAR_ZERO"))
+        ).upper()
+        macd_hist_expand_5m = bool(
+            tf_5m.get(
+                "macd_5m_hist_expand",
+                market_flow_context.get(
+                    "macd_5m_hist_expand",
+                    bool(
+                        tf_5m.get("macd_5m_hist_expand_up", False)
+                        or tf_5m.get("macd_5m_hist_expand_down", False)
+                    ),
+                ),
+            )
+        )
+        kdj_cross_5m = str(
+            tf_5m.get("kdj_cross", market_flow_context.get("kdj_cross", "NONE"))
+        ).upper()
+        kdj_zone_5m = str(
+            tf_5m.get("kdj_zone", market_flow_context.get("kdj_zone", "MID"))
+        ).upper()
+
         return {
             "symbol": symbol,
             "regime": regime,
             "regime_name": regime,  # prompt 兼容
-            "timestamp_utc": tf_15m.get("timestamp_close_utc") or datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": (
+                freshness_ctx.get("timestamp_close_utc")
+                if isinstance(freshness_ctx, dict) and freshness_ctx.get("timestamp_close_utc")
+                else tf_15m.get("timestamp_close_utc")
+                or datetime.now(timezone.utc).isoformat()
+            ),
             "trend_strength": trend_strength,
             "adx": adx,
             "atr_pct": atr_pct,
             "ema_bias": ema_bias,
             "flow_confirm": flow_confirm,
             "consistency_3bars": consistency_3bars,
+            "history_bars": history_bars,
+            "history_min_bars": min_history_bars,
+            "cold_start": cold_start,
+            "freshness_timeframe": freshness_timeframe,
             # 真正的 z-scores
             "cvd_z": cvd_z,
             "cvd_mom_z": cvd_mom_z,
@@ -980,6 +1169,20 @@ class DeepSeekAIService:
                 "wide_spread": bool(wide_spread),
                 "data_stale": bool(stale_seconds > 30),
             },
+            "tech_context": {
+                "ma10_bias_1h": ma10_bias_1h,
+                "macd_cross_5m": macd_cross_5m,
+                "macd_zone_5m": macd_zone_5m,
+                "macd_hist_expand_5m": bool(macd_hist_expand_5m),
+                "kdj_cross_5m": kdj_cross_5m,
+                "kdj_zone_5m": kdj_zone_5m,
+            },
+            "ret_3m": ret_3m,
+            "micro_confirm_3m_long": bool(micro_confirm_3m_long),
+            "micro_confirm_3m_short": bool(micro_confirm_3m_short),
+            "capture_confirm_3m_long": bool(capture_confirm_3m_long),
+            "capture_confirm_3m_short": bool(capture_confirm_3m_short),
+            "capture_confirm_3m_side": capture_confirm_3m_side,
             # 数据质量（不再写死）
             "missing_fields": missing_fields,
             "stale_seconds": stale_seconds,

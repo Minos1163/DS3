@@ -364,12 +364,6 @@ class PositionStateMachineV2:
                     "message": "No position for protection",
                 }
 
-        # 设置保护前清理旧保护单
-        try:
-            self.client.cancel_all_open_orders(intent.symbol)
-        except Exception:
-            pass
-
         # 执行真正的保护单下达
         result = self.client._execute_protection_v2(
             symbol=intent.symbol,

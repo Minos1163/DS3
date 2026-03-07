@@ -55,6 +55,28 @@ class MarketGateway:
         data = response.json()
         return float(data.get("openInterest", 0)) if data else None
 
+    def get_open_interest_hist(
+        self,
+        symbol: str,
+        period: str = "5m",
+        limit: int = 30,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        url = f"{self.broker.MARKET_BASE}/futures/data/openInterestHist"
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "period": period,
+            "limit": max(1, min(int(limit or 30), 500)),
+        }
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        response = self.broker.request("GET", url, params=params)
+        data = response.json()
+        return data if isinstance(data, list) else []
+
     def get_order_book(self, symbol: str, limit: int = 20) -> Optional[Dict[str, Any]]:
         # Binance futures depth supports: 5, 10, 20, 50, 100, 500, 1000.
         try:

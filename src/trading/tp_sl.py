@@ -22,6 +22,7 @@ class TpSlConfig:
 
     stop_loss_pct: Optional[float] = None
     take_profit_pct: Optional[float] = None
+    take_profit_levels: Optional[List[Tuple[float, float]]] = None
 
     rr_ratio: Optional[float] = None
 
@@ -68,8 +69,9 @@ class PapiTpSlManager:
         if sl_price and sl_price > 0:
             orders.append(self._build_sl_order(cfg, sl_price))
 
-        if tp_price and tp_price > 0:
-            orders.append(self._build_tp_order(cfg, tp_price))
+        tp_levels = self._resolve_take_profit_levels(cfg, tp_price)
+        for tp_order in self._build_tp_orders(cfg, tp_levels):
+            orders.append(tp_order)
 
         results = []
         for order in orders:
@@ -128,6 +130,33 @@ class PapiTpSlManager:
 
         return sl, tp
 
+    def _resolve_take_profit_levels(
+        self,
+        cfg: TpSlConfig,
+        fallback_tp_price: Optional[float],
+    ) -> List[Tuple[float, float]]:
+        levels_raw = cfg.take_profit_levels if isinstance(cfg.take_profit_levels, list) else []
+        levels: List[Tuple[float, float]] = []
+        for item in levels_raw:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            try:
+                price = float(item[0])
+                reduce_pct = float(item[1])
+            except Exception:
+                continue
+            if price <= 0:
+                continue
+            reduce_pct = max(0.0, min(1.0, reduce_pct))
+            if reduce_pct <= 0:
+                continue
+            levels.append((price, reduce_pct))
+        if levels:
+            return levels
+        if fallback_tp_price and fallback_tp_price > 0:
+            return [(fallback_tp_price, 1.0)]
+        return []
+
     def _calc_by_pct(self, entry: float, pct: float, pos_side: PositionSide, is_sl: bool) -> float:
         if pos_side == "LONG":
             return entry * (1 - pct) if is_sl else entry * (1 + pct)
@@ -160,25 +189,23 @@ class PapiTpSlManager:
             "side": order_side,
             "workingType": "MARK_PRICE",
             "timeInForce": "GTC",
-            "closePosition": True,
         }
 
         pos_side = self.broker.calculate_position_side(order_side, True)
         if pos_side:
             order["positionSide"] = pos_side
 
-        # PAPI 条件单必须带 quantity
+        return order
+
+    def _build_sl_order(self, cfg: TpSlConfig, stop_price: float) -> Dict[str, Any]:
+        order = self._base_order(cfg)
+        order["closePosition"] = True
         if cfg.quantity is not None:
             order["quantity"] = cfg.quantity
         else:
             qty = self._resolve_close_quantity(cfg)
             if qty is not None:
                 order["quantity"] = qty
-
-        return order
-
-    def _build_sl_order(self, cfg: TpSlConfig, stop_price: float) -> Dict[str, Any]:
-        order = self._base_order(cfg)
         order.update(
             {
                 "strategyType": "STOP",
@@ -188,16 +215,36 @@ class PapiTpSlManager:
         )
         return order
 
-    def _build_tp_order(self, cfg: TpSlConfig, stop_price: float) -> Dict[str, Any]:
-        order = self._base_order(cfg)
-        order.update(
-            {
-                "strategyType": "TAKE_PROFIT",
-                "stopPrice": self._round(stop_price, cfg.symbol),
-                "price": self._round(stop_price, cfg.symbol),
-            }
-        )
-        return order
+    def _build_tp_orders(
+        self,
+        cfg: TpSlConfig,
+        levels: List[Tuple[float, float]],
+    ) -> List[Dict[str, Any]]:
+        if not levels:
+            return []
+        base_qty = cfg.quantity
+        if base_qty is None:
+            base_qty = self._resolve_close_quantity(cfg)
+        if base_qty is None or base_qty <= 0:
+            return []
+
+        orders: List[Dict[str, Any]] = []
+        for stop_price, reduce_pct in levels:
+            order = self._base_order(cfg)
+            tp_qty = float(base_qty) * float(reduce_pct)
+            tp_qty = float(self.broker.format_quantity(cfg.symbol, tp_qty))
+            if tp_qty <= 0:
+                continue
+            order["quantity"] = tp_qty
+            order.update(
+                {
+                    "strategyType": "TAKE_PROFIT",
+                    "stopPrice": self._round(stop_price, cfg.symbol),
+                    "price": self._round(stop_price, cfg.symbol),
+                }
+            )
+            orders.append(order)
+        return orders
 
     def _resolve_close_quantity(self, cfg: TpSlConfig) -> Optional[float]:
         try:

@@ -47,3 +47,8 @@ tmp/
 user/skills/
 *.status
 *[0-9].backup.json
+# Minimax skills directory (embedded git repos)
+.minimax/
+
+# PDF files
+*.pdf

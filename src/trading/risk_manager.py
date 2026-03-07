@@ -852,15 +852,14 @@ class RiskManager:
         c = float(close_price or 0.0)
         m = float(bb_middle or 0.0)
         u = float(bb_upper or 0.0)
-        l = float(bb_lower or 0.0)
-        if c > 0 and m > 0 and u > l:
-            half = max((u - m), (m - l), 1e-12)
+        lower_band = float(bb_lower or 0.0)
+        if c > 0 and m > 0 and u > lower_band:
+            half = max((u - m), (m - lower_band), 1e-12)
             # penetration>0 表示对持仓不利方向穿越中轨
             if ps == "LONG":
                 penetration = (m - c) / half
             else:
                 penetration = (c - m) / half
-            offset = (c - m) / half
             if ps == "LONG":
                 if c >= m:
                     structure = "HEALTHY"
@@ -1089,6 +1088,7 @@ class RiskManager:
         position_side: str,
         macd_hist_norm: float,
         cvd_norm: float,
+        kdj_j_norm: float = 0.0,
         ev_direction: Optional[str] = None,
         ev_score: Optional[float] = None,
         lw_direction: Optional[str] = None,
@@ -1107,6 +1107,7 @@ class RiskManager:
         trap_score: Optional[float] = None,
         direction_lock: Optional[str] = None,
         decision_reason: Optional[str] = None,
+        close_decision_weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
         检查持仓保护状态（基于 MACD/CVD 冲突）
@@ -1194,6 +1195,47 @@ class RiskManager:
         }
         result["trap_score"] = float(trap_score or 0.0)
         result["close_price"] = float(close_price or last_close or 0.0)
+        
+        # 平仓决断权重 (MACD/KDJ/资金流)
+        # 默认: 资金流0.55, MACD0.3, KDJ0.15
+        ff_weight = 0.55
+        macd_weight = 0.30
+        kdj_weight = 0.15
+        if close_decision_weights:
+            ff_weight = float(close_decision_weights.get("fund_flow_weight", ff_weight))
+            macd_weight = float(close_decision_weights.get("macd_weight", macd_weight))
+            kdj_weight = float(close_decision_weights.get("kdj_weight", kdj_weight))
+        
+        # 计算平仓决断得分
+        # macd_hist_norm: MACD柱状图归一化 [-1, 1]
+        # kdj_j_norm: KDJ的J值归一化 [-1, 1] 
+        # cvd_norm: 资金流归一化 [-1, 1]
+        pos_dir = 1 if str(position_side).upper() == "LONG" else -1
+        
+        # 计算各指标方向得分 (与持仓方向对比)
+        macd_dir_score = float(macd_hist_norm) * pos_dir  # 同向为正,反向为负
+        kdj_dir_score = float(kdj_j_norm) * pos_dir
+        cvd_dir_score = float(cvd_norm) * pos_dir
+        
+        # 加权计算综合得分
+        close_decision_score = (
+            ff_weight * cvd_dir_score + 
+            macd_weight * macd_dir_score + 
+            kdj_weight * kdj_dir_score
+        )
+        
+        # 记录到result供日志使用
+        result["close_decision"] = {
+            "score": round(close_decision_score, 4),
+            "macd_score": round(macd_dir_score, 4),
+            "kdj_score": round(kdj_dir_score, 4),
+            "fund_flow_score": round(cvd_dir_score, 4),
+            "weights": {
+                "fund_flow": ff_weight,
+                "macd": macd_weight,
+                "kdj": kdj_weight
+            }
+        }
 
         def _finalize(out: Dict[str, Any]) -> Dict[str, Any]:
             """统一出口：记录冲突保护统计，不影响主流程。"""

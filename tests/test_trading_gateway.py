@@ -1,5 +1,3 @@
-import pytest
-
 from trading.entrypoint import perform_trade
 
 

@@ -1,14 +1,26 @@
 {
+  "iflow": {
+    "file_access": true,
+    "file_allowed_dirs": [
+      "d:\\AIDCA\\AI2",
+      "d:\\AIDCA\\AI2\\config",
+      "d:\\AIDCA\\AI2\\src"
+    ],
+    "file_read_only": false,
+    "file_max_size": 52428800,
+    "cwd": "d:\\AIDCA\\AI2"
+  },
   "trading": {
     "symbols": [
-      "ETHUSDT",
       "XRPUSDT",
       "BNBUSDT",
       "SOLUSDT",
       "DOGEUSDT",
       "TRXUSDT",
-      "ADAUSDT",
+      "ADAUSDT",     
       "BCHUSDT",
+      "BARDUSDT",
+      "CYSUSDT",
       "LINKUSDT",
       "AVAXUSDT",
       "XLMUSDT",
@@ -16,14 +28,13 @@
       "HBARUSDT",
       "LTCUSDT",
       "DOTUSDT",
-      "TONUSDT",
-      "SHIBUSDT",
+      "TONUSDT",      
       "UNIUSDT",
       "APTUSDT"
     ],
-    "min_leverage": 3,
-    "default_leverage": 4,
-    "max_leverage": 5,
+    "min_leverage": 2,
+    "default_leverage": 2,
+    "max_leverage": 2,
     "min_position_percent": 12,
     "max_position_percent": 100,
     "reserve_percent": 20
@@ -35,7 +46,7 @@
     "daily_loss_cooldown_seconds": 28800,
     "consecutive_loss_cooldown_seconds": 1800,
     "daily_reset_timezone": "Asia/Shanghai",
-    "stop_loss_default_percent": 0.015,
+    "stop_loss_default_percent": 0.02,
     "take_profit_default_percent": 0.0,
     "conflict_protection": {
       "light_confirm_bars": 2,
@@ -63,12 +74,13 @@
       "state_structure_break_deep": 0.45,
       "state_reduce_pct": 0.2,
       "state_circuit_cvd_norm": 0.92,
-      "state_circuit_trap_bars": 4,
-      "state_circuit_trap_hard": 0.93,
-      "state_circuit_trap_hard_bars": 3,
+      "state_circuit_trap_bars": 5,
+      "state_circuit_trap_hard": 0.95,
+      "state_circuit_trap_hard_bars": 4,
       "state_circuit_cvd_guard_min": 2,
       "state_circuit_dirscore_min": 0.2,
       "hard_exit_min_hold_seconds": 600,
+      "directional_eval_interval_seconds": 300,
       "hard_exit_min_mae": 0.0012,
       "hard_exit_trap_force": 0.9,
       "hard_exit_trap_min_confirm_count": 2,
@@ -79,7 +91,10 @@
       "hard_exit_new_pos_mae_mult": 1.35,
       "hard_exit_new_pos_trap_force": 0.95,
       "hard_exit_new_pos_trap_min_confirm_count": 3,
-      "hard_exit_new_pos_drawdown_mult": 1.6
+      "hard_exit_new_pos_drawdown_mult": 1.6,
+      "close_decision_fund_flow_weight": 0.55,
+      "close_decision_macd_weight": 0.3,
+      "close_decision_kdj_weight": 0.15
     }
   },
   "strategy": {
@@ -89,8 +104,8 @@
     "default_target_portion": 0.1,
     "add_position_portion": 0.05,
     "max_symbol_position_portion": 0.15,
-    "max_active_symbols": 5,
-    "min_open_portion": 0.08,
+    "max_active_symbols": 2,
+    "min_open_portion": 0.06,
     "max_open_portion": 1.0,
     "liquidity_norm_factor_weight": 0.12,
     "liquidity_norm_alpha": 0.2,
@@ -108,17 +123,17 @@
     "dca_multipliers": [
       1.0
     ],
-    "min_leverage": 3,
-    "default_leverage": 4,
-    "max_leverage": 5,
+    "min_leverage": 2,
+    "default_leverage": 2,
+    "max_leverage": 2,
     "strict_leverage_sync": true,
     "price_deviation_limit_percent": 1.0,
-    "open_threshold": 0.28,
-    "long_open_threshold": 0.3,
-    "short_open_threshold": 0.3,
+    "open_threshold": 0.38,
+    "long_open_threshold": 0.38,
+    "short_open_threshold": 0.30,
     "close_threshold": 0.3,
     "entry_slippage": 0.0015,
-    "stop_loss_pct": 0.015,
+    "stop_loss_pct": 0.02,
     "reverse_close_confirm_bars": 2,
     "reverse_close_score_buffer": 0.02,
     "reverse_close_min_gap": 0.08,
@@ -149,10 +164,13 @@
     "entry_side_mode": "BOTH",
     "regime": {
       "timeframe": "15m",
-      "adx_trend_on": 21,
-      "adx_range_on": 18,
+      "adx_trend_on": 18.5,
+      "adx_range_on": 17.0,
       "adx_no_trade_low": 16,
       "adx_no_trade_high": 19,
+      "trend_pending_adx_min": 16.5,
+      "trend_pending_adx_slope_min": 0.8,
+      "trend_pending_ema_expand_min": 0.0,
       "atr_pct_min": 0.001,
       "atr_pct_max": 0.02,
       "direction_lock_mode": "soft",
@@ -163,23 +181,31 @@
     },
     "ma10_macd_confluence": {
       "enabled": true,
-      "tf_exec": "15m",
+      "tf_exec": "5m",
       "tf_anchor": "1h",
       "ma_period": 10,
-      "macd_fast": 12,
-      "macd_slow": 26,
-      "macd_signal": 9,
+      "macd_fast": 8,
+      "macd_slow": 17,
+      "macd_signal": 7,
       "kline_limit_exec": 160,
       "kline_limit_anchor": 80,
       "entry_hard_filter": true,
-      "entry_require_macd_trigger": true,
+      "entry_require_macd_trigger": false,
+      "entry_allow_macd_early": true,
+      "entry_soft_penalty_macd_early": 0.03,
+      "entry_macd_early_hist_min": 0.0,
+      "entry_macd_early_expand_bars": 2,
+      "entry_soft_penalty_no_macd": 0.08,
+      "entry_soft_penalty_no_kdj": 0.04,
+      "entry_hard_block_against_ma10": true,
+      "entry_hard_block_reverse_macd": true,
       "block_on_opposite_bias": false,
       "buy_cross": "GOLDEN",
       "sell_cross": "DEAD",
       "buy_block_zone": "BELOW_ZERO",
       "sell_block_zone": "ABOVE_ZERO",
       "neutral_bias_mode": "degrade",
-      "neutral_bias_portion_scale": 0.6,
+      "neutral_bias_portion_scale": 0.75,
       "neutral_bias_leverage_cap": 2,
       "bias_boost": 0.12,
       "bias_penalty": 0.1,
@@ -190,6 +216,48 @@
       "exit_anchor_enabled": true,
       "exit_anchor_require_hist_expand": true,
       "exit_anchor_skip_on_hard_block": true
+    },
+    "trend_capture": {
+      "enabled": true,
+      "trend_pending_adx_min": 16.5,
+      "trend_pending_adx_slope_min": 0.8,
+      "trend_pending_ema_expand_min": 0.0,
+      "trend_pending_min_score": 0.55,
+      "min_score": 0.22,
+      "min_gap": 0.05,
+      "trial_position_mult": 0.35,
+      "confirm_position_mult": 0.65,
+      "trap_soft_max": 0.65,
+      "phantom_soft_max": 0.65,
+      "spread_soft_max": 1.8,
+      "range_veto_by_trend_enabled": true,
+      "range_veto_trend_pending_score": 0.18,
+      "range_veto_trend_capture_score": 0.22
+    },
+    "direction_combo": {
+      "macd_kdj_weights": {
+        "macd": 0.45,
+        "kdj": 0.25,
+        "macd_cross": 0.1,
+        "kdj_cross": 0.08,
+        "macd_hist_mom": 0.07,
+        "kdj_zone": 0.05
+      },
+      "macd_bb_weights": {
+        "macd": 0.4,
+        "bb": 0.2,
+        "macd_cross": 0.14,
+        "bb_break": 0.1,
+        "bb_trend": 0.1,
+        "macd_hist_mom": 0.06
+      },
+      "bb_squeeze_penalty": 0.5,
+      "align_bonus": 0.08
+    },
+    "direction_guide": {
+      "enabled": true,
+      "model": "MACD_KDJ",
+      "neutral_zone": 0.02
     },
     "range_quantile": {
       "enabled": true,
@@ -220,20 +288,26 @@
         "max_quantile": 0.7
       }
     },
+    "range_veto_by_trend": {
+      "enabled": true,
+      "trend_pending_score": 0.18,
+      "adx_slope_min": 0.8,
+      "oi_price_align_min": 0.55
+    },
     "engine_params": {
       "TREND": {
-        "max_active_symbols": 5,
+        "max_active_symbols": 2,
         "default_target_portion": 0.1,
         "add_position_portion": 0.05,
         "max_symbol_position_portion": 0.15,
-        "default_leverage": 4,
-        "max_leverage": 5,
-        "min_leverage": 3,
-        "long_open_threshold": 0.3,
-        "short_open_threshold": 0.3,
+        "default_leverage": 2,
+        "max_leverage": 2,
+        "min_leverage": 2,
+        "long_open_threshold": 0.38,
+        "short_open_threshold": 0.30,
         "close_threshold": 0.3,
         "take_profit_pct": 0.0,
-        "stop_loss_pct": 0.015,
+        "stop_loss_pct": 0.02,
         "dca_max_additions": 0,
         "dca_drawdown_thresholds": [
           0.01
@@ -244,18 +318,20 @@
         "signal_pool_id": "trend_pool"
       },
       "RANGE": {
-        "max_active_symbols": 5,
+        "max_active_symbols": 2,
         "default_target_portion": 0.08,
         "add_position_portion": 0.0,
         "max_symbol_position_portion": 0.1,
-        "default_leverage": 4,
-        "max_leverage": 5,
-        "min_leverage": 3,
-        "long_open_threshold": 0.36,
-        "short_open_threshold": 0.36,
+        "default_leverage": 2,
+        "max_leverage": 2,
+        "min_leverage": 2,
+        "long_open_threshold": 0.48,
+        "short_open_threshold": 0.40,
         "close_threshold": 0.55,
         "take_profit_pct": 0.0,
-        "stop_loss_pct": 0.015,
+        "take_profit_pct_levels": [0.6, 1.0],
+        "take_profit_reduce_pct_levels": [0.5, 0.5],
+        "stop_loss_pct": 0.02,
         "dca_max_additions": 0,
         "signal_pool_id": "range_pool"
       }
@@ -264,7 +340,6 @@
     "major_symbol_signal_pool": {
       "enabled": true,
       "symbols": [
-        "BTCUSDT",
         "ETHUSDT",
         "BNBUSDT"
       ],
@@ -379,12 +454,12 @@
         "enabled": true,
         "logic": "AND",
         "min_pass_count": 0,
-        "min_long_score": 0.11,
-        "min_short_score": 0.11,
-        "scheduled_trigger_bypass": true,
+        "min_long_score": 0.12,
+        "min_short_score": 0.12,
+        "scheduled_trigger_bypass": false,
         "apply_when_position_exists": false,
         "edge_trigger_enabled": true,
-        "edge_cooldown_seconds": 300,
+        "edge_cooldown_seconds": 900,
         "symbols": [],
         "signal_ids": [
           "trend_long_cvd",
@@ -397,14 +472,14 @@
         "id": "trend_pool_major",
         "pool_name": "trend_pool_major",
         "enabled": true,
-        "logic": "OR",
-        "min_pass_count": 1,
-        "min_long_score": 0.12,
-        "min_short_score": 0.12,
-        "scheduled_trigger_bypass": true,
+        "logic": "AND",
+        "min_pass_count": 2,
+        "min_long_score": 0.18,
+        "min_short_score": 0.18,
+        "scheduled_trigger_bypass": false,
         "apply_when_position_exists": false,
-        "edge_trigger_enabled": false,
-        "edge_cooldown_seconds": 60,
+        "edge_trigger_enabled": true,
+        "edge_cooldown_seconds": 900,
         "symbols": [],
         "signal_ids": [
           "trend_major_long_cvd",
@@ -419,12 +494,12 @@
         "enabled": true,
         "logic": "AND",
         "min_pass_count": 0,
-        "min_long_score": 0.33,
-        "min_short_score": 0.33,
-        "scheduled_trigger_bypass": true,
+        "min_long_score": 0.3,
+        "min_short_score": 0.3,
+        "scheduled_trigger_bypass": false,
         "apply_when_position_exists": false,
         "edge_trigger_enabled": true,
-        "edge_cooldown_seconds": 300,
+        "edge_cooldown_seconds": 600,
         "symbols": [],
         "signal_ids": [
           "range_long_extreme",
@@ -436,13 +511,13 @@
     "signal_pool": {
       "enabled": true,
       "logic": "AND",
-      "min_long_score": 0.17,
-      "min_short_score": 0.17,
+      "min_long_score": 0.15,
+      "min_short_score": 0.15,
       "min_pass_count": 0,
-      "scheduled_trigger_bypass": true,
+      "scheduled_trigger_bypass": false,
       "apply_when_position_exists": false,
       "edge_trigger_enabled": true,
-      "edge_cooldown_seconds": 300,
+      "edge_cooldown_seconds": 600,
       "symbols": [],
       "rules": [
         {
@@ -499,19 +574,21 @@
         "BLOCK",
         "AVOID"
       ],
-      "entry_hold_portion_scale": 0.6,
+      "entry_hold_portion_scale": 0.75,
       "entry_hold_leverage_cap": 2,
       "exit_close_ratio": 0.5,
-      "exit_score_threshold": 0.12,
-      "exit_confirm_bars": 2,
-      "exit_min_hold_seconds": 900,
+      "exit_score_threshold": 0.20,
+      "exit_confirm_bars": 3,
+      "exit_min_hold_seconds": 300,
       "exit_require_price_followthrough": true,
       "exit_price_change_min": 0.002,
       "exit_drawdown_override": 0.015,
-      "entry_threshold": 0.32,
+      "entry_threshold": 0.25,
+      "entry_threshold_capture": 0.21,
       "max_drawdown": 0.02,
       "max_exposure_per_trade": 0.22,
       "volatility_cap": 0.012,
+      "volatility_cap_capture": 0.014,
       "momentum_scale": 260,
       "trend_weight": 0.45,
       "momentum_weight": 0.3,
@@ -520,7 +597,7 @@
     },
     "deepseek_weight_router": {
       "enabled": true,
-      "ai_enabled": false,
+      "ai_enabled": true,
       "cache_ttl_seconds": 300,
       "cache_max_entries": 100,
       "volatility_adjustment_factor": 0.2,
@@ -528,7 +605,7 @@
       "flow_trend_weight_boost": 0.1
     },
     "deepseek_ai": {
-      "enabled": false,
+      "enabled": true,
       "api_url": "https://api.deepseek.com/v1/chat/completions",
       "model": "deepseek-chat",
       "timeout": 15,
@@ -553,10 +630,36 @@
         "range_micro_delta": 0.18
       }
     },
+    "ai_review": {
+      "enabled": true,
+      "position_timeframe": "5m",
+      "flat_timeframe": "5m",
+      "flat_top_n": 2
+    },
     "score_fusion": {
       "enabled": true,
-      "score_15m_weight": 0.4,
+      "score_15m_weight": 0.32,
+      "score_5m_weight": 0.68,
       "consistency_window": 3
+    },
+    "macd_kdj_fund_flow_hybrid": {
+      "enabled": true,
+      "macd_trend_weight": 0.50,
+      "kdj_timing_weight": 0.30,
+      "fund_flow_weight": 0.20,
+      "kdj_oversold_threshold": 20.0,
+      "kdj_overbought_threshold": 80.0,
+      "macd_positive_bonus": 0.08,
+      "macd_negative_penalty": 0.08,
+      "kdj_oversold_bonus": 0.06,
+      "kdj_overbought_penalty": 0.06,
+      "kdj_cross_buy_bonus": 0.04,
+      "kdj_cross_sell_penalty": 0.04,
+      "fund_flow_positive_bonus": 0.07,
+      "fund_flow_negative_penalty": 0.07,
+      "divergence_bonus": 0.05,
+      "divergence_penalty": 0.05,
+      "neutral_zone": 0.02
     }
   },
   "schedule": {
@@ -576,6 +679,12 @@
     "disable_proxy": true
   },
   "startup": {
-    "live_confirmation_enabled": false
+    "live_confirmation_enabled": false,
+    "preload_market_data_enabled": true,
+    "preload_market_lookback_minutes": 120,
+    "preload_market_kline_interval": "5m",
+    "preload_open_interest_period": "5m",
+    "preload_trend_kline_limit": 120,
+    "preload_request_sleep_ms": 0
   }
 }

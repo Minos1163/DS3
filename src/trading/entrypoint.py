@@ -13,13 +13,13 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
-from risk.integration_gate import gate_trade_decision
+import risk.integration_gate as integration_gate
 
 def _mock_order_id() -> str:
     return f"ORD-{int(time.time())}"
 
 def pre_trade_decision(state: Dict[str, Any], *, equity_fraction: float = 0.1, log_path: Optional[str] = None) -> Dict[str, Any]:
-    return gate_trade_decision(state, equity_fraction=equity_fraction, log_path=log_path)
+    return integration_gate.gate_trade_decision(state, equity_fraction=equity_fraction, log_path=log_path)
 
 def perform_trade(state: Dict[str, Any], asset: str = "BTCUSDT", amount: float = 0.0, price: Optional[float] = None, log_path: Optional[str] = None, protect_hook=None, protect_args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # Pre-trade risk decision
