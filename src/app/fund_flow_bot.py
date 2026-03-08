@@ -2091,15 +2091,17 @@ class TradingBot:
             decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL)
             and entry_mode == "TREND_CAPTURE"
         )
+        default_entry_threshold = self._to_float(cfg.get("entry_threshold"), 0.25)
         active_entry_threshold = self._to_float(
             cfg.get("entry_threshold_capture" if is_capture_entry else "entry_threshold"),
-            cfg.get("entry_threshold"),
+            default_entry_threshold,
         )
+        default_volatility_cap = self._to_float(cfg.get("volatility_cap"), 0.012)
         active_volatility_cap = max(
             1e-6,
             self._to_float(
                 cfg.get("volatility_cap_capture" if is_capture_entry else "volatility_cap"),
-                cfg.get("volatility_cap"),
+                default_volatility_cap,
             ),
         )
         long_score = self._to_float(md.get("long_score_adj", md.get("long_score")), 0.0)
@@ -2645,6 +2647,35 @@ class TradingBot:
         if realized_found:
             return realized_total
         return None
+
+    def _extract_position_side(self, position: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(position, dict):
+            return ""
+        side = str(position.get("side") or position.get("positionSide") or "").upper()
+        if side in ("LONG", "SHORT"):
+            return side
+        amount = self._to_float(position.get("amount", position.get("positionAmt", 0.0)), 0.0)
+        if amount > 0:
+            return "LONG"
+        if amount < 0:
+            return "SHORT"
+        return ""
+
+    def _extract_position_amount(self, position: Optional[Dict[str, Any]]) -> float:
+        if not isinstance(position, dict):
+            return 0.0
+        return abs(self._to_float(position.get("amount", position.get("positionAmt", 0.0)), 0.0))
+
+    @staticmethod
+    def _format_timeframe_label_from_seconds(tf_seconds: int) -> str:
+        sec = max(0, int(tf_seconds or 0))
+        if sec <= 0:
+            return "unknown_review"
+        if sec % 3600 == 0:
+            return f"next_{sec // 3600}h_review"
+        if sec % 60 == 0:
+            return f"next_{sec // 60}m_review"
+        return f"next_{sec}s_review"
 
     def _update_loss_streak_after_close(self, symbol: str, execution_result: Dict[str, Any]) -> None:
         order_info = execution_result.get("order") if isinstance(execution_result, dict) else None
@@ -4058,6 +4089,8 @@ class TradingBot:
         portfolio: Dict[str, Any],
     ) -> None:
         decision_json = self.fund_flow_execution_router.decision_to_json(decision)
+        pre_close_side = self._extract_position_side(position) if decision.operation == FundFlowOperation.CLOSE else ""
+        md = decision.metadata if isinstance(decision.metadata, dict) else {}
 
         self.fund_flow_attribution_engine.log_decision(
             decision=decision,
@@ -4117,6 +4150,25 @@ class TradingBot:
                 if "STOP" in order_type:
                     sl_order_id = str(oid)
 
+        if decision.operation == FundFlowOperation.CLOSE and execution_result.get("status") == "success" and pre_close_side in ("LONG", "SHORT"):
+            post_close_side = self._extract_position_side(position_for_log)
+            post_close_amount = self._extract_position_amount(position_for_log)
+            close_action = "REDUCE" if (post_close_side == pre_close_side and post_close_amount > 0.0) else "EXIT"
+            exec_meta = dict(md) if isinstance(md, dict) else {}
+            exec_meta["execution_reason"] = str(decision.reason or "")
+            try:
+                self.risk_manager.record_conflict_execution(
+                    symbol=symbol,
+                    position_side=pre_close_side,
+                    action=close_action,
+                    reduce_pct=self._to_float(decision.target_portion_of_balance, 0.0),
+                    realized_pnl=execution_result.get("realized_pnl") if isinstance(execution_result, dict) else None,
+                    decision_reason=str(decision.reason or ""),
+                    meta=exec_meta,
+                )
+            except Exception as e:
+                print(f"⚠️ {symbol} 冲突执行事件记录失败: {e}")
+
         self._safe_storage_call(
             "insert_ai_decision_log",
             symbol=symbol,
@@ -4152,7 +4204,6 @@ class TradingBot:
 
         if execution_result.get("status") == "success" and decision.operation != FundFlowOperation.HOLD:
             self.trade_count += 1
-        md = decision.metadata if isinstance(decision.metadata, dict) else {}
         long_score = self._to_float(md.get("long_score"), 0.0)
         short_score = self._to_float(md.get("short_score"), 0.0)
         engine_tag = str(md.get("engine") or md.get("regime") or "")
@@ -4330,10 +4381,14 @@ class TradingBot:
             guide_dir = str(combo_compare.get("guide_dir", combo_compare.get("active_dir", ev_direction)))
             guide_score = self._to_float(combo_compare.get("guide_score"), self._to_float(combo_compare.get("active_score"), ev_score))
             guide_neutral_zone = self._to_float(combo_compare.get("guide_neutral_zone"), 0.02)
+            guide_score_source = str(combo_compare.get("guide_score_source", "-"))
+            trigger_score_source = str(md.get("trigger_score_source", "-"))
             print(
                 "   开仓指导: "
                 f"model={guide_model}, dir={guide_dir[:8]}, score={guide_score:+.3f}, "
-                f"neutral_zone={guide_neutral_zone:.3f}"
+                f"neutral_zone={guide_neutral_zone:.3f}, "
+                f"guide_score_source={guide_score_source}, "
+                f"trigger_score_source={trigger_score_source}"
             )
             guide_model_key = str(combo_compare.get("direction_guide_model", "")).upper()
             is_kdj_guide = guide_model_key == "MACD_KDJ" or "KDJ" in guide_model.upper()
@@ -4414,6 +4469,31 @@ class TradingBot:
                 f"engine={engine_tag}, pool={selected_pool_id or '-'}, "
                 f"direction={direction_lock or '-'}, adx={regime_adx:.2f}, atr_pct={regime_atr_pct:.4f}"
             )
+        neutral_trial_active = bool(md.get("direction_neutral_trial_active", False))
+        neutral_trial_mode = str(md.get("direction_neutral_trial_mode", "none"))
+        neutral_trial_backdrop_ok = bool(md.get("direction_neutral_trial_backdrop_ok", False))
+        neutral_trial_pending_side = str(md.get("direction_neutral_trial_pending_side", "NONE"))
+        neutral_trial_pending_score = self._to_float(md.get("direction_neutral_trial_pending_score"), 0.0)
+        neutral_trial_regime_long_score = self._to_float(md.get("direction_neutral_trial_regime_long_score"), 0.0)
+        neutral_trial_regime_short_score = self._to_float(md.get("direction_neutral_trial_regime_short_score"), 0.0)
+        neutral_trial_flow_ok = bool(md.get("direction_neutral_trial_flow_ok", False))
+        neutral_trial_consistency_ok = bool(md.get("direction_neutral_trial_consistency_ok", False))
+        neutral_trial_hard_block = bool(md.get("direction_neutral_trial_hard_block", False))
+        neutral_trial_loose_pass_long = bool(md.get("direction_neutral_trial_loose_pass_long", False))
+        neutral_trial_loose_pass_short = bool(md.get("direction_neutral_trial_loose_pass_short", False))
+        if neutral_trial_active or neutral_trial_mode != "none":
+            print(
+                "   neutral_trial_meta: "
+                f"mode={neutral_trial_mode}, "
+                f"active={1 if neutral_trial_active else 0}, "
+                f"backdrop_ok={1 if neutral_trial_backdrop_ok else 0}, "
+                f"pending={neutral_trial_pending_side}/{neutral_trial_pending_score:.3f}, "
+                f"reg15={neutral_trial_regime_long_score:.3f}/{neutral_trial_regime_short_score:.3f}, "
+                f"flow_ok={1 if neutral_trial_flow_ok else 0}, "
+                f"cons_ok={1 if neutral_trial_consistency_ok else 0}, "
+                f"hard_block={1 if neutral_trial_hard_block else 0}, "
+                f"loose_pass={1 if neutral_trial_loose_pass_long else 0}/{1 if neutral_trial_loose_pass_short else 0}"
+            )
         range_quantiles = md.get("range_quantiles")
         if isinstance(range_quantiles, dict):
             rq_n = self._to_int(range_quantiles.get("n"), 0)
@@ -4461,6 +4541,38 @@ class TradingBot:
         )
         if decision.reason:
             print(f"   决策原因: {decision.reason}")
+        if decision.operation == FundFlowOperation.HOLD:
+            open_thresholds_raw = md.get("open_thresholds")
+            open_thresholds: Dict[str, Any] = open_thresholds_raw if isinstance(open_thresholds_raw, dict) else {}
+            final_long_score = self._to_float(md.get("final_long_score", md.get("long_score")), 0.0)
+            final_short_score = self._to_float(md.get("final_short_score", md.get("short_score")), 0.0)
+            long_threshold = self._to_float(open_thresholds.get("long"), 0.0)
+            short_threshold = self._to_float(open_thresholds.get("short"), 0.0)
+            direction_lock_applied = bool(md.get("direction_lock_applied", False))
+            blocked_long = direction_lock in ("SHORT_ONLY",) and final_long_score >= long_threshold > 0.0
+            blocked_short = direction_lock in ("LONG_ONLY",) and final_short_score >= short_threshold > 0.0
+            if direction_lock_applied and (blocked_long or blocked_short):
+                blocked_side = "LONG" if blocked_long else "SHORT"
+                blocked_score = final_long_score if blocked_long else final_short_score
+                blocked_threshold = long_threshold if blocked_long else short_threshold
+                print(
+                    "   HOLD归因: "
+                    f"direction_lock_blocked={blocked_side}, "
+                    f"lock={direction_lock or '-'}, "
+                    f"score={blocked_score:.3f}, "
+                    f"threshold={blocked_threshold:.3f}"
+                )
+            else:
+                dominant_side = "LONG" if final_long_score >= final_short_score else "SHORT"
+                dominant_score = final_long_score if dominant_side == "LONG" else final_short_score
+                dominant_threshold = long_threshold if dominant_side == "LONG" else short_threshold
+                print(
+                    "   HOLD归因: "
+                    f"score_below_threshold={dominant_side}, "
+                    f"score={dominant_score:.3f}, "
+                    f"threshold={dominant_threshold:.3f}, "
+                    f"lock={direction_lock or '-'}"
+                )
         if isinstance(leverage_sync, dict) and leverage_sync.get("status") == "error":
             print(f"   ⚠️ 杠杆同步失败: {leverage_sync.get('message')}")
         if status_value == "pending":
@@ -6341,9 +6453,10 @@ class TradingBot:
                 else:
                     sleep_seconds = self._aligned_sleep_seconds_for(flat_tf_seconds)
                     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    flat_review_label = self._format_timeframe_label_from_seconds(flat_tf_seconds)
                     print(
                         f"⏳ 调度等待(空仓AI): utc_now={now_utc}, sleep={sleep_seconds:.2f}s "
-                        f"(next_15m_review)"
+                        f"({flat_review_label})"
                     )
                     next_fire = datetime.now(timezone.utc) + timedelta(seconds=sleep_seconds)
                     print(
