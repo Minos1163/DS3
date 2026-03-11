@@ -203,3 +203,479 @@ def test_confluence_respects_ma10_hard_block_switch():
         cfg=engine._trend_capture_config(),
     )
     assert confluence["confluence_hard_block_long"] is False
+
+
+def test_resolve_entry_mode_prunes_opposite_short_capture_when_confluence_fallback_turns_long():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["short_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BNBUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 0.5,
+            "consistency_3bars": 0,
+            "lw": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
+            "ev": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
+        },
+        base_scores={"long_score": 0.09, "short_score": 0.0},
+        trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_side": "SHORT",
+            "trend_capture_score_long": 0.0,
+            "trend_capture_score_short": 0.2,
+            "trend_capture_breakout_short": True,
+            "trend_capture_cvd_align_short": True,
+            "trend_capture_depth_align_short": True,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+            "confluence_anchor_ma10_long": True,
+            "confluence_macd_trigger_long": True,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.BUY
+    assert resolved.metadata["trend_capture_score_short"] == 0.0
+    assert resolved.metadata["trend_capture_side"] in {"LONG", "NONE"}
+    assert resolved.metadata["trend_capture_directional_prune"] is True
+    assert resolved.metadata["trend_capture_pruned_side"] == "SHORT"
+
+
+def test_resolve_entry_mode_prunes_opposite_long_capture_when_confluence_fallback_turns_short():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["short_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BNBUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "SHORT_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 0.5,
+            "consistency_3bars": 0,
+            "lw": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
+            "ev": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
+        },
+        base_scores={"long_score": 0.0, "short_score": 0.09},
+        trend_pending={"trend_pending_side": "SHORT", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_side": "LONG",
+            "trend_capture_score_long": 0.2,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": True,
+            "trend_capture_cvd_align_long": True,
+            "trend_capture_depth_align_long": True,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+            "confluence_anchor_ma10_short": True,
+            "confluence_macd_trigger_short": True,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.SELL
+    assert resolved.metadata["trend_capture_score_long"] == 0.0
+    assert resolved.metadata["trend_capture_side"] in {"SHORT", "NONE"}
+    assert resolved.metadata["trend_capture_directional_prune"] is True
+    assert resolved.metadata["trend_capture_pruned_side"] == "LONG"
+
+
+def test_resolve_entry_mode_injects_long_confluence_fallback_into_entry_score():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["short_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BNBUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 0.5,
+            "consistency_3bars": 0,
+            "lw": {
+                "components": {
+                    "primary_flat": True,
+                    "backup_source": "ma10_macd_confluence_5m",
+                    "backup_long_score": 1.0,
+                    "backup_short_score": 0.0,
+                }
+            },
+            "ev": {
+                "components": {
+                    "primary_flat": True,
+                    "backup_source": "ma10_macd_confluence_5m",
+                    "backup_long_score": 1.0,
+                    "backup_short_score": 0.0,
+                }
+            },
+        },
+        base_scores={"long_score": 0.0001, "short_score": 0.0384},
+        trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_side": "SHORT",
+            "trend_capture_score_long": 0.0,
+            "trend_capture_score_short": 0.2,
+            "trend_capture_breakout_short": True,
+            "trend_capture_cvd_align_short": True,
+            "trend_capture_depth_align_short": True,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.08,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": True,
+            "confluence_anchor_ma10_long": True,
+            "confluence_macd_trigger_long": True,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.BUY
+    assert resolved.metadata["trend_capture_score_long"] == 1.0
+    assert resolved.metadata["trend_capture_confluence_injected"] is True
+    assert resolved.metadata["trend_capture_confluence_injected_side"] == "LONG"
+    assert resolved.metadata["trend_capture_confluence_injected_score"] == 1.0
+    assert resolved.metadata["trend_capture_injection_confirm_pass"] is True
+    assert resolved.metadata["trend_capture_injection_gate_pass"] is True
+    assert resolved.metadata["final_long_score"] >= 0.07
+
+
+def test_resolve_entry_mode_injects_short_confluence_fallback_into_entry_score():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["short_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BNBUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "SHORT_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 0.5,
+            "consistency_3bars": 0,
+            "lw": {
+                "components": {
+                    "primary_flat": True,
+                    "backup_source": "ma10_macd_confluence_5m",
+                    "backup_long_score": 0.0,
+                    "backup_short_score": 1.0,
+                }
+            },
+            "ev": {
+                "components": {
+                    "primary_flat": True,
+                    "backup_source": "ma10_macd_confluence_5m",
+                    "backup_long_score": 0.0,
+                    "backup_short_score": 1.0,
+                }
+            },
+        },
+        base_scores={"long_score": 0.0384, "short_score": 0.0001},
+        trend_pending={"trend_pending_side": "SHORT", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_side": "LONG",
+            "trend_capture_score_long": 0.2,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": True,
+            "trend_capture_cvd_align_long": True,
+            "trend_capture_depth_align_long": True,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.08,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": True,
+            "confluence_hard_block_short": False,
+            "confluence_anchor_ma10_short": True,
+            "confluence_macd_trigger_short": True,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.SELL
+    assert resolved.metadata["trend_capture_score_short"] == 1.0
+    assert resolved.metadata["trend_capture_confluence_injected"] is True
+    assert resolved.metadata["trend_capture_confluence_injected_side"] == "SHORT"
+    assert resolved.metadata["trend_capture_confluence_injected_score"] == 1.0
+    assert resolved.metadata["trend_capture_injection_confirm_pass"] is True
+    assert resolved.metadata["trend_capture_injection_gate_pass"] is True
+    assert resolved.metadata["final_short_score"] >= 0.07
+
+
+def test_resolve_entry_mode_does_not_inject_fallback_when_entry_window_closed():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BNBUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": False,
+            "flow_confirm": 1.0,
+            "consistency_3bars": 1,
+            "lw": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m", "backup_long_score": 1.0}},
+            "ev": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m", "backup_long_score": 1.0}},
+        },
+        base_scores={"long_score": 0.0001, "short_score": 0.0384},
+        trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
+        trend_capture={"trend_capture_score_long": 0.0, "trend_capture_score_short": 0.2, "trend_capture_side": "SHORT"},
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.08,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": True,
+            "confluence_anchor_ma10_long": True,
+            "confluence_macd_trigger_long": True,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.HOLD
+    assert resolved.metadata["trend_capture_confluence_injected"] is False
+    assert resolved.metadata["trend_capture_injection_confirm_pass"] is True
+    assert resolved.metadata["trend_capture_injection_gate_pass"] is False
+
+
+def test_detect_regime_primary_flat_prefers_5m_confluence_fallback_over_cvd():
+    engine = FundFlowDecisionEngine(_cfg())
+    regime_info = engine._detect_regime(
+        {
+            "cvd_momentum": -0.8,
+            "imbalance": -0.7,
+            "timeframes": {
+                "15m": {
+                    "adx": 20.0,
+                    "atr_pct": 0.004,
+                    "ema_fast": 101.0,
+                    "ema_slow": 100.0,
+                    "last_open": 100.0,
+                    "last_close": 100.2,
+                    "macd_hist_norm": 0.0,
+                    "macd_cross": "NONE",
+                    "macd_hist_delta": 0.0,
+                    "kdj_j": 50.0,
+                    "kdj_cross": "NONE",
+                    "kdj_zone": "MID",
+                    "bb_pos_norm": 0.0,
+                    "bb_width_norm": 0.0,
+                    "bb_break": "NONE",
+                    "bb_trend": "MID",
+                    "bb_squeeze": False,
+                },
+                "5m": {},
+                "1h": {},
+            },
+            "_ma10_macd_confluence": {
+                "last_close_1h": 101.5,
+                "ma10_1h": 100.0,
+                "ma10_1h_bias": 1,
+                "macd_5m": 0.6,
+                "macd_5m_signal": 0.2,
+                "macd_5m_hist": 0.4,
+                "macd_5m_hist_delta": 0.1,
+                "macd_5m_cross": "NONE",
+                "macd_5m_zone": "ABOVE_ZERO",
+                "kdj_k": 62.0,
+                "kdj_d": 55.0,
+                "kdj_j": 76.0,
+                "kdj_cross": "NONE",
+                "kdj_zone": "HIGH",
+            },
+        }
+    )
+    assert regime_info["guide_direction"] == "LONG_ONLY"
+    assert regime_info["lw"]["components"]["backup_source"] == "ma10_macd_confluence_5m"
+    assert regime_info["ev"]["components"]["backup_source"] == "ma10_macd_confluence_5m"
+
+
+def test_detect_regime_primary_flat_still_uses_cvd_fallback_when_no_confluence():
+    engine = FundFlowDecisionEngine(_cfg())
+    regime_info = engine._detect_regime(
+        {
+            "cvd_momentum": -0.8,
+            "imbalance": -0.7,
+            "timeframes": {
+                "15m": {
+                    "adx": 20.0,
+                    "atr_pct": 0.004,
+                    "ema_fast": 101.0,
+                    "ema_slow": 100.0,
+                    "last_open": 100.0,
+                    "last_close": 99.8,
+                    "macd_hist_norm": 0.0,
+                    "macd_cross": "NONE",
+                    "macd_hist_delta": 0.0,
+                    "kdj_j": 50.0,
+                    "kdj_cross": "NONE",
+                    "kdj_zone": "MID",
+                    "bb_pos_norm": 0.0,
+                    "bb_width_norm": 0.0,
+                    "bb_break": "NONE",
+                    "bb_trend": "MID",
+                    "bb_squeeze": False,
+                },
+                "5m": {},
+            },
+        }
+    )
+    assert regime_info["guide_direction"] == "SHORT_ONLY"
+    assert regime_info["lw"]["components"]["backup_source"] == "cvd_imbalance"
+
+
+def test_resolve_entry_mode_blocks_long_when_symbol_override_is_short_only():
+    cfg = _cfg()
+    cfg["fund_flow"]["symbol_side_overrides"] = {"APTUSDT": "SHORT_ONLY"}
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="APTUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 0.6,
+            "consistency_3bars": 1,
+        },
+        base_scores={"long_score": 0.12, "short_score": 0.01},
+        trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_score_long": 0.12,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_side": "LONG",
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.HOLD
+    assert resolved.metadata["symbol_side_override_mode"] == "SHORT_ONLY"
+    assert resolved.metadata["symbol_side_override_allowed"] is False
+    assert resolved.metadata["blocked_operation"] == Operation.BUY.value
+
+
+def test_decide_blocks_range_long_when_symbol_override_is_short_only(monkeypatch):
+    cfg = _cfg()
+    cfg["fund_flow"]["symbol_side_overrides"] = {"SUIUSDT": "SHORT_ONLY"}
+    engine = FundFlowDecisionEngine(cfg)
+
+    monkeypatch.setattr(engine, "_detect_regime", lambda _ctx: {"regime": "RANGE", "direction": "BOTH", "reason": "test"})
+    monkeypatch.setattr(engine, "_compute_trend_pending", lambda *args, **kwargs: {"trend_pending_side": "NONE", "trend_pending_score": 0.0})
+    monkeypatch.setattr(
+        engine,
+        "_engine_params_for",
+        lambda _regime: {
+            "default_leverage": 2,
+            "default_target_portion": 0.2,
+            "long_open_threshold": 0.07,
+            "short_open_threshold": 0.07,
+            "close_threshold": 0.3,
+        },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_extract_range_quantiles",
+        lambda _ctx: {
+            "ready": True,
+            "imb_hi": 0.4,
+            "imb_lo": -0.4,
+            "cvd_hi": 0.3,
+            "cvd_lo": -0.3,
+            "trap_guard_enabled": False,
+            "n": 64,
+        },
+    )
+    monkeypatch.setattr(engine, "_extract_15m_context", lambda _ctx: {})
+    monkeypatch.setattr(engine, "_extract_5m_context", lambda _ctx: {})
+    monkeypatch.setattr(engine, "_score_range", lambda _ctx: {"long_score": 0.6, "short_score": 0.1})
+    monkeypatch.setattr(engine, "_score_trend", lambda _ctx: {"long_score": 0.0, "short_score": 0.0})
+    monkeypatch.setattr(
+        engine,
+        "_fuse_scores",
+        lambda *_args, **_kwargs: {"long_score": 0.6, "short_score": 0.1, "fusion_applied": False},
+    )
+    monkeypatch.setattr(engine, "_record_15m_score", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(engine, "_compute_flow_consistency", lambda *_args, **_kwargs: (0.0, 0))
+    monkeypatch.setattr(engine, "_compute_trend_capture", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(engine, "_compute_entry_confluence_v2", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(engine, "_compute_range_veto_by_trend", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(engine, "_extract_range_turn_values", lambda _ctx: {})
+    monkeypatch.setattr(
+        engine,
+        "_evaluate_range_turn_confirm",
+        lambda _vals: {
+            "turned_up": True,
+            "turned_down": False,
+            "pass_count_long": 2,
+            "pass_count_short": 0,
+            "min_pass_count": 2,
+            "mode": "1bar",
+            "ready": True,
+        },
+    )
+
+    decision = engine.decide(
+        symbol="SUIUSDT",
+        portfolio={"positions": {}},
+        price=100.0,
+        market_flow_context={
+            "imbalance": -0.5,
+            "cvd_momentum": -0.4,
+            "oi_delta_ratio": 0.0,
+        },
+        use_weight_router=False,
+        use_ai_weights=False,
+    )
+
+    assert decision.operation == Operation.HOLD
+    assert decision.metadata["symbol_side_override_mode"] == "SHORT_ONLY"
+    assert decision.metadata["symbol_side_override_allowed"] is False
+    assert decision.metadata["blocked_operation"] == Operation.BUY.value

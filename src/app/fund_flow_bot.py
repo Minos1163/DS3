@@ -1287,6 +1287,21 @@ class TradingBot:
             ),
             "exit_confirm_bars": max(1, int(self._to_float(gate_cfg.get("exit_confirm_bars", 2), 2))),
             "exit_min_hold_seconds": max(0, int(self._to_float(gate_cfg.get("exit_min_hold_seconds", 300), 300))),
+            "exit_profit_lock_enabled": bool(gate_cfg.get("exit_profit_lock_enabled", True)),
+            "exit_profit_lock_min_pnl": max(
+                0.0,
+                self._normalize_percent_to_ratio(gate_cfg.get("exit_profit_lock_min_pnl", 0.0), 0.0),
+            ),
+            "exit_trap_grace_enabled": bool(gate_cfg.get("exit_trap_grace_enabled", True)),
+            "exit_trap_grace_trap_score_min": min(
+                1.0,
+                max(0.0, self._to_float(gate_cfg.get("exit_trap_grace_trap_score_min", 0.70), 0.70)),
+            ),
+            "exit_trap_grace_max_drawdown": max(
+                0.0,
+                self._normalize_percent_to_ratio(gate_cfg.get("exit_trap_grace_max_drawdown", 0.006), 0.006),
+            ),
+            "exit_loss_fast_close_enabled": bool(gate_cfg.get("exit_loss_fast_close_enabled", True)),
             "exit_require_price_followthrough": bool(gate_cfg.get("exit_require_price_followthrough", True)),
             "exit_price_change_min": max(
                 0.0,
@@ -2265,6 +2280,18 @@ class TradingBot:
                 exit_score_threshold = self._to_float(cfg.get("exit_score_threshold"), 0.12)
                 exit_confirm_bars = max(1, int(self._to_float(cfg.get("exit_confirm_bars"), 2)))
                 exit_min_hold_seconds = max(0, int(self._to_float(cfg.get("exit_min_hold_seconds"), 300)))
+                exit_profit_lock_enabled = bool(cfg.get("exit_profit_lock_enabled", True))
+                exit_profit_lock_min_pnl = max(0.0, self._to_float(cfg.get("exit_profit_lock_min_pnl"), 0.0))
+                exit_trap_grace_enabled = bool(cfg.get("exit_trap_grace_enabled", True))
+                exit_trap_grace_trap_score_min = min(
+                    1.0,
+                    max(0.0, self._to_float(cfg.get("exit_trap_grace_trap_score_min"), 0.70)),
+                )
+                exit_trap_grace_max_drawdown = max(
+                    0.0,
+                    self._to_float(cfg.get("exit_trap_grace_max_drawdown"), 0.006),
+                )
+                exit_loss_fast_close_enabled = bool(cfg.get("exit_loss_fast_close_enabled", True))
                 exit_require_price_followthrough = bool(cfg.get("exit_require_price_followthrough", True))
                 exit_price_change_min = abs(self._to_float(cfg.get("exit_price_change_min"), 0.0006))
                 exit_drawdown_override = abs(self._to_float(cfg.get("exit_drawdown_override"), 0.01))
@@ -2276,6 +2303,14 @@ class TradingBot:
                     if first_seen is not None:
                         hold_seconds = max(0, int(time.time() - float(first_seen)))
 
+                entry_price = self._to_float(position.get("entry_price"), 0.0)
+                current_pnl_ratio = 0.0
+                if current_price > 0 and entry_price > 0:
+                    if direction == "LONG":
+                        current_pnl_ratio = (current_price - entry_price) / entry_price
+                    elif direction == "SHORT":
+                        current_pnl_ratio = (entry_price - current_price) / entry_price
+
                 score_ok = gate_score <= (-1.0 * exit_score_threshold)
                 hold_ok = hold_seconds >= exit_min_hold_seconds
                 drawdown_override = drawdown >= exit_drawdown_override
@@ -2286,8 +2321,41 @@ class TradingBot:
                 else:
                     price_followthrough = False
 
-                exit_confirmed = hard_block or (
-                    score_ok
+                trap_score = max(
+                    self._to_float(flow_context.get("trap_score"), 0.0),
+                    self._to_float(md.get("trap_score", md.get("trap_last", 0.0)), 0.0),
+                )
+                post_entry_protection_active = not hold_ok
+                # 开仓后的保护期只约束“前300秒”，不能变成“方向反了再多等300秒”。
+                profit_lock_ready = (
+                    exit_profit_lock_enabled
+                    and (not post_entry_protection_active)
+                    and current_pnl_ratio > exit_profit_lock_min_pnl
+                )
+                trap_rebound_window = (
+                    exit_trap_grace_enabled
+                    and
+                    (not post_entry_protection_active)
+                    and current_pnl_ratio <= 0.0
+                    and trap_score >= exit_trap_grace_trap_score_min
+                    and (not hard_block)
+                    and (not drawdown_override)
+                    and (not price_followthrough)
+                    and drawdown < max(exit_drawdown_override * 2.0, exit_trap_grace_max_drawdown)
+                )
+                fast_loss_exit = (
+                    exit_loss_fast_close_enabled
+                    and
+                    (not post_entry_protection_active)
+                    and current_pnl_ratio < 0.0
+                    and score_ok
+                    and (drawdown_override or price_followthrough)
+                    and (not trap_rebound_window)
+                )
+
+                exit_confirmed = hard_block or profit_lock_ready or fast_loss_exit or (
+                    (not trap_rebound_window)
+                    and score_ok
                     and exit_streak >= exit_confirm_bars
                     and (drawdown_override or hold_ok)
                     and ((not exit_require_price_followthrough) or drawdown_override or price_followthrough)
@@ -2297,19 +2365,38 @@ class TradingBot:
                 gate_meta["exit_hold_seconds"] = hold_seconds
                 gate_meta["exit_price_change"] = price_change
                 gate_meta["exit_drawdown"] = drawdown
+                gate_meta["exit_current_pnl_ratio"] = current_pnl_ratio
+                gate_meta["exit_trap_score"] = trap_score
+                gate_meta["post_entry_protection_active"] = bool(post_entry_protection_active)
+                gate_meta["profit_lock_ready"] = bool(profit_lock_ready)
+                gate_meta["trap_rebound_window"] = bool(trap_rebound_window)
+                gate_meta["fast_loss_exit"] = bool(fast_loss_exit)
                 if isinstance(md, dict):
                     md["pretrade_risk_gate"] = gate_meta
 
                 if not exit_confirmed:
                     gate_meta["action"] = "HOLD"
                     base_reason = str(decision.reason or "").strip()
-                    delay_reason = (
-                        "PRE_RISK_EXIT_DELAY "
-                        f"score={gate_score:.3f}/{-exit_score_threshold:.3f} "
-                        f"streak={exit_streak}/{exit_confirm_bars} "
-                        f"hold={hold_seconds}s/{exit_min_hold_seconds}s "
-                        f"pc={price_change:+.4f}"
-                    )
+                    if post_entry_protection_active and (not hard_block) and (not drawdown_override):
+                        delay_reason = (
+                            "PRE_RISK_COOLDOWN_PROTECT "
+                            f"hold={hold_seconds}s/{exit_min_hold_seconds}s "
+                            f"pnl={current_pnl_ratio:+.4f} dd={drawdown:.4f}"
+                        )
+                    elif trap_rebound_window:
+                        delay_reason = (
+                            "PRE_RISK_TRAP_GRACE "
+                            f"trap={trap_score:.2f} pnl={current_pnl_ratio:+.4f} "
+                            f"dd={drawdown:.4f}/{max(exit_drawdown_override * 2.0, exit_trap_grace_max_drawdown):.4f}"
+                        )
+                    else:
+                        delay_reason = (
+                            "PRE_RISK_EXIT_DELAY "
+                            f"score={gate_score:.3f}/{-exit_score_threshold:.3f} "
+                            f"streak={exit_streak}/{exit_confirm_bars} "
+                            f"hold={hold_seconds}s/{exit_min_hold_seconds}s "
+                            f"pc={price_change:+.4f}"
+                        )
                     return (
                         FundFlowDecision(
                             operation=FundFlowOperation.HOLD,
@@ -2329,7 +2416,12 @@ class TradingBot:
                     and direction in ("LONG", "SHORT")
                 ):
                     skip_on_hard_block = bool(confluence_cfg.get("exit_anchor_skip_on_hard_block", True))
-                    skip_anchor = bool(drawdown_override) or (skip_on_hard_block and bool(hard_block))
+                    skip_anchor = (
+                        bool(drawdown_override)
+                        or bool(profit_lock_ready)
+                        or bool(fast_loss_exit)
+                        or (skip_on_hard_block and bool(hard_block))
+                    )
                     if not skip_anchor:
                         ma10_5m = self._to_float(md.get("ma10_5m"), 0.0)
                         last_close_5m = self._to_float(md.get("last_close_5m"), self._to_float(md.get("last_close"), 0.0))
@@ -5200,7 +5292,11 @@ class TradingBot:
                 "positions": positions_payload,
                 "total_assets": self._to_float(account_summary.get("equity"), 0.0),
             }
-            trigger_context = {"trigger_type": trigger_type, "signal_pool_id": None}
+            trigger_context = {
+                "trigger_type": trigger_type,
+                "signal_pool_id": None,
+                "allow_entry_window": bool(allow_new_entries),
+            }
 
             confluence_cfg = self._ma10_macd_confluence_config()
             confluence: Dict[str, Any] = {}
