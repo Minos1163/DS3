@@ -1,6 +1,6 @@
 """
 配置加载器
-负责加载和验证配置文件
+负责加载和验证配置文件（支持 JSON 和 JSONC 格式）
 """
 
 import json
@@ -9,7 +9,72 @@ from typing import Any, Dict
 
 
 class ConfigLoader:
-    """配置加载器"""
+    """配置加载器（支持 JSONC 带注释的 JSON 格式）"""
+
+    @staticmethod
+    def _strip_jsonc_comments(content: str) -> str:
+        """
+        移除 JSONC 格式的注释（支持 // 单行注释和 /* */ 多行注释）
+        """
+        result = []
+        in_string = False
+        escape = False
+        in_single_line_comment = False
+        in_multi_line_comment = False
+        i = 0
+
+        while i < len(content):
+            char = content[i]
+            next_char = content[i + 1] if i + 1 < len(content) else ""
+
+            if in_single_line_comment:
+                if char in "\r\n":
+                    in_single_line_comment = False
+                    result.append(char)
+                i += 1
+                continue
+
+            if in_multi_line_comment:
+                if char == "*" and next_char == "/":
+                    in_multi_line_comment = False
+                    i += 2
+                    continue
+                if char in "\r\n":
+                    result.append(char)
+                i += 1
+                continue
+
+            if in_string:
+                result.append(char)
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                i += 1
+                continue
+
+            if char == '"':
+                in_string = True
+                result.append(char)
+                i += 1
+                continue
+
+            if char == "/" and next_char == "/":
+                in_single_line_comment = True
+                i += 2
+                continue
+
+            if char == "/" and next_char == "*":
+                in_multi_line_comment = True
+                i += 2
+                continue
+
+            result.append(char)
+            i += 1
+
+        return "".join(result)
 
     @staticmethod
     def _project_root() -> str:
@@ -26,7 +91,7 @@ class ConfigLoader:
     @staticmethod
     def load_json_config(file_path: str) -> Dict[str, Any]:
         """
-        加载JSON配置文件
+        加载JSON配置文件（支持 .json 和 .jsonc 格式）
 
         Args:
             file_path: 配置文件路径
@@ -39,11 +104,24 @@ class ConfigLoader:
             json.JSONDecodeError: JSON格式错误
         """
         resolved_path = ConfigLoader._resolve_config_path(file_path)
+
+        # 支持 .jsonc 后缀
         if not os.path.exists(resolved_path):
-            raise FileNotFoundError(f"配置文件不存在: {file_path} (resolved: {resolved_path})")
+            # 如果 .json 不存在，尝试 .jsonc
+            if resolved_path.endswith('.json'):
+                jsonc_path = resolved_path[:-5] + '.jsonc'
+                if os.path.exists(jsonc_path):
+                    resolved_path = jsonc_path
+            elif not os.path.exists(resolved_path):
+                raise FileNotFoundError(f"配置文件不存在: {file_path} (resolved: {resolved_path})")
 
         with open(resolved_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+            content = f.read()
+
+        # 移除注释（JSONC 格式）
+        content = ConfigLoader._strip_jsonc_comments(content)
+
+        config = json.loads(content)
 
         return config
 

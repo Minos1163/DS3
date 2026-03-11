@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "workspace": {
+    "name": "AI2",
+    "createdAt": 1772943521249,
+    "preset": "starter"
+  },
+  "authorizedRoots": [
+    "D:\\AIDCA\\AI2"
+  ]
+}

@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gitnexus/package-lock.json
+      - run: npm ci
+        working-directory: gitnexus
+      - run: npx tsc --noEmit
+        working-directory: gitnexus
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gitnexus/package-lock.json
+      - run: npm ci
+        working-directory: gitnexus
+      - run: npx vitest run test/unit --coverage --coverage.thresholdAutoUpdate=false
+        working-directory: gitnexus
+
+  cross-platform-unit:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gitnexus/package-lock.json
+      - run: npm ci
+        working-directory: gitnexus
+      - run: npx vitest run test/unit
+        working-directory: gitnexus
+
+  cross-platform-integration:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gitnexus/package-lock.json
+      - run: npm ci
+        working-directory: gitnexus
+      - run: npm run build
+        working-directory: gitnexus
+      - run: npx vitest run test/integration
+        working-directory: gitnexus
