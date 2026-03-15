@@ -910,6 +910,9 @@ class RiskManager:
                 "structure": structure,
                 "structure_break": structure_break,
                 "penetration": round(penetration, 3),
+                "deep_break": bool(deep_break),
+                "ev_opp": False,
+                "lw_opp": False,
                 "hard_votes": 3,
                 "confirm_count": trap_count,
                 "reason": (
@@ -975,6 +978,9 @@ class RiskManager:
                 "structure": structure,
                 "structure_break": structure_break,
                 "penetration": round(penetration, 3),
+                "deep_break": bool(deep_break),
+                "ev_opp": bool(ev_opp),
+                "lw_opp": bool(lw_opp),
                 "hard_votes": hard_votes,
                 "confirm_count": rev_count,
                 "reason": (
@@ -994,6 +1000,9 @@ class RiskManager:
                 "structure": structure,
                 "structure_break": structure_break,
                 "penetration": round(penetration, 3),
+                "deep_break": bool(deep_break),
+                "ev_opp": bool(ev_opp),
+                "lw_opp": bool(lw_opp),
                 "hard_votes": hard_votes,
                 "confirm_count": rev_count,
                 "reason": (
@@ -1014,6 +1023,9 @@ class RiskManager:
                 "structure": structure,
                 "structure_break": structure_break,
                 "penetration": round(penetration, 3),
+                "deep_break": bool(deep_break),
+                "ev_opp": bool(ev_opp),
+                "lw_opp": bool(lw_opp),
                 "hard_votes": hard_votes,
                 "confirm_count": rev_count,
                 "reason": (
@@ -1033,6 +1045,9 @@ class RiskManager:
                 "structure": structure,
                 "structure_break": structure_break,
                 "penetration": round(penetration, 3),
+                "deep_break": bool(deep_break),
+                "ev_opp": bool(ev_opp),
+                "lw_opp": bool(lw_opp),
                 "hard_votes": hard_votes,
                 "confirm_count": rev_count,
                 "reduce_pct": reduce_pct,
@@ -1053,6 +1068,9 @@ class RiskManager:
                 "structure": structure,
                 "structure_break": structure_break,
                 "penetration": round(penetration, 3),
+                "deep_break": bool(deep_break),
+                "ev_opp": bool(ev_opp),
+                "lw_opp": bool(lw_opp),
                 "hard_votes": hard_votes,
                 "confirm_count": rev_count,
                 "reason": (
@@ -1071,6 +1089,9 @@ class RiskManager:
             "structure": structure,
             "structure_break": structure_break,
             "penetration": round(penetration, 3),
+            "deep_break": bool(deep_break),
+            "ev_opp": bool(ev_opp),
+            "lw_opp": bool(lw_opp),
             "hard_votes": hard_votes,
             "confirm_count": rev_count,
             "reason": (
@@ -1128,7 +1149,6 @@ class RiskManager:
             lw_score: LW 分数
             macd_strength: MACD 强度（可选，默认用 abs(macd_hist_norm)）
             now_ts: 当前时间戳（可选，用于 cooldown 检查）
-            ma10_ltf: 低周期 MA10（可选，用于趋势结构判定）
             last_close: 低周期最新收盘价（可选，用于趋势结构判定）
             decision_reason: 决策引擎 reason（用于反转语义投票）
 
@@ -1162,17 +1182,6 @@ class RiskManager:
 
         regime = str(market_regime or "").upper()
         is_trend = regime == "TREND"
-        ma10_ref = abs(float(ma10_ltf or 0.0))
-        close_ref = float(last_close or 0.0)
-
-        def _trend_structure_intact() -> bool:
-            if (not is_trend) or ma10_ref <= 0 or close_ref <= 0:
-                return False
-            if position_side == "LONG":
-                return close_ref >= ma10_ref
-            if position_side == "SHORT":
-                return close_ref <= ma10_ref
-            return False
 
         key = (symbol, str(position_side).upper())
         # caller can pass loop timestamp; otherwise fallback to "now"
@@ -1296,6 +1305,9 @@ class RiskManager:
         result["state_energy_decline"] = bool(state_info.get("energy_decline", False))
         result["state_structure"] = str(state_info.get("structure", "UNKNOWN"))
         result["state_reason"] = str(state_info.get("reason", ""))
+        result["state_deep_break"] = bool(state_info.get("deep_break", False))
+        result["state_ev_opp"] = bool(state_info.get("ev_opp", False))
+        result["state_lw_opp"] = bool(state_info.get("lw_opp", False))
 
         # 状态机优先级：熔断/退出 > 减仓 > 收紧
         if risk_state in ("CIRCUIT_EXIT", "EXIT"):
@@ -1387,11 +1399,7 @@ class RiskManager:
                 return _finalize(result)
 
             if against_ev and ev_score_abs >= ev_conflict_light_min:
-                if _trend_structure_intact():
-                    prev = int(self._conflict_counters.get(key, 0) or 0)
-                    self._conflict_counters[key] = max(0, prev - 1)
-                else:
-                    self._conflict_counters[key] = int(self._conflict_counters.get(key, 0) or 0) + 1
+                self._conflict_counters[key] = int(self._conflict_counters.get(key, 0) or 0) + 1
                 conflict_bars = self._conflict_counters[key]
                 conflict_score = ev_score_abs
                 # LW 与 EV 同向（都反持仓）时，提升冲突等级；反之降级
@@ -1495,11 +1503,7 @@ class RiskManager:
 
         if conflict:
             # 更新冲突计数
-            if _trend_structure_intact():
-                prev = int(self._conflict_counters.get(key, 0) or 0)
-                self._conflict_counters[key] = max(0, prev - 1)
-            else:
-                self._conflict_counters[key] = int(self._conflict_counters.get(key, 0) or 0) + 1
+            self._conflict_counters[key] = int(self._conflict_counters.get(key, 0) or 0) + 1
             conflict_bars = self._conflict_counters[key]
 
             # 风险惩罚系数

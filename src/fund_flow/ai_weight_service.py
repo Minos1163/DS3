@@ -315,7 +315,6 @@ class DeepSeekAIService:
                 "vol_cool": bool(context.get("extreme_vol_cooldown", False)),
             },
             "tech": {
-                "ma": str(tech_context.get("ma10_bias_1h", "FLAT")),
                 "mc": str(tech_context.get("macd_cross_5m", "NONE")),
                 "mz": str(tech_context.get("macd_zone_5m", "NEAR_ZERO")),
                 "mh": bool(tech_context.get("macd_hist_expand_5m", False)),

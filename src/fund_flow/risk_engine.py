@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Optional
 
+from src.config.config_loader import ConfigLoader
 from src.fund_flow.models import FundFlowDecision, Operation
 
 
@@ -19,20 +20,12 @@ class FundFlowRiskEngine:
         symbol_whitelist: Optional[Iterable[str]] = None,
     ) -> None:
         self.config = config or {}
-        trading = self.config.get("trading", {}) or {}
         fund_flow_cfg = self.config.get("fund_flow", {}) or {}
+        leverage_cfg = ConfigLoader.get_leverage_settings(self.config, scope="fund_flow")
 
-        self.min_leverage = int(
-            fund_flow_cfg.get("min_leverage", trading.get("min_leverage", 2))
-        )
-        max_lev_raw = int(
-            fund_flow_cfg.get("max_leverage", trading.get("max_leverage", 20))
-        )
-        self.max_leverage = max(self.min_leverage, min(20, max_lev_raw))
-        default_lev_raw = int(
-            fund_flow_cfg.get("default_leverage", trading.get("default_leverage", self.min_leverage))
-        )
-        self.default_leverage = min(self.max_leverage, max(self.min_leverage, default_lev_raw))
+        self.min_leverage = int(leverage_cfg["min_leverage"])
+        self.max_leverage = int(leverage_cfg["max_leverage"])
+        self.default_leverage = int(leverage_cfg["default_leverage"])
         self.min_open_portion = float(fund_flow_cfg.get("min_open_portion", 0.08))
         self.max_open_portion = float(fund_flow_cfg.get("max_open_portion", 1.0))
         self.price_deviation_limit_percent = float(

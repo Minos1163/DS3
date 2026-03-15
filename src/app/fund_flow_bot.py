@@ -260,6 +260,9 @@ class TradingBot:
         self._volatility_last_bucket_by_symbol: Dict[str, str] = {}
         self._volatility_cooldown_until_by_symbol: Dict[str, datetime] = {}
         self._volatility_cooldown_reason_by_symbol: Dict[str, str] = {}
+        self._conflict_exit_streak_by_symbol: Dict[str, int] = {}
+        self._conflict_cooldown_until_by_symbol: Dict[str, datetime] = {}
+        self._conflict_cooldown_reason_by_symbol: Dict[str, str] = {}
         self._prev_imbalance_for_phantom: Dict[str, float] = {}
         self._micro_feature_history: Dict[str, Dict[str, Deque[float]]] = {}
         self._signal_registry_version: str = ""
@@ -677,6 +680,7 @@ class TradingBot:
 
     def _print_startup_summary(self) -> None:
         ff_cfg = self.config.get("fund_flow", {}) or {}
+        leverage_cfg = ConfigLoader.get_leverage_settings(self.config, scope="fund_flow")
         symbols = ConfigLoader.get_trading_symbols(self.config)
         startup_cfg = self._startup_market_preload_config()
         print("=" * 66)
@@ -688,9 +692,9 @@ class TradingBot:
         print(f"📊 交易对: {', '.join(symbols)}")
         print(
             "⚙️ 杠杆配置: "
-            f"min={ff_cfg.get('min_leverage', 2)}x, "
-            f"default={ff_cfg.get('default_leverage', 2)}x, "
-            f"max={ff_cfg.get('max_leverage', 20)}x"
+            f"min={leverage_cfg['min_leverage']}x, "
+            f"default={leverage_cfg['default_leverage']}x, "
+            f"max={leverage_cfg['max_leverage']}x"
         )
         print(
             "🎚️ 止盈止损(生效): "
@@ -1053,7 +1057,126 @@ class TradingBot:
             "position_timeframe_seconds": max(60, position_tf_seconds),
             "flat_timeframe_seconds": max(60, flat_tf_seconds),
             "flat_top_n": flat_top_n,
+            "allow_entries_with_positions": bool(ai_cfg.get("allow_entries_with_positions", True)),
+            "final_min_score": max(0.0, self._to_float(ai_cfg.get("final_min_score", 0.08), 0.08)),
+            "final_same_side_add_min_score": max(
+                0.0,
+                self._to_float(ai_cfg.get("final_same_side_add_min_score", 0.11), 0.11),
+            ),
+            "final_trend_weak_score": max(
+                0.0,
+                self._to_float(ai_cfg.get("final_trend_weak_score", 0.16), 0.16),
+            ),
+            "final_trend_min_structure_votes": max(
+                1,
+                int(self._to_float(ai_cfg.get("final_trend_min_structure_votes", 1), 1)),
+            ),
+            "final_max_trap_score": max(
+                0.0,
+                self._to_float(ai_cfg.get("final_max_trap_score", 0.5), 0.5),
+            ),
+            "final_require_trend_structure": bool(ai_cfg.get("final_require_trend_structure", True)),
+            "final_block_trap_unconfirmed": bool(ai_cfg.get("final_block_trap_unconfirmed", True)),
+            "final_block_trend_bad_macd_zone": bool(ai_cfg.get("final_block_trend_bad_macd_zone", True)),
         }
+
+    @staticmethod
+    def _ai_review_mode_supports_position_review(ai_review_mode: str) -> bool:
+        return str(ai_review_mode or "").lower() in {"positions", "mixed"}
+
+    @staticmethod
+    def _ai_review_mode_supports_flat_candidates(ai_review_mode: str) -> bool:
+        return str(ai_review_mode or "").lower() in {"flat_candidates", "mixed"}
+
+    @staticmethod
+    def _ai_entry_guard(
+        *,
+        decision: FundFlowDecision,
+        local_score: float,
+        flow_context: Optional[Dict[str, Any]],
+        ai_review_cfg: Optional[Dict[str, Any]],
+        position: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        if decision.operation not in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+            return True, ""
+
+        cfg = ai_review_cfg if isinstance(ai_review_cfg, dict) else {}
+        md_raw = getattr(decision, "metadata", None)
+        md: Dict[str, Any] = md_raw if isinstance(md_raw, dict) else {}
+        ctx = flow_context if isinstance(flow_context, dict) else {}
+
+        def _f(value: Any, default: float = 0.0) -> float:
+            try:
+                out = float(value)
+            except Exception:
+                out = float(default)
+            if out != out or out == float("inf") or out == float("-inf"):
+                return float(default)
+            return out
+
+        side = "LONG" if decision.operation == FundFlowOperation.BUY else "SHORT"
+        pos_side = str(position.get("side", "")).upper() if isinstance(position, dict) else ""
+        same_side_add = pos_side in {"LONG", "SHORT"} and pos_side == side
+        min_score = _f(
+            cfg.get("final_same_side_add_min_score" if same_side_add else "final_min_score"),
+            0.11 if same_side_add else 0.08,
+        )
+        if local_score < min_score:
+            tag = "same_side_add" if same_side_add else "entry"
+            return False, f"{tag}_score<{min_score:.3f} ({local_score:.3f})"
+
+        engine = str(md.get("engine") or md.get("regime") or ctx.get("regime") or "").upper()
+        final_raw = md.get("final")
+        final_info: Dict[str, Any] = final_raw if isinstance(final_raw, dict) else {}
+        need_confirm = bool(final_info.get("need_confirm", False))
+        flow_confirm = bool(ctx.get("flow_confirm", md.get("flow_confirm", False)))
+        trap_score = _f(ctx.get("trap_score", ctx.get("trap_last")), 0.0)
+        trap_confirmed = bool(ctx.get("trap_confirmed", False))
+        capture_side = str(ctx.get("capture_confirm_3m_side", "NONE")).upper()
+        macd_cross = str(ctx.get("macd_cross_5m", "NONE")).upper()
+        macd_zone = str(ctx.get("macd_zone_5m", "NEAR_ZERO")).upper()
+        weak_score = _f(cfg.get("final_trend_weak_score"), 0.16)
+        min_structure_votes = max(1, int(_f(cfg.get("final_trend_min_structure_votes"), 1)))
+
+        if side == "LONG":
+            capture_ok = capture_side == "LONG" or bool(ctx.get("capture_confirm_3m_long", False))
+            macd_cross_ok = macd_cross == "GOLDEN"
+            macd_zone_bad = macd_zone == "BELOW_ZERO"
+        else:
+            capture_ok = capture_side == "SHORT" or bool(ctx.get("capture_confirm_3m_short", False))
+            macd_cross_ok = macd_cross == "DEAD"
+            macd_zone_bad = macd_zone == "ABOVE_ZERO"
+
+        if (
+            bool(cfg.get("final_block_trap_unconfirmed", True))
+            and trap_score >= _f(cfg.get("final_max_trap_score"), 0.5)
+            and not trap_confirmed
+            and not flow_confirm
+            and not capture_ok
+        ):
+            return False, f"trap_unconfirmed score={trap_score:.3f}"
+
+        if engine == "TREND":
+            structure_votes = int(flow_confirm) + int(capture_ok) + int(macd_cross_ok)
+            if (
+                bool(cfg.get("final_require_trend_structure", True))
+                and structure_votes < min_structure_votes
+                and (need_confirm or local_score < weak_score)
+            ):
+                return (
+                    False,
+                    "trend_structure_weak "
+                    f"votes={structure_votes}/{min_structure_votes} "
+                    f"flow={int(flow_confirm)} capture={capture_side} mc={macd_cross}",
+                )
+            if (
+                bool(cfg.get("final_block_trend_bad_macd_zone", True))
+                and macd_zone_bad
+                and local_score < weak_score
+            ):
+                return False, f"trend_bad_macd_zone zone={macd_zone}"
+
+        return True, ""
 
     def _is_kline_alignment_active(self) -> bool:
         schedule_cfg = self.config.get("schedule", {}) or {}
@@ -1279,7 +1402,13 @@ class TradingBot:
             "force_exit_on_gate": bool(gate_cfg.get("force_exit_on_gate", True)),
             "entry_block_actions": entry_block_actions,
             "entry_hold_portion_scale": min(1.0, max(0.1, self._to_float(gate_cfg.get("entry_hold_portion_scale", 0.6), 0.6))),
-            "entry_hold_leverage_cap": max(1.0, self._to_float(gate_cfg.get("entry_hold_leverage_cap", 2.0), 2.0)),
+            "entry_hold_leverage_cap": max(
+                1.0,
+                self._to_float(
+                    gate_cfg.get("entry_hold_leverage_cap"),
+                    float(ConfigLoader.get_leverage_settings(self.config, scope="fund_flow")["min_leverage"]),
+                ),
+            ),
             "exit_close_ratio": min(1.0, max(0.1, self._to_float(gate_cfg.get("exit_close_ratio", 1.0), 1.0))),
             "exit_score_threshold": min(
                 1.0,
@@ -1291,6 +1420,10 @@ class TradingBot:
             "exit_profit_lock_min_pnl": max(
                 0.0,
                 self._normalize_percent_to_ratio(gate_cfg.get("exit_profit_lock_min_pnl", 0.0), 0.0),
+            ),
+            "exit_profit_lock_require_score_ok": bool(gate_cfg.get("exit_profit_lock_require_score_ok", True)),
+            "exit_profit_lock_require_followthrough": bool(
+                gate_cfg.get("exit_profit_lock_require_followthrough", True)
             ),
             "exit_trap_grace_enabled": bool(gate_cfg.get("exit_trap_grace_enabled", True)),
             "exit_trap_grace_trap_score_min": min(
@@ -1310,6 +1443,15 @@ class TradingBot:
             "exit_drawdown_override": max(
                 0.0,
                 self._normalize_percent_to_ratio(gate_cfg.get("exit_drawdown_override", 0.01), 0.01),
+            ),
+            "exit_trend_hold_enabled": bool(gate_cfg.get("exit_trend_hold_enabled", True)),
+            "exit_trend_hold_min_score": min(
+                1.0,
+                max(0.0, self._to_float(gate_cfg.get("exit_trend_hold_min_score", 0.25), 0.25)),
+            ),
+            "exit_trend_hold_min_gap": min(
+                1.0,
+                max(0.0, self._to_float(gate_cfg.get("exit_trend_hold_min_gap", 0.12), 0.12)),
             ),
             "momentum_scale": max(1.0, self._to_float(gate_cfg.get("momentum_scale", 300.0), 300.0)),
             "volatility_cap": volatility_cap,
@@ -1468,7 +1610,15 @@ class TradingBot:
                 1.0,
                 max(0.1, self._to_float(raw.get("neutral_bias_portion_scale", 0.6), 0.6)),
             ),
-            "neutral_bias_leverage_cap": max(1, int(self._to_float(raw.get("neutral_bias_leverage_cap", 2), 2))),
+            "neutral_bias_leverage_cap": max(
+                1,
+                int(
+                    self._to_float(
+                        raw.get("neutral_bias_leverage_cap"),
+                        float(ConfigLoader.get_leverage_settings(self.config, scope="fund_flow")["min_leverage"]),
+                    )
+                ),
+            ),
             "bias_boost": min(0.5, max(0.0, self._to_float(raw.get("bias_boost", 0.12), 0.12))),
             "bias_penalty": min(0.5, max(0.0, self._to_float(raw.get("bias_penalty", 0.10), 0.10))),
             "cross_boost": min(0.5, max(0.0, self._to_float(raw.get("cross_boost", 0.06), 0.06))),
@@ -1954,14 +2104,21 @@ class TradingBot:
 
         md_raw = getattr(decision, "metadata", None)
         md: Dict[str, Any] = md_raw if isinstance(md_raw, dict) else {}
-        bias = int(self._to_float(md.get("ma10_1h_bias"), 0.0))
         macd_cross = str(md.get("macd_5m_cross", md.get("macd_cross", "NONE"))).upper()
         macd_hist_expand_up = bool(md.get("macd_5m_hist_expand_up", False))
         macd_hist_expand_down = bool(md.get("macd_5m_hist_expand_down", False))
-        macd_trigger_pass_long = bool(md.get("macd_trigger_pass_long", False))
-        macd_trigger_pass_short = bool(md.get("macd_trigger_pass_short", False))
-        macd_early_pass_long = bool(md.get("macd_early_pass_long", False))
-        macd_early_pass_short = bool(md.get("macd_early_pass_short", False))
+        macd_trigger_pass_long = bool(
+            md.get("confluence_macd_trigger_long", md.get("macd_trigger_pass_long", False))
+        )
+        macd_trigger_pass_short = bool(
+            md.get("confluence_macd_trigger_short", md.get("macd_trigger_pass_short", False))
+        )
+        macd_early_pass_long = bool(
+            md.get("confluence_macd_early_long", md.get("macd_early_pass_long", False))
+        )
+        macd_early_pass_short = bool(
+            md.get("confluence_macd_early_short", md.get("macd_early_pass_short", False))
+        )
 
         def _to_hold(tag: str) -> FundFlowDecision:
             base_reason = str(decision.reason or "").strip()
@@ -1974,33 +2131,19 @@ class TradingBot:
                 metadata=md,
             )
 
-        if bool(cfg.get("entry_hard_block_against_ma10", True)) and bias != 0:
-            is_opposite = (
-                (bias > 0 and decision.operation == FundFlowOperation.SELL)
-                or (bias < 0 and decision.operation == FundFlowOperation.BUY)
-            )
-            if is_opposite:
-                op_token = decision.operation.value if hasattr(decision.operation, "value") else str(decision.operation)
-                return _to_hold(f"MA10_BIAS_BLOCK bias={bias} op={op_token}")
-        elif bool(cfg.get("block_on_opposite_bias", True)) and bias != 0:
-            is_opposite = (
-                (bias > 0 and decision.operation == FundFlowOperation.SELL)
-                or (bias < 0 and decision.operation == FundFlowOperation.BUY)
-            )
-            if is_opposite:
-                op_token = decision.operation.value if hasattr(decision.operation, "value") else str(decision.operation)
-                return _to_hold(f"MA10_BIAS_BLOCK bias={bias} op={op_token}")
-
         if bool(cfg.get("entry_hard_block_reverse_macd", True)):
             if decision.operation == FundFlowOperation.BUY and macd_cross == "DEAD" and macd_hist_expand_down:
                 return _to_hold("MACD_REVERSE_BLOCK side=LONG cross=DEAD")
             if decision.operation == FundFlowOperation.SELL and macd_cross == "GOLDEN" and macd_hist_expand_up:
                 return _to_hold("MACD_REVERSE_BLOCK side=SHORT cross=GOLDEN")
 
+        allow_macd_early = bool(cfg.get("entry_allow_macd_early", True))
         if bool(cfg.get("entry_require_macd_trigger", True)):
-            if decision.operation == FundFlowOperation.BUY and not (macd_trigger_pass_long or macd_early_pass_long):
+            long_macd_ok = macd_trigger_pass_long or (allow_macd_early and macd_early_pass_long)
+            short_macd_ok = macd_trigger_pass_short or (allow_macd_early and macd_early_pass_short)
+            if decision.operation == FundFlowOperation.BUY and not long_macd_ok:
                 return _to_hold("MACD_TRIGGER_REQUIRED side=LONG")
-            if decision.operation == FundFlowOperation.SELL and not (macd_trigger_pass_short or macd_early_pass_short):
+            if decision.operation == FundFlowOperation.SELL and not short_macd_ok:
                 return _to_hold("MACD_TRIGGER_REQUIRED side=SHORT")
         return decision
 
@@ -2074,6 +2217,115 @@ class TradingBot:
             "timeframe": tf,
         }
 
+    def _strict_trend_strategy_config(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config, dict) else {}
+        engine_params = ff_cfg.get("engine_params", {}) if isinstance(ff_cfg, dict) else {}
+        trend_params = engine_params.get("TREND", {}) if isinstance(engine_params, dict) else {}
+        return {
+            "trend_only_mode": bool(trend_params.get("trend_only_mode", False)),
+            "break_even_trigger_pnl_ratio": max(
+                0.0,
+                self._normalize_percent_to_ratio(
+                    trend_params.get("tp_break_even_trigger_pnl_ratio", 0.0035),
+                    0.0035,
+                ),
+            ),
+            "break_even_lock_ratio": max(
+                0.0,
+                self._normalize_percent_to_ratio(
+                    trend_params.get("tp_break_even_lock_ratio", 0.0005),
+                    0.0005,
+                ),
+            ),
+            "trailing_activate_mfe_ratio": max(
+                0.0,
+                self._normalize_percent_to_ratio(
+                    trend_params.get("tp_trailing_activate_mfe_ratio", 0.0055),
+                    0.0055,
+                ),
+            ),
+            "trailing_distance_ratio": max(
+                0.0,
+                self._normalize_percent_to_ratio(
+                    trend_params.get("tp_trailing_distance_ratio", 0.0016),
+                    0.0016,
+                ),
+            ),
+            "ev_lw_flip_exit_mfe_ratio": max(
+                0.0,
+                self._normalize_percent_to_ratio(
+                    trend_params.get("ev_lw_flip_exit_mfe_ratio", 0.0015),
+                    0.0015,
+                ),
+            ),
+            "conflict_cooldown_trigger_count": max(
+                1,
+                int(self._to_float(trend_params.get("symbol_conflict_cooldown_trigger_count", 2), 2)),
+            ),
+            "conflict_cooldown_seconds": max(
+                0,
+                int(self._to_float(trend_params.get("symbol_conflict_cooldown_seconds", 3600), 3600)),
+            ),
+        }
+
+    def _conflict_symbol_cooldown_state(self, symbol: str) -> Dict[str, Any]:
+        cfg = self._strict_trend_strategy_config()
+        symbol_up = str(symbol).upper()
+        now = datetime.now(timezone.utc)
+        expiry = self._conflict_cooldown_until_by_symbol.get(symbol_up)
+        if isinstance(expiry, datetime) and expiry <= now:
+            self._conflict_cooldown_until_by_symbol.pop(symbol_up, None)
+            self._conflict_cooldown_reason_by_symbol.pop(symbol_up, None)
+            self._save_risk_state()
+            expiry = None
+        blocked = isinstance(expiry, datetime) and expiry > now
+        remaining = int((expiry - now).total_seconds()) if blocked else 0
+        return {
+            "enabled": bool(cfg.get("trend_only_mode", False)),
+            "blocked": bool(blocked),
+            "remaining_seconds": max(0, remaining),
+            "reason": self._conflict_cooldown_reason_by_symbol.get(symbol_up),
+            "streak": int(self._conflict_exit_streak_by_symbol.get(symbol_up, 0) or 0),
+        }
+
+    def _update_conflict_symbol_cooldown_after_close(
+        self,
+        *,
+        symbol: str,
+        close_action: str,
+        decision_reason: str,
+    ) -> None:
+        cfg = self._strict_trend_strategy_config()
+        symbol_up = str(symbol).upper()
+        reason = str(decision_reason or "")
+        if str(close_action).upper() != "EXIT":
+            return
+
+        is_conflict_exit = ("deep_break" in reason) or ("hard_conflict" in reason)
+        if not is_conflict_exit:
+            if self._conflict_exit_streak_by_symbol.get(symbol_up):
+                self._conflict_exit_streak_by_symbol[symbol_up] = 0
+                self._save_risk_state()
+            return
+
+        streak = int(self._conflict_exit_streak_by_symbol.get(symbol_up, 0) or 0) + 1
+        self._conflict_exit_streak_by_symbol[symbol_up] = streak
+        trigger_count = int(cfg.get("conflict_cooldown_trigger_count", 2))
+        cooldown_seconds = int(cfg.get("conflict_cooldown_seconds", 3600))
+        if streak >= trigger_count and cooldown_seconds > 0:
+            until = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
+            prev_until = self._conflict_cooldown_until_by_symbol.get(symbol_up)
+            if not isinstance(prev_until, datetime) or prev_until < until:
+                self._conflict_cooldown_until_by_symbol[symbol_up] = until
+            self._conflict_cooldown_reason_by_symbol[symbol_up] = (
+                f"conflict_exit_streak={streak}, trigger={trigger_count}, reason={reason[:160]}"
+            )
+            print(
+                f"⚠️ {symbol_up} 连续冲突退出冷却触发: "
+                f"streak={streak}, until={self._conflict_cooldown_until_by_symbol[symbol_up].isoformat()}"
+            )
+        self._save_risk_state()
+
     def _position_drawdown_ratio(self, position: Dict[str, Any], current_price: float) -> float:
         side = str(position.get("side", "")).upper()
         entry_price = self._to_float(position.get("entry_price"), 0.0)
@@ -2119,9 +2371,15 @@ class TradingBot:
                 default_volatility_cap,
             ),
         )
-        long_score = self._to_float(md.get("long_score_adj", md.get("long_score")), 0.0)
-        short_score = self._to_float(md.get("short_score_adj", md.get("short_score")), 0.0)
-        trend_strength = min(1.0, max(0.0, max(long_score, short_score)))
+        raw_long_score = self._to_float(md.get("long_score_adj", md.get("long_score")), 0.0)
+        raw_short_score = self._to_float(md.get("short_score_adj", md.get("short_score")), 0.0)
+        final_long_score = self._to_float(md.get("final_long_score"), raw_long_score)
+        final_short_score = self._to_float(md.get("final_short_score"), raw_short_score)
+        # 持仓风控优先看最终融合分，不要被过低的基础 long/short 分误伤。
+        trend_strength = min(
+            1.0,
+            max(0.0, max(raw_long_score, raw_short_score, final_long_score, final_short_score)),
+        )
         cvd_momentum = self._to_float(flow_context.get("cvd_momentum"), self._to_float(md.get("cvd_norm"), 0.0))
         momentum_strength = min(1.0, abs(cvd_momentum) * self._to_float(cfg.get("momentum_scale"), 300.0))
         atr_pct = abs(self._to_float(md.get("regime_atr_pct"), 0.0))
@@ -2232,7 +2490,15 @@ class TradingBot:
 
                 if gate_action == "HOLD":
                     portion_scale = min(1.0, max(0.1, self._to_float(cfg.get("entry_hold_portion_scale"), 0.6)))
-                    lev_cap = max(1, int(self._to_float(cfg.get("entry_hold_leverage_cap"), 2)))
+                    lev_cap = max(
+                        1,
+                        int(
+                            self._to_float(
+                                cfg.get("entry_hold_leverage_cap"),
+                                float(ConfigLoader.get_leverage_settings(self.config, scope="fund_flow")["min_leverage"]),
+                            )
+                        ),
+                    )
                     scaled_portion = max(
                         0.0,
                         min(1.0, self._to_float(decision.target_portion_of_balance, 0.0) * portion_scale),
@@ -2282,6 +2548,10 @@ class TradingBot:
                 exit_min_hold_seconds = max(0, int(self._to_float(cfg.get("exit_min_hold_seconds"), 300)))
                 exit_profit_lock_enabled = bool(cfg.get("exit_profit_lock_enabled", True))
                 exit_profit_lock_min_pnl = max(0.0, self._to_float(cfg.get("exit_profit_lock_min_pnl"), 0.0))
+                exit_profit_lock_require_score_ok = bool(cfg.get("exit_profit_lock_require_score_ok", True))
+                exit_profit_lock_require_followthrough = bool(
+                    cfg.get("exit_profit_lock_require_followthrough", True)
+                )
                 exit_trap_grace_enabled = bool(cfg.get("exit_trap_grace_enabled", True))
                 exit_trap_grace_trap_score_min = min(
                     1.0,
@@ -2311,6 +2581,15 @@ class TradingBot:
                     elif direction == "SHORT":
                         current_pnl_ratio = (entry_price - current_price) / entry_price
 
+                aligned_final_score = 0.0
+                opposing_final_score = 0.0
+                if direction == "LONG":
+                    aligned_final_score = final_long_score
+                    opposing_final_score = final_short_score
+                elif direction == "SHORT":
+                    aligned_final_score = final_short_score
+                    opposing_final_score = final_long_score
+
                 score_ok = gate_score <= (-1.0 * exit_score_threshold)
                 hold_ok = hold_seconds >= exit_min_hold_seconds
                 drawdown_override = drawdown >= exit_drawdown_override
@@ -2326,11 +2605,27 @@ class TradingBot:
                     self._to_float(md.get("trap_score", md.get("trap_last", 0.0)), 0.0),
                 )
                 post_entry_protection_active = not hold_ok
+                trend_hold_enabled = bool(cfg.get("exit_trend_hold_enabled", True))
+                trend_hold_min_score = max(0.0, self._to_float(cfg.get("exit_trend_hold_min_score"), 0.25))
+                trend_hold_min_gap = max(0.0, self._to_float(cfg.get("exit_trend_hold_min_gap"), 0.12))
+                strong_trend_hold = (
+                    trend_hold_enabled
+                    and direction in ("LONG", "SHORT")
+                    and aligned_final_score >= trend_hold_min_score
+                    and aligned_final_score >= (opposing_final_score + trend_hold_min_gap)
+                )
                 # 开仓后的保护期只约束“前300秒”，不能变成“方向反了再多等300秒”。
+                profit_lock_score_ok = (not exit_profit_lock_require_score_ok) or score_ok
+                profit_lock_followthrough_ok = (
+                    (not exit_profit_lock_require_followthrough) or drawdown_override or price_followthrough
+                )
                 profit_lock_ready = (
                     exit_profit_lock_enabled
                     and (not post_entry_protection_active)
                     and current_pnl_ratio > exit_profit_lock_min_pnl
+                    and profit_lock_score_ok
+                    and profit_lock_followthrough_ok
+                    and (not strong_trend_hold)
                 )
                 trap_rebound_window = (
                     exit_trap_grace_enabled
@@ -2354,6 +2649,8 @@ class TradingBot:
                 )
 
                 exit_confirmed = hard_block or profit_lock_ready or fast_loss_exit or (
+                    (not strong_trend_hold)
+                    and
                     (not trap_rebound_window)
                     and score_ok
                     and exit_streak >= exit_confirm_bars
@@ -2369,15 +2666,26 @@ class TradingBot:
                 gate_meta["exit_trap_score"] = trap_score
                 gate_meta["post_entry_protection_active"] = bool(post_entry_protection_active)
                 gate_meta["profit_lock_ready"] = bool(profit_lock_ready)
+                gate_meta["profit_lock_score_ok"] = bool(profit_lock_score_ok)
+                gate_meta["profit_lock_followthrough_ok"] = bool(profit_lock_followthrough_ok)
                 gate_meta["trap_rebound_window"] = bool(trap_rebound_window)
                 gate_meta["fast_loss_exit"] = bool(fast_loss_exit)
+                gate_meta["aligned_final_score"] = aligned_final_score
+                gate_meta["opposing_final_score"] = opposing_final_score
+                gate_meta["trend_hold_active"] = bool(strong_trend_hold)
                 if isinstance(md, dict):
                     md["pretrade_risk_gate"] = gate_meta
 
                 if not exit_confirmed:
                     gate_meta["action"] = "HOLD"
                     base_reason = str(decision.reason or "").strip()
-                    if post_entry_protection_active and (not hard_block) and (not drawdown_override):
+                    if strong_trend_hold and (not hard_block) and (not drawdown_override):
+                        delay_reason = (
+                            "PRE_RISK_TREND_HOLD "
+                            f"aligned={aligned_final_score:.3f} opp={opposing_final_score:.3f} "
+                            f"score={gate_score:.3f}"
+                        )
+                    elif post_entry_protection_active and (not hard_block) and (not drawdown_override):
                         delay_reason = (
                             "PRE_RISK_COOLDOWN_PROTECT "
                             f"hold={hold_seconds}s/{exit_min_hold_seconds}s "
@@ -2423,27 +2731,22 @@ class TradingBot:
                         or (skip_on_hard_block and bool(hard_block))
                     )
                     if not skip_anchor:
-                        ma10_5m = self._to_float(md.get("ma10_5m"), 0.0)
-                        last_close_5m = self._to_float(md.get("last_close_5m"), self._to_float(md.get("last_close"), 0.0))
                         macd_zone = str(md.get("macd_5m_zone", "NEAR_ZERO")).upper()
                         require_hist_expand = bool(confluence_cfg.get("exit_anchor_require_hist_expand", True))
                         if direction == "LONG":
                             hist_ok = bool(md.get("macd_5m_hist_expand_up", md.get("macd_5m_hist_expand", False)))
                             zone_ok = macd_zone != "BELOW_ZERO"
-                            structure_ok = ma10_5m > 0 and last_close_5m >= ma10_5m
                         else:
                             hist_ok = bool(md.get("macd_5m_hist_expand_down", md.get("macd_5m_hist_expand", False)))
                             zone_ok = macd_zone != "ABOVE_ZERO"
-                            structure_ok = ma10_5m > 0 and last_close_5m <= ma10_5m
-                        still_trending = bool(structure_ok and zone_ok and ((not require_hist_expand) or hist_ok))
+                        still_trending = bool(zone_ok and ((not require_hist_expand) or hist_ok))
                         gate_meta["exit_anchor_hold"] = bool(still_trending)
                         if isinstance(md, dict):
                             md["pretrade_risk_gate"] = gate_meta
                         if still_trending:
                             base_reason = str(decision.reason or "").strip()
                             delay_reason = (
-                                "MA10_MACD_HOLD_ANCHOR "
-                                f"ma10_5m={ma10_5m:.6f} last_close_5m={last_close_5m:.6f} "
+                                "MACD_HOLD_ANCHOR "
                                 f"zone={macd_zone} hist_expand={1 if hist_ok else 0}"
                             )
                             return (
@@ -2521,7 +2824,16 @@ class TradingBot:
         slippage = float(getattr(self.fund_flow_decision_engine, "entry_slippage", 0.001))
         tp_pct = float(getattr(self.fund_flow_decision_engine, "take_profit_pct", 0.03))
         sl_pct = float(getattr(self.fund_flow_decision_engine, "stop_loss_pct", 0.01))
-        leverage = int(self._to_float(position.get("leverage"), getattr(self.fund_flow_decision_engine, "default_leverage", 6)))
+        leverage = int(
+            self._to_float(
+                position.get("leverage"),
+                getattr(
+                    self.fund_flow_decision_engine,
+                    "default_leverage",
+                    ConfigLoader.get_default_leverage(self.config),
+                ),
+            )
+        )
         action = FundFlowOperation.BUY if side == "LONG" else FundFlowOperation.SELL
 
         md = base_decision.metadata if isinstance(getattr(base_decision, "metadata", None), dict) else {}
@@ -2590,6 +2902,35 @@ class TradingBot:
                     if isinstance(k, str) and stage >= 0:
                         dca_state[k] = stage
             self._dca_stage_by_pos = dca_state
+            raw_conflict_streak = data.get("conflict_exit_streak_by_symbol", {})
+            conflict_streak: Dict[str, int] = {}
+            if isinstance(raw_conflict_streak, dict):
+                for k, v in raw_conflict_streak.items():
+                    if not isinstance(k, str):
+                        continue
+                    try:
+                        streak = max(0, int(v))
+                    except Exception:
+                        streak = 0
+                    conflict_streak[k.upper()] = streak
+            self._conflict_exit_streak_by_symbol = conflict_streak
+            raw_conflict_cooldown = data.get("conflict_cooldown_until_by_symbol", {})
+            conflict_cooldown: Dict[str, datetime] = {}
+            if isinstance(raw_conflict_cooldown, dict):
+                for k, v in raw_conflict_cooldown.items():
+                    if not isinstance(k, str):
+                        continue
+                    dt = self._parse_iso_datetime(v)
+                    if isinstance(dt, datetime):
+                        conflict_cooldown[k.upper()] = dt
+            self._conflict_cooldown_until_by_symbol = conflict_cooldown
+            raw_conflict_reason = data.get("conflict_cooldown_reason_by_symbol", {})
+            conflict_reason: Dict[str, str] = {}
+            if isinstance(raw_conflict_reason, dict):
+                for k, v in raw_conflict_reason.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        conflict_reason[k.upper()] = v
+            self._conflict_cooldown_reason_by_symbol = conflict_reason
         except Exception:
             # 状态文件损坏时忽略，避免启动失败。
             pass
@@ -2603,6 +2944,11 @@ class TradingBot:
             "daily_open_date": self._daily_open_date,
             "peak_equity": self._peak_equity,
             "dca_stage_by_pos": self._dca_stage_by_pos,
+            "conflict_exit_streak_by_symbol": self._conflict_exit_streak_by_symbol,
+            "conflict_cooldown_until_by_symbol": {
+                k: v.isoformat() for k, v in self._conflict_cooldown_until_by_symbol.items() if isinstance(v, datetime)
+            },
+            "conflict_cooldown_reason_by_symbol": self._conflict_cooldown_reason_by_symbol,
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -3756,6 +4102,7 @@ class TradingBot:
         cooldown_sec: float = 60.0,
         breakeven_mode: str = "",
         breakeven_fee_buffer: Optional[float] = None,
+        sl_distance_ratio_override: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         冲突保护时收紧止损/保本止损
@@ -3771,6 +4118,7 @@ class TradingBot:
             cooldown_sec: 冷却时间（秒），避免频繁撤挂
             breakeven_mode: "profit_only" 时仅盈利后保本；其它值立即按保本价挂单
             breakeven_fee_buffer: 保本手续费buffer（比例），None 时读取配置
+            sl_distance_ratio_override: 直接覆盖止损距离比例（用于固定 trailing）
 
         Returns:
             执行结果
@@ -3804,8 +4152,12 @@ class TradingBot:
             atr_pct_use = abs(self._to_float(conflict_cfg.get("atr_pct_fallback", 0.0), 0.0))
         atr_distance_ratio = min(0.20, atr_pct_use * atr_multiple) if atr_pct_use > 0 else 0.0
         pct_distance_ratio = max(0.0005, sl_pct * max(0.1, float(tighten_ratio)))
-        tighten_distance_ratio = max(pct_distance_ratio, atr_distance_ratio)
-        atr_guard_applied = tighten_distance_ratio > (pct_distance_ratio + 1e-12)
+        if sl_distance_ratio_override is not None:
+            tighten_distance_ratio = max(0.0001, min(0.20, abs(float(sl_distance_ratio_override))))
+            atr_guard_applied = False
+        else:
+            tighten_distance_ratio = max(pct_distance_ratio, atr_distance_ratio)
+            atr_guard_applied = tighten_distance_ratio > (pct_distance_ratio + 1e-12)
 
         # 预先读取当前保护单，确保 cooldown 分支也能输出 old_sl/new_sl
         existing_orders: List[Dict[str, Any]] = []
@@ -4260,6 +4612,14 @@ class TradingBot:
                 )
             except Exception as e:
                 print(f"⚠️ {symbol} 冲突执行事件记录失败: {e}")
+            try:
+                self._update_conflict_symbol_cooldown_after_close(
+                    symbol=symbol,
+                    close_action=close_action,
+                    decision_reason=str(decision.reason or ""),
+                )
+            except Exception as e:
+                print(f"⚠️ {symbol} 冲突退出冷却更新失败: {e}")
 
         self._safe_storage_call(
             "insert_ai_decision_log",
@@ -5252,6 +5612,7 @@ class TradingBot:
             flow_snapshot = self.fund_flow_ingestion_service.aggregate_from_metrics(symbol=symbol, metrics=raw_flow_context)
             flow_context = self._apply_timeframe_context(raw_flow_context, flow_snapshot)
             volatility_guard = self._update_extreme_volatility_state(symbol, flow_context)
+            conflict_symbol_cooldown = self._conflict_symbol_cooldown_state(symbol)
             
             self._safe_storage_call(
                 "upsert_market_flow",
@@ -5267,6 +5628,14 @@ class TradingBot:
                     f"atr_pct={self._to_float(volatility_guard.get('atr_pct'), 0.0):.4f}, "
                     f"threshold={self._to_float(volatility_guard.get('threshold'), 0.0):.4f}, "
                     f"tf={volatility_guard.get('timeframe')}"
+                )
+                continue
+            if position is None and bool(conflict_symbol_cooldown.get("blocked")):
+                print(
+                    f"⏭️ {symbol} 连续冲突退出冷却中，跳过新开仓: "
+                    f"remaining={int(conflict_symbol_cooldown.get('remaining_seconds', 0) or 0)}s, "
+                    f"streak={int(conflict_symbol_cooldown.get('streak', 0) or 0)}, "
+                    f"reason={conflict_symbol_cooldown.get('reason')}"
                 )
                 continue
             
@@ -5322,7 +5691,7 @@ class TradingBot:
                 ai_review_enabled
                 and self._is_ai_gate_enabled()
                 and isinstance(position, dict)
-                and str(ai_review_mode or "").lower() == "positions"
+                and self._ai_review_mode_supports_position_review(ai_review_mode)
             ):
                 ai_trigger_context = dict(trigger_context)
                 ai_trigger_context["ai_gate"] = "position_review"
@@ -5729,11 +6098,104 @@ class TradingBot:
                         decision_md["risk_state_structure"] = str(protection.get("state_structure", "UNKNOWN"))
                         decision_md["risk_state_penetration"] = float(protection.get("penetration", 0.0) or 0.0)
                         decision_md["risk_state_hard_votes"] = int(protection.get("hard_votes", 0) or 0)
+                        decision_md["risk_state_deep_break"] = bool(protection.get("state_deep_break", False))
+                        decision_md["risk_state_ev_opp"] = bool(protection.get("state_ev_opp", False))
+                        decision_md["risk_state_lw_opp"] = bool(protection.get("state_lw_opp", False))
                         decision_md["risk_breakeven_mode"] = str(protection.get("breakeven_mode", "") or "")
                         decision_md["risk_breakeven_fee_buffer"] = float(protection.get("breakeven_fee_buffer", 0.0) or 0.0)
                     except Exception:
                         pass
-            
+
+                    entry_price_runtime = self._to_float(position.get("entry_price"), 0.0)
+                    current_pnl_ratio_runtime = 0.0
+                    if entry_price_runtime > 0 and current_price > 0:
+                        if current_side == "LONG":
+                            current_pnl_ratio_runtime = (current_price - entry_price_runtime) / entry_price_runtime
+                        elif current_side == "SHORT":
+                            current_pnl_ratio_runtime = (entry_price_runtime - current_price) / entry_price_runtime
+
+                    strict_trend_cfg = self._strict_trend_strategy_config()
+                    trend_strategy_active = bool(strict_trend_cfg.get("trend_only_mode", False)) and (
+                        str(decision_md.get("engine") or decision_md.get("regime") or "").upper() == "TREND"
+                    )
+                    ev_lw_flip_exit_ready = (
+                        trend_strategy_active
+                        and bool(protection.get("state_ev_opp", False))
+                        and bool(protection.get("state_lw_opp", False))
+                        and (mfe_runtime / 100.0) >= self._to_float(strict_trend_cfg.get("ev_lw_flip_exit_mfe_ratio"), 0.0015)
+                    )
+                    if ev_lw_flip_exit_ready:
+                        decision = FundFlowDecision(
+                            operation=FundFlowOperation.CLOSE,
+                            symbol=symbol,
+                            target_portion_of_balance=1.0,
+                            leverage=decision.leverage,
+                            reason=(
+                                "TREND_FLIP_EXIT: ev/lw opposite with protected mfe "
+                                f"| mfe={mfe_runtime/100.0:.4f} pnl={current_pnl_ratio_runtime:.4f}"
+                            ),
+                            metadata=decision_md,
+                        )
+                        pending_new_entries.append({
+                            "symbol": symbol,
+                            "score": max(1.0, self._decision_signal_score(decision)),
+                            "max_active_symbols": max_active_symbols,
+                            "engine": decision_md.get("engine"),
+                            "decision": decision,
+                            "account_summary": account_summary,
+                            "position": position,
+                            "current_price": current_price,
+                            "flow_context": flow_context,
+                            "trigger_type": trigger_type,
+                            "trigger_id": trigger_id,
+                            "trigger_context": trigger_context,
+                            "portfolio": portfolio,
+                            "bypass_capacity_guard": True,
+                            "bypass_ai_final_review": True,
+                        })
+                        continue
+
+                    if trend_strategy_active and current_pnl_ratio_runtime >= self._to_float(
+                        strict_trend_cfg.get("break_even_trigger_pnl_ratio"),
+                        0.0035,
+                    ):
+                        try:
+                            self._tighten_protection_for_conflict(
+                                symbol=symbol,
+                                position=position,
+                                current_price=current_price,
+                                force_break_even=True,
+                                atr_pct=self._to_float(decision_md.get("regime_atr_pct"), 0.0),
+                                cooldown_sec=60.0,
+                                breakeven_mode="immediate",
+                                breakeven_fee_buffer=self._to_float(
+                                    strict_trend_cfg.get("break_even_lock_ratio"),
+                                    0.0005,
+                                ),
+                            )
+                        except Exception as e:
+                            print(f"⚠️ {symbol} 趋势保本止损更新失败: {e}")
+
+                    if trend_strategy_active and (mfe_runtime / 100.0) >= self._to_float(
+                        strict_trend_cfg.get("trailing_activate_mfe_ratio"),
+                        0.0055,
+                    ):
+                        try:
+                            self._tighten_protection_for_conflict(
+                                symbol=symbol,
+                                position=position,
+                                current_price=current_price,
+                                force_break_even=False,
+                                atr_pct=self._to_float(decision_md.get("regime_atr_pct"), 0.0),
+                                cooldown_sec=60.0,
+                                sl_distance_ratio_override=self._to_float(
+                                    strict_trend_cfg.get("trailing_distance_ratio"),
+                                    0.0016,
+                                ),
+                            )
+                        except Exception as e:
+                            print(f"⚠️ {symbol} 趋势 trailing 更新失败: {e}")
+
                     if protection_level == "conflict_hard":
                         # 重度冲突：减仓、保本止损、禁止加仓
                         reduce_pct = float(protection.get("reduce_position_pct", 0.0))
@@ -5894,10 +6356,21 @@ class TradingBot:
                             )
                             # 执行减仓
                             pending_new_entries.append({
+                                "symbol": symbol,
+                                "score": max(1.0, self._decision_signal_score(decision)),
+                                "max_active_symbols": max_active_symbols,
+                                "engine": decision_md.get("engine"),
                                 "decision": decision,
+                                "account_summary": account_summary,
                                 "position": position,
                                 "current_price": current_price,
+                                "flow_context": flow_context,
+                                "trigger_type": trigger_type,
+                                "trigger_id": trigger_id,
                                 "trigger_context": trigger_context,
+                                "portfolio": portfolio,
+                                "bypass_capacity_guard": True,
+                                "bypass_ai_final_review": True,
                             })
                             continue
                         if reduce_pct > 0 and not reduce_confirmed:
@@ -6016,10 +6489,21 @@ class TradingBot:
                                 metadata=decision_md,
                             )
                             pending_new_entries.append({
+                                "symbol": symbol,
+                                "score": max(1.0, self._decision_signal_score(decision)),
+                                "max_active_symbols": max_active_symbols,
+                                "engine": decision_md.get("engine"),
                                 "decision": decision,
+                                "account_summary": account_summary,
                                 "position": position,
                                 "current_price": current_price,
+                                "flow_context": flow_context,
+                                "trigger_type": trigger_type,
+                                "trigger_id": trigger_id,
                                 "trigger_context": trigger_context,
+                                "portfolio": portfolio,
+                                "bypass_capacity_guard": True,
+                                "bypass_ai_final_review": True,
                             })
                             continue
                         # 收紧止损
@@ -6077,6 +6561,20 @@ class TradingBot:
                         print(f"✅ {symbol} 方向确认增强: {protection.get('reason')}")
             
                 if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                    local_entry_score = self._decision_signal_score(decision)
+                    allow_same_side_add, block_reason = self._ai_entry_guard(
+                        decision=decision,
+                        local_score=local_entry_score,
+                        flow_context=flow_context,
+                        ai_review_cfg=ai_review_cfg,
+                        position=position,
+                    )
+                    if not allow_same_side_add:
+                        print(
+                            f"⏭️ {symbol} 同向加仓被拦截: "
+                            f"score={local_entry_score:.3f}, reason={block_reason}"
+                        )
+                        continue
             
                     remaining = max(0.0, float(local_max_symbol_position_portion) - float(current_portion))
                     if remaining < min_open_portion:
@@ -6298,35 +6796,46 @@ class TradingBot:
         ai_review_cfg = ai_review_cfg_raw if isinstance(ai_review_cfg_raw, dict) else {}
         ai_review_mode = str(context.get("ai_review_mode") or "disabled").lower()
         ai_flat_top_n = max(1, int(self._to_float(ai_review_cfg.get("flat_top_n", 2), 2)))
+        ai_review_flat_enabled = self._ai_review_mode_supports_flat_candidates(ai_review_mode)
 
-        if block_new_entries_due_to_protection_gap and pending_new_entries:
+        def _item_decision(item: Dict[str, Any]) -> Optional[FundFlowDecision]:
+            decision_raw = item.get("decision")
+            return decision_raw if isinstance(decision_raw, FundFlowDecision) else None
+
+        def _is_close_candidate(item: Dict[str, Any]) -> bool:
+            decision_i = _item_decision(item)
+            return decision_i is not None and decision_i.operation == FundFlowOperation.CLOSE
+
+        close_candidates = [item for item in pending_new_entries if _is_close_candidate(item)]
+        open_candidates = [item for item in pending_new_entries if not _is_close_candidate(item)]
+
+        if block_new_entries_due_to_protection_gap and open_candidates:
             print(
                 "⛔ 本轮禁止新开仓：检测到持仓缺少保护单，已清空候选开仓队列 "
                 f"symbols={','.join(protection_gap_symbols)}"
             )
-            pending_new_entries = []
+            open_candidates = []
 
-        if pending_new_entries:
-            pending_new_entries = sorted(
-                pending_new_entries,
+        if open_candidates:
+            open_candidates = sorted(
+                open_candidates,
                 key=lambda x: float(x.get("score", 0.0)),
                 reverse=True,
             )
-            if ai_gate_enabled and ai_review_mode == "flat_candidates" and len(pending_new_entries) > ai_flat_top_n:
-                skipped = pending_new_entries[ai_flat_top_n:]
-                pending_new_entries = pending_new_entries[:ai_flat_top_n]
+            if ai_gate_enabled and ai_review_flat_enabled and len(open_candidates) > ai_flat_top_n:
+                skipped = open_candidates[ai_flat_top_n:]
+                open_candidates = open_candidates[:ai_flat_top_n]
                 skipped_symbols = [str(item.get("symbol") or "") for item in skipped]
                 print(
                     f"🤖 空仓AI候选收敛: 仅分析前{ai_flat_top_n}个标的, "
                     f"跳过={','.join([s for s in skipped_symbols if s])}"
                 )
-            if ai_gate_enabled and ai_review_mode == "flat_candidates":
+            if ai_gate_enabled and ai_review_flat_enabled:
                 shortlist_parts: List[str] = []
-                for rank, item in enumerate(pending_new_entries, start=1):
+                for rank, item in enumerate(open_candidates, start=1):
                     symbol_i = str(item.get("symbol") or "")
                     score_i = float(item.get("score", 0.0))
-                    decision_i_raw = item.get("decision")
-                    decision_i = decision_i_raw if isinstance(decision_i_raw, FundFlowDecision) else None
+                    decision_i = _item_decision(item)
                     local_action = decision_i.operation.value.upper() if decision_i else "UNKNOWN"
                     shortlist_parts.append(
                         f"{rank}.{symbol_i}:{local_action}:score={score_i:.3f}"
@@ -6336,6 +6845,8 @@ class TradingBot:
                         f"🤖 空仓AI入围Top{len(shortlist_parts)}: "
                         + " | ".join(shortlist_parts)
                     )
+        pending_new_entries = close_candidates + open_candidates
+        if pending_new_entries:
             active_symbols_estimate: set[str] = set()
             try:
                 active_positions = self.position_data.get_all_positions()
@@ -6345,12 +6856,17 @@ class TradingBot:
                 active_symbols_estimate = set()
             active_symbols_estimate.update(str(s).upper() for s in self._opened_symbols_this_cycle)
             for rank, item in enumerate(pending_new_entries, start=1):
+                decision_i = _item_decision(item)
+                if decision_i is None:
+                    continue
+                is_close_candidate = decision_i.operation == FundFlowOperation.CLOSE
                 active_count = len(active_symbols_estimate)
                 item_max_active_symbols = max(
                     1,
                     int(self._to_float(item.get("max_active_symbols"), max_active_symbols)),
                 )
-                if active_count >= item_max_active_symbols:
+                bypass_capacity_guard = bool(item.get("bypass_capacity_guard", False)) or is_close_candidate
+                if (not bypass_capacity_guard) and active_count >= item_max_active_symbols:
                     print(
                         f"⏭️ {item.get('symbol')} 候选开仓被跳过："
                         f"持仓交易对已满({active_count}/{item_max_active_symbols})，"
@@ -6375,12 +6891,9 @@ class TradingBot:
                     portfolio_i = {}
 
                 current_price_i = self._to_float(item.get("current_price"), 0.0)
-                decision_i_raw = item.get("decision")
-                decision_i = decision_i_raw if isinstance(decision_i_raw, FundFlowDecision) else None
-                symbol_i = str(item.get("symbol") or "")
-                if decision_i is None:
-                    continue
-                if ai_gate_enabled and ai_review_mode == "flat_candidates":
+                symbol_i = str(item.get("symbol") or getattr(decision_i, "symbol", "") or "")
+                bypass_ai_final_review = bool(item.get("bypass_ai_final_review", False)) or is_close_candidate
+                if ai_gate_enabled and ai_review_flat_enabled and (not bypass_ai_final_review):
                     local_score = float(item.get("score", 0.0))
                     if decision_i.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL) and current_price_i > 0:
                         print(
@@ -6411,6 +6924,21 @@ class TradingBot:
                                 f"⛔ {symbol_i} AI终审未通过: rank={rank} "
                                 f"local={decision_i.operation.value.upper()} "
                                 f"ai={ai_decision.operation.value.upper()} "
+                                f"source={ai_source} conf={ai_conf:.3f}"
+                            )
+                            continue
+                        allow_ai_entry, block_reason = self._ai_entry_guard(
+                            decision=ai_decision,
+                            local_score=local_score,
+                            flow_context=flow_context_i,
+                            ai_review_cfg=ai_review_cfg,
+                            position=item.get("position") if isinstance(item.get("position"), dict) else None,
+                        )
+                        if not allow_ai_entry:
+                            print(
+                                f"⛔ {symbol_i} AI终审结构拦截: rank={rank} "
+                                f"local={decision_i.operation.value.upper()} "
+                                f"score={local_score:.3f} reason={block_reason} "
                                 f"source={ai_source} conf={ai_conf:.3f}"
                             )
                             continue
@@ -6466,6 +6994,7 @@ class TradingBot:
             ai_review_cfg = self._ai_review_config()
             position_tf_seconds = int(ai_review_cfg.get("position_timeframe_seconds", 300))
             flat_tf_seconds = int(ai_review_cfg.get("flat_timeframe_seconds", tf_seconds or 900))
+            allow_entries_with_positions = bool(ai_review_cfg.get("allow_entries_with_positions", True))
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             if has_position:
                 position_review_due = self._should_allow_aligned_cycle(
@@ -6473,7 +7002,27 @@ class TradingBot:
                     timeframe_seconds=position_tf_seconds,
                     now_ts=start,
                 )
-                if position_review_due:
+                allow_new_entries = False
+                flat_review_due = False
+                if allow_entries_with_positions:
+                    allow_new_entries = self._should_allow_entries_this_cycle(start)
+                    flat_review_due = self._should_allow_aligned_cycle(
+                        bucket_key="flat_ai_review",
+                        timeframe_seconds=flat_tf_seconds,
+                        now_ts=start,
+                    )
+                entry_review_due = allow_entries_with_positions and allow_new_entries and flat_review_due
+                if position_review_due and entry_review_due:
+                    print(
+                        f"\n=== FUND_FLOW cycle {cycles + 1} @ {now_utc} UTC === "
+                        f"[mode=MIXED_AI_REVIEW, kline_align={'ON' if alignment_active else 'OFF'}"
+                        f", position_tf={int(position_tf_seconds)}s, entry_tf={int(flat_tf_seconds)}s]"
+                    )
+                    try:
+                        self.run_cycle(allow_new_entries=True, ai_review_mode="mixed")
+                    except Exception as e:
+                        print(f"❌ run_cycle 异常: {e}")
+                elif position_review_due:
                     print(
                         f"\n=== FUND_FLOW cycle {cycles + 1} @ {now_utc} UTC === "
                         f"[mode=POSITION_AI_REVIEW, kline_align={'ON' if alignment_active else 'OFF'}"
@@ -6483,19 +7032,37 @@ class TradingBot:
                         self.run_cycle(allow_new_entries=False, ai_review_mode="positions")
                     except Exception as e:
                         print(f"❌ run_cycle 异常: {e}")
+                elif entry_review_due:
+                    print(
+                        f"\n=== FUND_FLOW cycle {cycles + 1} @ {now_utc} UTC === "
+                        f"[mode=OPEN_WINDOW_AI_WITH_POSITIONS, kline_align={'ON' if alignment_active else 'OFF'}"
+                        f", entry_tf={int(flat_tf_seconds)}s]"
+                    )
+                    try:
+                        self.run_cycle(allow_new_entries=True, ai_review_mode="flat_candidates")
+                    except Exception as e:
+                        print(f"❌ run_cycle 异常: {e}")
                 else:
+                    next_position_fire = datetime.now(timezone.utc) + timedelta(
+                        seconds=self._aligned_sleep_seconds_for(position_tf_seconds)
+                    )
+                    next_entry_fire = datetime.now(timezone.utc) + timedelta(
+                        seconds=self._aligned_sleep_seconds_for(flat_tf_seconds)
+                    )
                     print(
                         f"\n=== FUND_FLOW cycle {cycles + 1} @ {now_utc} UTC === "
                         f"[mode=WAIT_POSITION_AI, kline_align={'ON' if alignment_active else 'OFF'}"
                         f", tf={int(position_tf_seconds)}s]"
                     )
-                    next_fire = datetime.now(timezone.utc) + timedelta(
-                        seconds=self._aligned_sleep_seconds_for(position_tf_seconds)
-                    )
                     print(
-                        "⏭️ 当前有持仓，等待下一次 5m AI 持仓复核窗口。"
-                        f" 下次复核(UTC)≈{next_fire.strftime('%Y-%m-%d %H:%M:%S')}"
+                        "⏭️ 当前有持仓，等待下一次持仓复核窗口。"
+                        f" 下次复核(UTC)≈{next_position_fire.strftime('%Y-%m-%d %H:%M:%S')}"
                     )
+                    if allow_entries_with_positions:
+                        print(
+                            "   同时保留趋势补抓窗口: "
+                            f"next_entry_window(UTC)≈{next_entry_fire.strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
             else:
                 allow_new_entries = self._should_allow_entries_this_cycle(start)
                 flat_review_due = self._should_allow_aligned_cycle(
@@ -6540,11 +7107,16 @@ class TradingBot:
             if alignment_active:
                 post_has_position = bool(self._position_snapshot_by_symbol(symbols_all))
                 if post_has_position:
-                    sleep_seconds = self._aligned_sleep_seconds_for(position_tf_seconds)
+                    next_position_sleep = self._aligned_sleep_seconds_for(position_tf_seconds)
+                    if allow_entries_with_positions:
+                        next_entry_sleep = self._aligned_sleep_seconds_for(flat_tf_seconds)
+                        sleep_seconds = min(next_position_sleep, next_entry_sleep)
+                    else:
+                        sleep_seconds = next_position_sleep
                     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                     print(
                         f"⏳ 调度等待(持仓AI): utc_now={now_utc}, sleep={sleep_seconds:.2f}s "
-                        f"(next_5m_review)"
+                        f"({'next_mixed_review' if allow_entries_with_positions else 'next_position_review'})"
                     )
                 else:
                     sleep_seconds = self._aligned_sleep_seconds_for(flat_tf_seconds)

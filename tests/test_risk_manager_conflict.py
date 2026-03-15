@@ -135,3 +135,25 @@ def test_cvd_extreme_can_still_immediately_trigger_circuit_exit():
     r1 = rm.check_position_protection(now_ts=30.0, **kwargs)
     assert r1["risk_state"] == "CIRCUIT_EXIT"
     assert r1["level"] == "conflict_hard"
+
+
+def test_check_position_protection_exposes_ev_lw_opposite_flags():
+    rm = RiskManager(_cfg())
+    kwargs = {
+        "symbol": "SOLUSDT",
+        "position_side": "LONG",
+        "macd_hist_norm": -0.20,
+        "cvd_norm": -0.40,
+        "ev_direction": "SHORT_ONLY",
+        "ev_score": 0.8,
+        "lw_direction": "SHORT_ONLY",
+        "lw_score": 0.8,
+        "market_regime": "TREND",
+        "bb_upper": 101.0,
+        "bb_middle": 100.0,
+        "bb_lower": 99.0,
+        "close_price": 99.4,
+    }
+    out = rm.check_position_protection(now_ts=40.0, **kwargs)
+    assert out["state_ev_opp"] is True
+    assert out["state_lw_opp"] is True

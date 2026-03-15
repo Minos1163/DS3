@@ -1,4 +1,8 @@
-"""Live trading entrypoint compatible with existing VPS startup command."""
+"""Canonical live trading entrypoint.
+
+The active runtime implementation is ``src.app.fund_flow_bot.TradingBot``.
+Legacy launchers should route here instead of carrying their own runtime copy.
+"""
 
 from __future__ import annotations
 

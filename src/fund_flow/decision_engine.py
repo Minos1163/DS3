@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
+from src.config.config_loader import ConfigLoader
 from src.fund_flow.models import ExecutionMode, FundFlowDecision, Operation, TimeInForce
 from src.fund_flow.deepseek_weight_router import DeepSeekWeightRouter, WeightMap
 from src.fund_flow.weight_router import WeightRouter
@@ -25,7 +26,7 @@ class FundFlowDecisionEngine:
         self.config = config or {}
         ff = self.config.get("fund_flow", {}) or {}
         risk = self.config.get("risk", {}) or {}
-        trading = self.config.get("trading", {}) or {}
+        leverage_cfg = ConfigLoader.get_leverage_settings(self.config, scope="fund_flow")
 
         self.default_portion = float(ff.get("default_target_portion", risk.get("max_position_pct", 0.2)))
         self.max_active_symbols = max(1, int(ff.get("max_active_symbols", 1) or 1))
@@ -33,11 +34,12 @@ class FundFlowDecisionEngine:
             self.default_portion,
             self._to_float(ff.get("max_symbol_position_portion"), max(self.default_portion, 0.1)),
         )
-        self.min_leverage = int(ff.get("min_leverage", trading.get("min_leverage", 2)) or 2)
-        max_lev_raw = int(ff.get("max_leverage", trading.get("max_leverage", 20)) or 20)
-        self.max_leverage = max(self.min_leverage, min(20, max_lev_raw))
-        default_lev_raw = int(ff.get("default_leverage", trading.get("default_leverage", self.min_leverage)) or self.min_leverage)
-        self.default_leverage = min(self.max_leverage, max(self.min_leverage, default_lev_raw))
+        self.min_leverage = int(leverage_cfg["min_leverage"])
+        self.max_leverage = int(leverage_cfg["max_leverage"])
+        self.default_leverage = int(leverage_cfg["default_leverage"])
+        self.allowed_leverage_values = self._normalize_leverage_levels(
+            [self.min_leverage, self.default_leverage, self.max_leverage]
+        )
 
         base_open_threshold = float(ff.get("open_threshold", 0.35))
         self.long_open_threshold = float(ff.get("long_open_threshold", base_open_threshold))
@@ -105,6 +107,17 @@ class FundFlowDecisionEngine:
         self.trend_capture_min_gap = max(
             0.0,
             self._to_float(trend_capture_cfg.get("min_gap"), 0.05),
+        )
+        self.trend_capture_short_min_score_boost = max(
+            0.0,
+            self._to_float(trend_capture_cfg.get("short_min_score_boost"), 0.0),
+        )
+        self.trend_capture_short_min_gap_boost = max(
+            0.0,
+            self._to_float(trend_capture_cfg.get("short_min_gap_boost"), 0.0),
+        )
+        self.trend_capture_short_require_confirm_3m = bool(
+            trend_capture_cfg.get("short_require_confirm_3m", False)
         )
         self.trend_capture_trial_position_mult = min(
             1.0,
@@ -422,7 +435,7 @@ class FundFlowDecisionEngine:
         score_15m_weight = ff.get("score_15m_weight", score_fusion.get("score_15m_weight", self.score_15m_weight))
         score_5m_weight = ff.get("score_5m_weight", score_fusion.get("score_5m_weight", self.score_5m_weight))
 
-        return {
+        result = {
             "adx_trend_on": self._to_float(regime.get("adx_trend_on"), self.regime_adx_trend_on),
             "adx_range_on": self._to_float(regime.get("adx_range_on"), self.regime_adx_range_on),
             "adx_no_trade_low": self._to_float(regime.get("adx_no_trade_low"), self.regime_no_trade_low),
@@ -449,8 +462,20 @@ class FundFlowDecisionEngine:
             "trend_pending_ema_expand_min": self._to_float(tc.get("trend_pending_ema_expand_min", regime.get("trend_pending_ema_expand_min")), self.trend_pending_ema_expand_min),
             "trend_pending_min_score": self._to_float(tc.get("trend_pending_min_score"), 0.55),
             "trend_capture_enabled": bool(tc.get("enabled", self.trend_capture_enabled)),
+            "trend_only_mode": bool(tc.get("trend_only_mode", False)),
             "trend_capture_min_score": self._to_float(tc.get("min_score"), self.trend_capture_min_score),
             "trend_capture_min_gap": self._to_float(tc.get("min_gap"), self.trend_capture_min_gap),
+            "trend_capture_short_min_score_boost": self._to_float(
+                tc.get("short_min_score_boost"),
+                self.trend_capture_short_min_score_boost,
+            ),
+            "trend_capture_short_min_gap_boost": self._to_float(
+                tc.get("short_min_gap_boost"),
+                self.trend_capture_short_min_gap_boost,
+            ),
+            "trend_capture_short_require_confirm_3m": bool(
+                tc.get("short_require_confirm_3m", self.trend_capture_short_require_confirm_3m)
+            ),
             "trend_capture_trial_position_mult": self._to_float(tc.get("trial_position_mult"), self.trend_capture_trial_position_mult),
             "trend_capture_confirm_position_mult": self._to_float(tc.get("confirm_position_mult"), 0.65),
             "trend_capture_trap_soft_max": self._to_float(tc.get("trap_soft_max"), 0.65),
@@ -480,6 +505,19 @@ class FundFlowDecisionEngine:
             "pretrade_volatility_cap_std": self._to_float(gate.get("volatility_cap"), 0.012),
             "pretrade_volatility_cap_capture": self._to_float(gate.get("volatility_cap_capture"), 0.014),
         }
+        optional_strict_keys = (
+            "required_flow_confirm",
+            "required_long_cvd_norm",
+            "required_short_cvd_norm",
+            "required_price_oi_alignment_15m",
+            "required_adx_slope",
+            "required_long_ema_spread_expand",
+            "required_short_ema_spread_expand",
+        )
+        for key in optional_strict_keys:
+            if key in tc:
+                result[key] = self._to_float(tc.get(key), 0.0)
+        return result
 
     @staticmethod
     def _to_float(value: Any, default: float = 0.0) -> float:
@@ -987,6 +1025,16 @@ class FundFlowDecisionEngine:
         
         return flow_confirm, consistency_3bars
 
+    def _normalize_leverage_levels(self, values: Sequence[Any]) -> list[int]:
+        levels = sorted(
+            {
+                max(1, int(self._to_float(value, 0.0)))
+                for value in values
+                if value is not None
+            }
+        )
+        return levels or [max(1, int(self.default_leverage))]
+
     def _pick_leverage(
         self,
         score: float,
@@ -994,19 +1042,27 @@ class FundFlowDecisionEngine:
         min_leverage: int,
         max_leverage: int,
         default_leverage: int,
+        allowed_levels: Optional[Sequence[int]] = None,
     ) -> int:
         min_lev = max(1, int(min_leverage))
         max_lev = max(min_lev, int(max_leverage))
         default_lev = min(max_lev, max(min_lev, int(default_leverage)))
-        if max_lev == min_lev:
-            return min_lev
+        levels = self._normalize_leverage_levels(
+            allowed_levels
+            if allowed_levels is not None
+            else (min_lev, default_lev, max_lev)
+        )
+        levels = [lev for lev in levels if min_lev <= lev <= max_lev]
+        if not levels:
+            levels = [default_lev]
+        if len(levels) == 1:
+            return levels[0]
         s = min(max(float(score), 0.0), 1.0)
         th = min(max(float(threshold), 0.0), 0.99)
         denom = max(1e-6, 1.0 - th)
         strength = max(0.0, min(1.0, (s - th) / denom))
-        # Use 2-arg round for static typing compatibility with float.
-        lev = int(round(min_lev + strength * (max_lev - min_lev), 0))
-        lev = min(max_lev, max(min_lev, lev))
+        idx = min(len(levels) - 1, int(strength * len(levels)))
+        lev = levels[idx]
         if lev <= 0:
             return default_lev
         return lev
@@ -1120,6 +1176,43 @@ class FundFlowDecisionEngine:
                 }
             )
         return levels
+
+    def _resolve_entry_stop_loss_pct(
+        self,
+        *,
+        base_stop_loss_pct: Any,
+        regime_info: Dict[str, Any],
+        market_flow_context: Dict[str, Any],
+        cfg: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        cfg = cfg or {}
+        base_ratio = self._normalize_pct_ratio(base_stop_loss_pct, self.stop_loss_pct)
+        if not bool(cfg.get("dynamic_stop_loss_enabled", False)):
+            return base_ratio
+
+        min_ratio = max(
+            0.0,
+            self._normalize_pct_ratio(cfg.get("short_stop_loss_min_pct"), 0.0035),
+        )
+        max_ratio = max(
+            min_ratio,
+            self._normalize_pct_ratio(cfg.get("short_stop_loss_max_pct"), 0.0045),
+        )
+        atr_mult = max(0.1, self._to_float(cfg.get("short_stop_loss_atr_mult"), 1.2))
+        timeframes = market_flow_context.get("timeframes") if isinstance(market_flow_context, dict) else {}
+        tf15 = timeframes.get("15m") if isinstance(timeframes, dict) and isinstance(timeframes.get("15m"), dict) else {}
+        atr_pct = max(
+            0.0,
+            self._to_float(
+                regime_info.get("atr_pct"),
+                self._to_float(tf15.get("atr_pct"), self._to_float(market_flow_context.get("atr_pct"), 0.0)),
+            ),
+        )
+        atr_based = atr_pct * atr_mult if atr_pct > 0 else 0.0
+        resolved = atr_based if atr_based > 0 else base_ratio
+        if resolved <= 0:
+            resolved = max_ratio
+        return min(max_ratio, max(min_ratio, resolved))
 
     # ========== 方向判断三层架构 ==========
 
@@ -1457,7 +1550,7 @@ class FundFlowDecisionEngine:
         self,
         market_flow_context: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        """Use 5m MA10/MACD/KDJ snapshot as the first fallback when 15m primary indicators are flat."""
+        """Use 5m MACD/KDJ snapshot as the first fallback when 15m primary indicators are flat."""
         if not isinstance(market_flow_context, dict):
             return None
 
@@ -1473,11 +1566,6 @@ class FundFlowDecisionEngine:
 
         long_score = 0.0
         short_score = 0.0
-
-        if bool(confluence.get("confluence_anchor_ma10_long", False)):
-            long_score += 0.40
-        if bool(confluence.get("confluence_anchor_ma10_short", False)):
-            short_score += 0.40
 
         if bool(confluence.get("confluence_macd_trigger_long", False)):
             long_score += 0.35
@@ -2468,25 +2556,14 @@ class FundFlowDecisionEngine:
         hard_block_long = False
         hard_block_short = False
         entry_hard_filter = bool(cfg.get("entry_hard_filter", True))
-        block_against_ma10 = bool(cfg.get("entry_hard_block_against_ma10", True))
         block_reverse_macd = bool(cfg.get("entry_hard_block_reverse_macd", True))
-        block_on_opposite_bias = bool(cfg.get("block_on_opposite_bias", False))
         require_macd_trigger = bool(cfg.get("entry_require_macd_trigger", False))
         allow_macd_early = bool(cfg.get("entry_allow_macd_early", True))
-        if entry_hard_filter:
-            long_anchor_conflict = block_against_ma10 and (not anchor_long)
-            short_anchor_conflict = block_against_ma10 and (not anchor_short)
+        if entry_hard_filter and block_reverse_macd:
             long_reverse_macd = block_reverse_macd and macd_trigger_short
             short_reverse_macd = block_reverse_macd and macd_trigger_long
-            if block_on_opposite_bias:
-                if long_anchor_conflict or long_reverse_macd:
-                    hard_block_long = True
-                if short_anchor_conflict or short_reverse_macd:
-                    hard_block_short = True
-            elif long_anchor_conflict and long_reverse_macd:
-                hard_block_long = True
-            if short_anchor_conflict and short_reverse_macd:
-                hard_block_short = True
+            hard_block_long = bool(long_reverse_macd)
+            hard_block_short = bool(short_reverse_macd)
 
         soft_penalty_long = 0.0
         soft_penalty_short = 0.0
@@ -2603,8 +2680,7 @@ class FundFlowDecisionEngine:
         if prune_opposite_capture:
             if guide_direction == "LONG_ONLY":
                 injection_confirm_pass = bool(
-                    confluence.get("confluence_anchor_ma10_long", False)
-                    and confluence.get("confluence_macd_trigger_long", False)
+                    confluence.get("confluence_macd_trigger_long", False)
                     and (
                         flow_confirm >= 0.5
                         or consistency_3bars >= 1
@@ -2614,8 +2690,7 @@ class FundFlowDecisionEngine:
                 )
             else:
                 injection_confirm_pass = bool(
-                    confluence.get("confluence_anchor_ma10_short", False)
-                    and confluence.get("confluence_macd_trigger_short", False)
+                    confluence.get("confluence_macd_trigger_short", False)
                     and (
                         flow_confirm >= 0.5
                         or consistency_3bars >= 1
@@ -2686,6 +2761,9 @@ class FundFlowDecisionEngine:
 
         cap_long = self._to_float(normalized_trend_capture.get("trend_capture_score_long"), 0.0)
         cap_short = self._to_float(normalized_trend_capture.get("trend_capture_score_short"), 0.0)
+        confirm_3m_short = bool(
+            normalized_trend_capture.get("trend_capture_confirm_3m_short", False)
+        )
         pending_side = str(trend_pending.get("trend_pending_side", "NONE")).upper()
         pending_score = self._to_float(trend_pending.get("trend_pending_score"), 0.0)
         pen_long = self._to_float(confluence.get("confluence_soft_penalty_long"), 0.0)
@@ -2696,6 +2774,39 @@ class FundFlowDecisionEngine:
         neutral_trial_side = str(regime_info.get("direction_neutral_trial_side", "NONE")).upper()
         neutral_trial_score = self._to_float(regime_info.get("direction_neutral_trial_score"), 0.0)
         neutral_trial_gap = self._to_float(regime_info.get("direction_neutral_trial_gap"), 0.0)
+        combo_compare = regime_info.get("combo_compare", {}) if isinstance(regime_info.get("combo_compare"), dict) else {}
+        feature_snapshot_raw = combo_compare.get("feature_snapshot", {})
+        feature_snapshot = feature_snapshot_raw if isinstance(feature_snapshot_raw, dict) else {}
+        feature_snapshot_numeric = [
+            self._to_float(v, 0.0)
+            for v in feature_snapshot.values()
+            if isinstance(v, (int, float, bool))
+        ]
+        feature_snapshot_all_zero = bool(feature_snapshot_numeric) and all(
+            abs(v) < 1e-12 for v in feature_snapshot_numeric
+        )
+        cvd_components = regime_info.get("lw", {}).get("components", {}) if isinstance(regime_info.get("lw"), dict) else {}
+        cvd_norm = self._to_float(
+            regime_info.get("cvd_norm"),
+            self._to_float(cvd_components.get("cvd"), 0.0),
+        )
+        flow_confirm = self._to_float(regime_info.get("flow_confirm"), 0.0)
+        price_oi_alignment = self._to_float(
+            trend_pending.get("trend_pending_price_oi_align"),
+            self._to_float(trend_pending.get("price_oi_alignment_15m"), 0.0),
+        )
+        adx_slope_15m = self._to_float(
+            trend_pending.get("trend_pending_adx_slope"),
+            self._to_float(trend_pending.get("adx_slope_15m"), 0.0),
+        )
+        ema_spread_expand_15m = self._to_float(
+            trend_pending.get("trend_pending_ema_spread_expand"),
+            self._to_float(trend_pending.get("ema_spread_expand_15m"), 0.0),
+        )
+        breakout_long = bool(normalized_trend_capture.get("trend_capture_breakout_long", False))
+        breakout_short = bool(normalized_trend_capture.get("trend_capture_breakout_short", False))
+        pullback_long = bool(normalized_trend_capture.get("trend_capture_pullback_resume_long", False))
+        pullback_short = bool(normalized_trend_capture.get("trend_capture_pullback_resume_short", False))
 
         weighted_long = base_long * 0.72 + cap_long * 0.28 - pen_long
         weighted_short = base_short * 0.72 + cap_short * 0.28 - pen_short
@@ -2716,8 +2827,49 @@ class FundFlowDecisionEngine:
         open_short_th = self._to_float(cfg.get("short_open_threshold"), self.short_open_threshold)
         capture_open_th = self._to_float(cfg.get("trend_capture_min_score"), self.trend_capture_min_score)
         capture_gap = self._to_float(cfg.get("trend_capture_min_gap"), self.trend_capture_min_gap)
+        short_score_boost = max(
+            0.0,
+            self._to_float(
+                cfg.get("trend_capture_short_min_score_boost"),
+                self.trend_capture_short_min_score_boost,
+            ),
+        )
+        short_gap_boost = max(
+            0.0,
+            self._to_float(
+                cfg.get("trend_capture_short_min_gap_boost"),
+                self.trend_capture_short_min_gap_boost,
+            ),
+        )
+        short_require_confirm_3m = bool(
+            cfg.get(
+                "trend_capture_short_require_confirm_3m",
+                self.trend_capture_short_require_confirm_3m,
+            )
+        )
         default_portion = self._to_float(cfg.get("default_target_portion"), self.default_portion)
         leverage = int(self._to_float(cfg.get("default_leverage"), self.default_leverage))
+        effective_short_th = open_short_th + short_score_boost
+        effective_short_gap = capture_gap + short_gap_boost
+        short_confirm_pass = (not short_require_confirm_3m) or confirm_3m_short
+        trend_only_mode = bool(cfg.get("trend_only_mode", False))
+        required_flow_confirm = max(0.0, self._to_float(cfg.get("required_flow_confirm"), 0.0))
+        required_long_cvd_norm = max(0.0, self._to_float(cfg.get("required_long_cvd_norm"), 0.0))
+        required_short_cvd_norm = max(0.0, self._to_float(cfg.get("required_short_cvd_norm"), 0.0))
+        required_price_oi_alignment = max(
+            0.0,
+            self._to_float(cfg.get("required_price_oi_alignment_15m"), 0.0),
+        )
+        required_adx_slope = self._to_float(cfg.get("required_adx_slope"), 0.0)
+        required_long_ema_expand = self._to_float(cfg.get("required_long_ema_spread_expand"), 0.0)
+        required_short_ema_expand = self._to_float(cfg.get("required_short_ema_spread_expand"), 0.0)
+        require_flow_confirm = "required_flow_confirm" in cfg
+        require_long_cvd = "required_long_cvd_norm" in cfg
+        require_short_cvd = "required_short_cvd_norm" in cfg
+        require_price_oi_alignment = "required_price_oi_alignment_15m" in cfg
+        require_adx_slope = "required_adx_slope" in cfg
+        require_long_ema_expand = "required_long_ema_spread_expand" in cfg
+        require_short_ema_expand = "required_short_ema_spread_expand" in cfg
 
         operation = Operation.HOLD
         side = "NONE"
@@ -2748,13 +2900,23 @@ class FundFlowDecisionEngine:
                 entry_stage = 2 if cap_long >= capture_open_th else 1
                 entry_size_mult = 1.0 if entry_stage == 2 else self._to_float(cfg.get("trend_capture_confirm_position_mult"), 0.65)
                 decision_source = "trend_std"
-            elif final_short >= open_short_th and final_short >= final_long + capture_gap:
+            elif (
+                final_short >= effective_short_th
+                and final_short >= final_long + effective_short_gap
+                and short_confirm_pass
+            ):
                 operation = Operation.SELL
                 side = "SHORT"
                 entry_mode = "TREND_STD"
                 entry_stage = 2 if cap_short >= capture_open_th else 1
                 entry_size_mult = 1.0 if entry_stage == 2 else self._to_float(cfg.get("trend_capture_confirm_position_mult"), 0.65)
                 decision_source = "trend_std"
+            elif (
+                final_short >= effective_short_th
+                and final_short >= final_long + effective_short_gap
+                and not short_confirm_pass
+            ):
+                decision_source = "trend_short_confirm_blocked"
         elif regime == "RANGE":
             if bool(range_veto.get("range_veto_by_trend", False)):
                 if pending_side == "LONG" and cap_long >= capture_open_th and final_long >= final_short + capture_gap:
@@ -2791,6 +2953,47 @@ class FundFlowDecisionEngine:
                 entry_size_mult = 0.25
                 decision_source = "no_trade_capture"
 
+        entry_hard_filters: list[str] = []
+        if operation in (Operation.BUY, Operation.SELL):
+            if trend_only_mode and regime != "TREND":
+                entry_hard_filters.append("trend_only_mode_non_trend")
+            if feature_snapshot_all_zero:
+                entry_hard_filters.append("feature_snapshot_all_zero")
+            if regime == "TREND":
+                if require_flow_confirm and flow_confirm < required_flow_confirm:
+                    entry_hard_filters.append("flow_confirm_below_required")
+                if require_price_oi_alignment and price_oi_alignment < required_price_oi_alignment:
+                    entry_hard_filters.append("price_oi_alignment_below_required")
+                if require_adx_slope and adx_slope_15m <= required_adx_slope:
+                    entry_hard_filters.append("adx_slope_below_required")
+            if side == "LONG":
+                if pending_side == "SHORT":
+                    entry_hard_filters.append("pending_side_short_blocks_long")
+                if require_long_cvd and cvd_norm <= required_long_cvd_norm:
+                    entry_hard_filters.append("cvd_norm_below_required_long")
+                if require_long_ema_expand and ema_spread_expand_15m <= required_long_ema_expand:
+                    entry_hard_filters.append("ema_spread_expand_not_positive_long")
+                if not breakout_long and not pullback_long:
+                    entry_hard_filters.append("no_breakout_no_pullback_long")
+            elif side == "SHORT":
+                if pending_side == "LONG":
+                    entry_hard_filters.append("pending_side_long_blocks_short")
+                if require_short_cvd and cvd_norm >= (-1.0 * required_short_cvd_norm):
+                    entry_hard_filters.append("cvd_norm_above_required_short")
+                if require_short_ema_expand and ema_spread_expand_15m >= (-1.0 * required_short_ema_expand):
+                    entry_hard_filters.append("ema_spread_expand_not_negative_short")
+                if not breakout_short and not pullback_short:
+                    entry_hard_filters.append("no_breakout_no_pullback_short")
+
+        entry_hard_filter_blocked = bool(entry_hard_filters)
+        if entry_hard_filter_blocked:
+            operation = Operation.HOLD
+            side = "NONE"
+            entry_mode = "HOLD"
+            entry_stage = 0
+            entry_size_mult = 0.0
+            decision_source = "entry_hard_filter_blocked"
+
         md: Dict[str, Any] = {}
         md.update(regime_info or {})
         md.update(base_scores or {})
@@ -2816,6 +3019,25 @@ class FundFlowDecisionEngine:
                 "direction_neutral_trial_gap": round(neutral_trial_gap, 4),
                 "direction_neutral_trial_mode": str(regime_info.get("direction_neutral_trial_mode", "none")),
                 "direction_neutral_trial_reason": str(regime_info.get("direction_neutral_trial_reason", "")),
+                "short_entry_score_threshold": round(effective_short_th, 4),
+                "short_entry_gap_required": round(effective_short_gap, 4),
+                "short_entry_confirm_3m_required": bool(short_require_confirm_3m),
+                "short_entry_confirm_3m_pass": bool(confirm_3m_short),
+                "short_entry_confirm_gate_pass": bool(short_confirm_pass),
+                "entry_feature_snapshot_all_zero": bool(feature_snapshot_all_zero),
+                "entry_feature_snapshot_values": dict(feature_snapshot),
+                "entry_cvd_norm": round(cvd_norm, 4),
+                "entry_flow_confirm": round(flow_confirm, 4),
+                "entry_price_oi_alignment_15m": round(price_oi_alignment, 4),
+                "entry_adx_slope_15m": round(adx_slope_15m, 4),
+                "entry_ema_spread_expand_15m": round(ema_spread_expand_15m, 8),
+                "entry_breakout_long": bool(breakout_long),
+                "entry_breakout_short": bool(breakout_short),
+                "entry_pullback_long": bool(pullback_long),
+                "entry_pullback_short": bool(pullback_short),
+                "trend_only_mode": bool(trend_only_mode),
+                "entry_hard_filter_blocked": bool(entry_hard_filter_blocked),
+                "entry_hard_filters": list(entry_hard_filters),
             }
         )
 
@@ -2841,6 +3063,8 @@ class FundFlowDecisionEngine:
             reason_parts.append(self._format_trend_capture_reason(md, side))
         if bool(range_veto.get("range_veto_by_trend", False)):
             reason_parts.append(str(range_veto.get("range_veto_reason", "")))
+        if entry_hard_filter_blocked:
+            reason_parts.append(f"blocked={','.join(entry_hard_filters)}")
         if side == "LONG":
             reason_parts.append(
                 f"soft={self._to_float(md.get('confluence_soft_penalty_long'), 0.0):.2f} "
@@ -3406,6 +3630,9 @@ class FundFlowDecisionEngine:
         min_lev = int(engine_params.get("min_leverage", self.min_leverage))
         max_lev = int(engine_params.get("max_leverage", self.max_leverage))
         default_lev = int(engine_params.get("default_leverage", self.default_leverage))
+        allowed_levs = self._normalize_leverage_levels(
+            engine_params.get("allowed_leverage_values", self.allowed_leverage_values)
+        )
         target_portion = float(engine_params.get("default_target_portion", self.default_portion))
         entry_mode = "TREND_CAPTURE" if pending_capture_active else ("RANGE" if regime == "RANGE" else "TREND_STD")
         entry_stage = 1 if pending_capture_active else 2
@@ -3413,7 +3640,12 @@ class FundFlowDecisionEngine:
         if pending_capture_active:
             target_portion *= entry_size_mult
         take_profit_pct = self._normalize_pct_ratio(engine_params.get("take_profit_pct"), self.take_profit_pct)
-        stop_loss_pct = self._normalize_pct_ratio(engine_params.get("stop_loss_pct"), self.stop_loss_pct)
+        stop_loss_pct = self._resolve_entry_stop_loss_pct(
+            base_stop_loss_pct=engine_params.get("stop_loss_pct"),
+            regime_info=regime_info,
+            market_flow_context=market_flow_context,
+            cfg=engine_params,
+        )
         tp_pct_levels_raw = engine_params.get("take_profit_pct_levels")
         tp_pct_levels: list[float] = tp_pct_levels_raw if isinstance(tp_pct_levels_raw, list) else []
         tp_reduce_levels_raw = engine_params.get("take_profit_reduce_pct_levels")
@@ -3424,6 +3656,9 @@ class FundFlowDecisionEngine:
         sl_long_price = price * (1.0 - stop_loss_pct) if sl_enabled else None
         tp_short_price = price * (1.0 - take_profit_pct) if tp_enabled else None
         sl_short_price = price * (1.0 + stop_loss_pct) if sl_enabled else None
+        metadata_base["entry_dynamic_stop_loss_pct"] = stop_loss_pct
+        metadata_base["entry_take_profit_levels"] = list(tp_pct_levels)
+        metadata_base["entry_take_profit_reduce_levels"] = list(tp_reduce_levels)
         resolve_cfg = {
             **trend_cfg,
             **engine_params,
@@ -3457,6 +3692,7 @@ class FundFlowDecisionEngine:
                         min_leverage=min_lev,
                         max_leverage=max_lev,
                         default_leverage=default_lev,
+                        allowed_levels=allowed_levs,
                     )
                     return FundFlowDecision(
                         operation=Operation.BUY,
@@ -3470,7 +3706,7 @@ class FundFlowDecisionEngine:
                         tp_execution=ExecutionMode.LIMIT,
                         sl_execution=ExecutionMode.LIMIT,
                         reason=resolved.reason,
-                        metadata={**metadata_base, **resolved_md, "leverage_model": {"min": min_lev, "max": max_lev, "picked": leverage}},
+                        metadata={**metadata_base, **resolved_md, "leverage_model": {"min": min_lev, "max": max_lev, "levels": allowed_levs, "picked": leverage}},
                     )
                 if resolved.operation == Operation.SELL:
                     lev_score = self._to_float(resolved_md.get("final_short_score"), short_score)
@@ -3480,6 +3716,7 @@ class FundFlowDecisionEngine:
                         min_leverage=min_lev,
                         max_leverage=max_lev,
                         default_leverage=default_lev,
+                        allowed_levels=allowed_levs,
                     )
                     return FundFlowDecision(
                         operation=Operation.SELL,
@@ -3493,7 +3730,7 @@ class FundFlowDecisionEngine:
                         tp_execution=ExecutionMode.LIMIT,
                         sl_execution=ExecutionMode.LIMIT,
                         reason=resolved.reason,
-                        metadata={**metadata_base, **resolved_md, "leverage_model": {"min": min_lev, "max": max_lev, "picked": leverage}},
+                        metadata={**metadata_base, **resolved_md, "leverage_model": {"min": min_lev, "max": max_lev, "levels": allowed_levs, "picked": leverage}},
                     )
                 return FundFlowDecision(
                     operation=Operation.HOLD,
@@ -3611,6 +3848,7 @@ class FundFlowDecisionEngine:
                     min_leverage=min_lev,
                     max_leverage=max_lev,
                     default_leverage=default_lev,
+                    allowed_levels=allowed_levs,
                 )
                 return self._apply_symbol_side_override(
                     FundFlowDecision(
@@ -3639,7 +3877,7 @@ class FundFlowDecisionEngine:
                             **range_meta,
                             **range_veto,
                             "open_thresholds": {"long": long_threshold, "short": short_threshold},
-                            "leverage_model": {"min": min_lev, "max": max_lev, "picked": leverage},
+                            "leverage_model": {"min": min_lev, "max": max_lev, "levels": allowed_levs, "picked": leverage},
                             "tp_sl": {"tp_pct": take_profit_pct, "sl_pct": stop_loss_pct, "tp_enabled": tp_enabled, "sl_enabled": sl_enabled},
                             "entry_mode": entry_mode,
                             "entry_stage": entry_stage,
@@ -3660,6 +3898,7 @@ class FundFlowDecisionEngine:
                     min_leverage=min_lev,
                     max_leverage=max_lev,
                     default_leverage=default_lev,
+                    allowed_levels=allowed_levs,
                 )
                 return self._apply_symbol_side_override(
                     FundFlowDecision(
@@ -3688,7 +3927,7 @@ class FundFlowDecisionEngine:
                             **range_meta,
                             **range_veto,
                             "open_thresholds": {"long": long_threshold, "short": short_threshold},
-                            "leverage_model": {"min": min_lev, "max": max_lev, "picked": leverage},
+                            "leverage_model": {"min": min_lev, "max": max_lev, "levels": allowed_levs, "picked": leverage},
                             "tp_sl": {"tp_pct": take_profit_pct, "sl_pct": stop_loss_pct, "tp_enabled": tp_enabled, "sl_enabled": sl_enabled},
                             "entry_mode": entry_mode,
                             "entry_stage": entry_stage,
@@ -4009,6 +4248,7 @@ class FundFlowDecisionEngine:
                 min_leverage=min_lev,
                 max_leverage=max_lev,
                 default_leverage=default_lev,
+                allowed_levels=allowed_levs,
             )
             return FundFlowDecision(
                 operation=Operation.BUY,
@@ -4026,8 +4266,14 @@ class FundFlowDecisionEngine:
                     **metadata_base,
                     **score_out,
                     **resolved_md,
-                    "leverage_model": {"min": min_lev, "max": max_lev, "picked": leverage},
+                    "leverage_model": {"min": min_lev, "max": max_lev, "levels": allowed_levs, "picked": leverage},
                     "tp_sl": {"tp_pct": take_profit_pct, "sl_pct": stop_loss_pct, "tp_enabled": tp_enabled, "sl_enabled": sl_enabled},
+                    "tp_levels": self._build_tp_levels_metadata(
+                        price=price,
+                        direction="LONG",
+                        pct_levels=tp_pct_levels,
+                        reduce_levels=tp_reduce_levels,
+                    ),
                 },
             )
 
@@ -4039,6 +4285,7 @@ class FundFlowDecisionEngine:
                 min_leverage=min_lev,
                 max_leverage=max_lev,
                 default_leverage=default_lev,
+                allowed_levels=allowed_levs,
             )
             return FundFlowDecision(
                 operation=Operation.SELL,
@@ -4056,8 +4303,14 @@ class FundFlowDecisionEngine:
                     **metadata_base,
                     **score_out,
                     **resolved_md,
-                    "leverage_model": {"min": min_lev, "max": max_lev, "picked": leverage},
+                    "leverage_model": {"min": min_lev, "max": max_lev, "levels": allowed_levs, "picked": leverage},
                     "tp_sl": {"tp_pct": take_profit_pct, "sl_pct": stop_loss_pct, "tp_enabled": tp_enabled, "sl_enabled": sl_enabled},
+                    "tp_levels": self._build_tp_levels_metadata(
+                        price=price,
+                        direction="SHORT",
+                        pct_levels=tp_pct_levels,
+                        reduce_levels=tp_reduce_levels,
+                    ),
                 },
             )
 

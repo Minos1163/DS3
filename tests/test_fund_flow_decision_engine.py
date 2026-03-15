@@ -41,7 +41,7 @@ def _trend_context(
     return {"timeframes": {"15m": tf_15m, "5m": dict(tf_ctx)}}
 
 
-def test_decide_buy_when_long_score_dominates():
+def test_decide_hold_when_long_score_lacks_breakout_or_pullback():
     engine = FundFlowDecisionEngine(_cfg())
     decision = engine.decide(
         symbol="BTCUSDT",
@@ -59,9 +59,7 @@ def test_decide_buy_when_long_score_dominates():
         ),
         trigger_context={"trigger_type": "signal"},
     )
-    assert decision.operation == Operation.BUY
-    assert decision.take_profit_price is not None
-    assert decision.stop_loss_price is not None
+    assert decision.operation == Operation.HOLD
 
 
 def test_decide_close_long_when_short_reversal():
@@ -145,6 +143,13 @@ def test_trend_capture_keeps_partial_score_without_micro_confirm():
     assert capture["trend_capture_side"] == "LONG"
 
 
+def test_pick_leverage_uses_discrete_config_levels():
+    engine = FundFlowDecisionEngine(_cfg())
+    assert engine._pick_leverage(0.11, 0.10, 4, 8, 6) == 4
+    assert engine._pick_leverage(0.55, 0.10, 4, 8, 6) == 6
+    assert engine._pick_leverage(0.95, 0.10, 4, 8, 6) == 8
+
+
 def test_resolve_entry_mode_uses_base_score_floor_for_trend_entry():
     cfg = _cfg()
     cfg["fund_flow"]["long_open_threshold"] = 0.085
@@ -157,10 +162,19 @@ def test_resolve_entry_mode_uses_base_score_floor_for_trend_entry():
     engine = FundFlowDecisionEngine(cfg)
     resolved = engine._resolve_entry_mode(
         symbol="BTCUSDT",
-        regime_info={"regime": "TREND"},
+        regime_info={
+            "regime": "TREND",
+            "cvd_norm": 0.3,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
+        },
         base_scores={"long_score": 0.10, "short_score": 0.0},
         trend_pending={"trend_pending_side": "NONE", "trend_pending_score": 0.0},
-        trend_capture={"trend_capture_score_long": 0.0, "trend_capture_score_short": 0.0},
+        trend_capture={
+            "trend_capture_score_long": 0.0,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
+        },
         confluence={
             "confluence_soft_penalty_long": 0.0,
             "confluence_soft_penalty_short": 0.0,
@@ -174,15 +188,8 @@ def test_resolve_entry_mode_uses_base_score_floor_for_trend_entry():
     assert resolved.metadata["final_long_score"] >= 0.085
 
 
-def test_confluence_respects_ma10_hard_block_switch():
-    cfg = _cfg()
-    cfg["fund_flow"]["ma10_macd_confluence"] = {
-        "entry_hard_filter": True,
-        "entry_hard_block_against_ma10": False,
-        "entry_hard_block_reverse_macd": True,
-        "block_on_opposite_bias": False,
-    }
-    engine = FundFlowDecisionEngine(cfg)
+def test_confluence_ignores_ma10_bias_for_hard_block():
+    engine = FundFlowDecisionEngine(_cfg())
     confluence = engine._compute_entry_confluence_v2(
         "BTCUSDT",
         market_flow_context={
@@ -190,19 +197,20 @@ def test_confluence_respects_ma10_hard_block_switch():
                 "last_close_1h": 99.0,
                 "ma10_1h": 100.0,
                 "ma10_1h_bias": -1,
-                "macd_5m": -0.5,
+                "macd_5m": 0.5,
                 "macd_5m_signal": 0.1,
-                "macd_5m_hist": -0.6,
-                "macd_5m_hist_delta": -0.1,
-                "kdj_k": 40.0,
-                "kdj_d": 45.0,
-                "kdj_j": 35.0,
+                "macd_5m_hist": 0.6,
+                "macd_5m_hist_delta": 0.1,
+                "kdj_k": 55.0,
+                "kdj_d": 50.0,
+                "kdj_j": 65.0,
             },
             "timeframes": {"5m": {}, "1h": {}},
         },
         cfg=engine._trend_capture_config(),
     )
     assert confluence["confluence_hard_block_long"] is False
+    assert confluence["confluence_macd_trigger_long"] is True
 
 
 def test_resolve_entry_mode_prunes_opposite_short_capture_when_confluence_fallback_turns_long():
@@ -223,6 +231,8 @@ def test_resolve_entry_mode_prunes_opposite_short_capture_when_confluence_fallba
             "allow_entry_window": True,
             "flow_confirm": 0.5,
             "consistency_3bars": 0,
+            "cvd_norm": 0.25,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
             "lw": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
             "ev": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
         },
@@ -235,13 +245,14 @@ def test_resolve_entry_mode_prunes_opposite_short_capture_when_confluence_fallba
             "trend_capture_breakout_short": True,
             "trend_capture_cvd_align_short": True,
             "trend_capture_depth_align_short": True,
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
         },
         confluence={
             "confluence_soft_penalty_long": 0.0,
             "confluence_soft_penalty_short": 0.0,
             "confluence_hard_block_long": False,
             "confluence_hard_block_short": False,
-            "confluence_anchor_ma10_long": True,
             "confluence_macd_trigger_long": True,
         },
         range_veto={},
@@ -272,6 +283,7 @@ def test_resolve_entry_mode_prunes_opposite_long_capture_when_confluence_fallbac
             "allow_entry_window": True,
             "flow_confirm": 0.5,
             "consistency_3bars": 0,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
             "lw": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
             "ev": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
         },
@@ -284,13 +296,14 @@ def test_resolve_entry_mode_prunes_opposite_long_capture_when_confluence_fallbac
             "trend_capture_breakout_long": True,
             "trend_capture_cvd_align_long": True,
             "trend_capture_depth_align_long": True,
+            "trend_capture_breakout_short": True,
+            "trend_capture_pullback_resume_short": False,
         },
         confluence={
             "confluence_soft_penalty_long": 0.0,
             "confluence_soft_penalty_short": 0.0,
             "confluence_hard_block_long": False,
             "confluence_hard_block_short": False,
-            "confluence_anchor_ma10_short": True,
             "confluence_macd_trigger_short": True,
         },
         range_veto={},
@@ -301,6 +314,43 @@ def test_resolve_entry_mode_prunes_opposite_long_capture_when_confluence_fallbac
     assert resolved.metadata["trend_capture_side"] in {"SHORT", "NONE"}
     assert resolved.metadata["trend_capture_directional_prune"] is True
     assert resolved.metadata["trend_capture_pruned_side"] == "LONG"
+
+
+def test_resolve_entry_mode_blocks_short_without_3m_confirm_when_required():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["short_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "short_require_confirm_3m": True,
+        "short_min_score_boost": 0.02,
+        "short_min_gap_boost": 0.01,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="SOLUSDT",
+        regime_info={"regime": "TREND"},
+        base_scores={"long_score": 0.0, "short_score": 0.34},
+        trend_pending={"trend_pending_side": "NONE", "trend_pending_score": 0.0},
+        trend_capture={
+            "trend_capture_score_long": 0.0,
+            "trend_capture_score_short": 1.0,
+            "trend_capture_confirm_3m_short": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.HOLD
+    assert resolved.metadata["decision_source"] == "trend_short_confirm_blocked"
+    assert resolved.metadata["short_entry_confirm_3m_required"] is True
+    assert resolved.metadata["short_entry_confirm_gate_pass"] is False
 
 
 def test_resolve_entry_mode_injects_long_confluence_fallback_into_entry_score():
@@ -321,6 +371,8 @@ def test_resolve_entry_mode_injects_long_confluence_fallback_into_entry_score():
             "allow_entry_window": True,
             "flow_confirm": 0.5,
             "consistency_3bars": 0,
+            "cvd_norm": 0.25,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
             "lw": {
                 "components": {
                     "primary_flat": True,
@@ -347,13 +399,14 @@ def test_resolve_entry_mode_injects_long_confluence_fallback_into_entry_score():
             "trend_capture_breakout_short": True,
             "trend_capture_cvd_align_short": True,
             "trend_capture_depth_align_short": True,
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
         },
         confluence={
             "confluence_soft_penalty_long": 0.0,
             "confluence_soft_penalty_short": 0.08,
             "confluence_hard_block_long": False,
             "confluence_hard_block_short": True,
-            "confluence_anchor_ma10_long": True,
             "confluence_macd_trigger_long": True,
         },
         range_veto={},
@@ -387,6 +440,7 @@ def test_resolve_entry_mode_injects_short_confluence_fallback_into_entry_score()
             "allow_entry_window": True,
             "flow_confirm": 0.5,
             "consistency_3bars": 0,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
             "lw": {
                 "components": {
                     "primary_flat": True,
@@ -413,13 +467,14 @@ def test_resolve_entry_mode_injects_short_confluence_fallback_into_entry_score()
             "trend_capture_breakout_long": True,
             "trend_capture_cvd_align_long": True,
             "trend_capture_depth_align_long": True,
+            "trend_capture_breakout_short": True,
+            "trend_capture_pullback_resume_short": False,
         },
         confluence={
             "confluence_soft_penalty_long": 0.08,
             "confluence_soft_penalty_short": 0.0,
             "confluence_hard_block_long": True,
             "confluence_hard_block_short": False,
-            "confluence_anchor_ma10_short": True,
             "confluence_macd_trigger_short": True,
         },
         range_veto={},
@@ -463,7 +518,6 @@ def test_resolve_entry_mode_does_not_inject_fallback_when_entry_window_closed():
             "confluence_soft_penalty_short": 0.08,
             "confluence_hard_block_long": False,
             "confluence_hard_block_short": True,
-            "confluence_anchor_ma10_long": True,
             "confluence_macd_trigger_long": True,
         },
         range_veto={},
@@ -579,6 +633,8 @@ def test_resolve_entry_mode_blocks_long_when_symbol_override_is_short_only():
             "allow_entry_window": True,
             "flow_confirm": 0.6,
             "consistency_3bars": 1,
+            "cvd_norm": 0.25,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
         },
         base_scores={"long_score": 0.12, "short_score": 0.01},
         trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
@@ -586,6 +642,8 @@ def test_resolve_entry_mode_blocks_long_when_symbol_override_is_short_only():
             "trend_capture_score_long": 0.12,
             "trend_capture_score_short": 0.0,
             "trend_capture_side": "LONG",
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
         },
         confluence={
             "confluence_soft_penalty_long": 0.0,
@@ -679,3 +737,351 @@ def test_decide_blocks_range_long_when_symbol_override_is_short_only(monkeypatch
     assert decision.metadata["symbol_side_override_mode"] == "SHORT_ONLY"
     assert decision.metadata["symbol_side_override_allowed"] is False
     assert decision.metadata["blocked_operation"] == Operation.BUY.value
+
+
+def test_resolve_entry_mode_blocks_entry_when_feature_snapshot_is_all_zero():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BTCUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 1.0,
+            "consistency_3bars": 2,
+            "cvd_norm": 0.35,
+            "combo_compare": {
+                "feature_snapshot": {
+                    "macd_hist_sign": 0,
+                    "macd_cross_sign": 0,
+                    "kdj_cross_sign": 0,
+                    "kdj_zone_sign": 0,
+                }
+            },
+        },
+        base_scores={"long_score": 0.12, "short_score": 0.0},
+        trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_score_long": 0.12,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.HOLD
+    assert resolved.metadata["decision_source"] == "entry_hard_filter_blocked"
+    assert resolved.metadata["entry_hard_filter_blocked"] is True
+    assert "feature_snapshot_all_zero" in resolved.metadata["entry_hard_filters"]
+
+
+def test_resolve_entry_mode_blocks_long_when_pending_side_is_short():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="ETHUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 1.0,
+            "consistency_3bars": 2,
+            "cvd_norm": 0.28,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
+        },
+        base_scores={"long_score": 0.12, "short_score": 0.0},
+        trend_pending={"trend_pending_side": "SHORT", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_score_long": 0.12,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.HOLD
+    assert resolved.metadata["decision_source"] == "entry_hard_filter_blocked"
+    assert "pending_side_short_blocks_long" in resolved.metadata["entry_hard_filters"]
+
+
+def test_resolve_entry_mode_blocks_long_when_cvd_norm_is_non_positive():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "required_long_cvd_norm": 0.12,
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="SOLUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 1.0,
+            "consistency_3bars": 2,
+            "cvd_norm": 0.0,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
+        },
+        base_scores={"long_score": 0.12, "short_score": 0.0},
+        trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_score_long": 0.12,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.HOLD
+    assert resolved.metadata["decision_source"] == "entry_hard_filter_blocked"
+    assert "cvd_norm_below_required_long" in resolved.metadata["entry_hard_filters"]
+
+
+def test_resolve_entry_mode_blocks_entry_without_breakout_or_pullback():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BNBUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 1.0,
+            "consistency_3bars": 2,
+            "cvd_norm": 0.31,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
+        },
+        base_scores={"long_score": 0.12, "short_score": 0.0},
+        trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_score_long": 0.12,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": False,
+            "trend_capture_pullback_resume_long": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.HOLD
+    assert resolved.metadata["decision_source"] == "entry_hard_filter_blocked"
+    assert "no_breakout_no_pullback_long" in resolved.metadata["entry_hard_filters"]
+
+
+def test_resolve_entry_mode_blocks_long_when_strict_trend_requirements_fail():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "trend_only_mode": True,
+        "required_flow_confirm": 1.0,
+        "required_long_cvd_norm": 0.12,
+        "required_price_oi_alignment_15m": 1.0,
+        "required_adx_slope": 0.05,
+        "required_long_ema_spread_expand": 0.0,
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BTCUSDT",
+        regime_info={
+            "regime": "TREND",
+            "flow_confirm": 0.5,
+            "cvd_norm": 0.10,
+            "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
+        },
+        base_scores={"long_score": 0.15, "short_score": 0.0},
+        trend_pending={
+            "trend_pending_side": "LONG",
+            "trend_pending_score": 0.8,
+            "trend_pending_price_oi_align": 0.0,
+            "trend_pending_adx_slope": 0.01,
+            "trend_pending_ema_spread_expand": 0.0,
+        },
+        trend_capture={
+            "trend_capture_score_long": 0.2,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.HOLD
+    assert "flow_confirm_below_required" in resolved.metadata["entry_hard_filters"]
+    assert "cvd_norm_below_required_long" in resolved.metadata["entry_hard_filters"]
+    assert "price_oi_alignment_below_required" in resolved.metadata["entry_hard_filters"]
+    assert "adx_slope_below_required" in resolved.metadata["entry_hard_filters"]
+    assert "ema_spread_expand_not_positive_long" in resolved.metadata["entry_hard_filters"]
+
+
+def test_decide_uses_dynamic_short_term_stop_loss_for_trend_entries():
+    cfg = _cfg()
+    cfg["fund_flow"].update(
+        {
+            "default_target_portion": 0.08,
+            "long_open_threshold": 0.07,
+            "default_leverage": 5,
+            "min_leverage": 4,
+            "max_leverage": 5,
+            "engine_params": {
+                "TREND": {
+                    "default_target_portion": 0.08,
+                    "default_leverage": 5,
+                    "min_leverage": 4,
+                    "max_leverage": 5,
+                    "long_open_threshold": 0.07,
+                    "dynamic_stop_loss_enabled": True,
+                    "short_stop_loss_min_pct": 0.0035,
+                    "short_stop_loss_max_pct": 0.0045,
+                    "short_stop_loss_atr_mult": 1.2,
+                    "take_profit_pct_levels": [0.0025, 0.0055],
+                    "take_profit_reduce_pct_levels": [0.4, 0.3],
+                }
+            },
+            "trend_capture": {
+                "trend_only_mode": True,
+                "required_flow_confirm": 1.0,
+                "required_long_cvd_norm": 0.12,
+                "required_price_oi_alignment_15m": 1.0,
+                "required_adx_slope": 0.05,
+                "required_long_ema_spread_expand": 0.0,
+                "min_score": 0.08,
+                "min_gap": 0.02,
+                "base_score_floor_mult": 0.85,
+            },
+        }
+    )
+    engine = FundFlowDecisionEngine(cfg)
+    engine._detect_regime = lambda *_args, **_kwargs: {
+        "regime": "TREND",
+        "direction": "LONG_ONLY",
+        "guide_direction": "LONG_ONLY",
+        "adx": 25.0,
+        "atr_pct": 0.002,
+        "cvd_norm": 0.2,
+        "combo_compare": {"feature_snapshot": {"macd_hist_sign": 1, "kdj_cross_sign": 1}},
+    }
+    engine._compute_trend_pending = lambda *_args, **_kwargs: {
+        "trend_pending_side": "LONG",
+        "trend_pending_score": 0.8,
+        "trend_pending_price_oi_align": 1.0,
+        "trend_pending_adx_slope": 0.08,
+        "trend_pending_ema_spread": 1.0,
+        "trend_pending_ema_spread_expand": 0.01,
+    }
+    engine._compute_flow_consistency = lambda *_args, **_kwargs: (1.0, 2)
+    engine._compute_trend_capture = lambda *_args, **_kwargs: {
+        "trend_capture_side": "LONG",
+        "trend_capture_score_long": 0.43,
+        "trend_capture_score_short": 0.0,
+        "trend_capture_breakout_long": True,
+        "trend_capture_breakout_short": False,
+        "trend_capture_pullback_resume_long": False,
+        "trend_capture_pullback_resume_short": False,
+    }
+    engine._compute_entry_confluence_v2 = lambda *_args, **_kwargs: {
+        "confluence_side": "LONG",
+        "confluence_hard_block_long": False,
+        "confluence_hard_block_short": False,
+        "confluence_soft_penalty_long": 0.0,
+        "confluence_soft_penalty_short": 0.0,
+    }
+    engine._compute_range_veto_by_trend = lambda *_args, **_kwargs: {}
+    decision = engine.decide(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=100.0,
+        market_flow_context={
+            "timeframes": {
+                "15m": {
+                    "adx": 25.0,
+                    "atr_pct": 0.002,
+                    "ema_fast": 101.0,
+                    "ema_slow": 100.0,
+                    "ret_period": 0.01,
+                    "oi_delta_ratio": 0.02,
+                },
+                "5m": {
+                    "close": 105.0,
+                    "hh_n": 105.0,
+                    "ll_n": 100.0,
+                    "ema_fast": 104.0,
+                    "ema_slow": 102.0,
+                    "ret_period": 0.01,
+                    "cvd_momentum": 0.02,
+                    "oi_delta_ratio": 0.02,
+                    "depth_ratio": 1.02,
+                    "imbalance": 0.03,
+                },
+                "3m": {
+                    "ret_period": 0.02,
+                },
+            },
+            "fund_flow_features": {"15m": {"oi_delta_ratio": 0.02}, "5m": {"oi_delta_ratio": 0.02}},
+            "microstructure_features": {"micro_delta": 0.02, "microprice_bias": 0.02},
+        },
+        trigger_context={"trigger_type": "signal"},
+        use_weight_router=False,
+        use_ai_weights=False,
+    )
+    assert decision.operation == Operation.BUY
+    assert decision.stop_loss_price is not None
+    assert round((100.0 - float(decision.stop_loss_price)) / 100.0, 4) == 0.0035
+    tp_levels = decision.metadata.get("tp_levels", [])
+    assert len(tp_levels) == 2

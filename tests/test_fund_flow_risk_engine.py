@@ -18,7 +18,7 @@ def _cfg():
 def test_clamp_leverage_out_of_range_fallback():
     engine = FundFlowRiskEngine(_cfg(), symbol_whitelist=["BTCUSDT"])
     assert engine.clamp_leverage(999) == 10
-    assert engine.clamp_leverage(0) == 2
+    assert engine.clamp_leverage(0) == 3
 
 
 def test_validate_open_portion_range():

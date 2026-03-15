@@ -187,7 +187,41 @@ class ConfigLoader:
     @staticmethod
     def get_default_leverage(config: Dict[str, Any]) -> int:
         """获取默认杠杆"""
-        return config.get("trading", {}).get("default_leverage", 3)
+        return ConfigLoader.get_leverage_settings(config)["default_leverage"]
+
+    @staticmethod
+    def get_leverage_settings(
+        config: Dict[str, Any],
+        scope: str = "fund_flow",
+    ) -> Dict[str, int]:
+        """获取统一杠杆配置，优先读取指定作用域，其次回退到 trading。"""
+        root = config if isinstance(config, dict) else {}
+        trading = root.get("trading", {}) if isinstance(root.get("trading"), dict) else {}
+        scoped = root.get(scope, {}) if isinstance(root.get(scope), dict) else {}
+
+        def _to_int(value: Any, fallback: int) -> int:
+            try:
+                return int(float(value))
+            except Exception:
+                return int(fallback)
+
+        trading_default = trading.get("default_leverage")
+        scoped_default = scoped.get("default_leverage", trading_default)
+
+        min_raw = scoped.get("min_leverage", trading.get("min_leverage", scoped_default))
+        min_lev = max(1, _to_int(min_raw, 1))
+
+        max_raw = scoped.get("max_leverage", trading.get("max_leverage", scoped_default if scoped_default is not None else min_lev))
+        max_lev = max(min_lev, _to_int(max_raw, min_lev))
+
+        default_raw = scoped.get("default_leverage", trading_default if trading_default is not None else min_lev)
+        default_lev = min(max_lev, max(min_lev, _to_int(default_raw, min_lev)))
+
+        return {
+            "min_leverage": int(min_lev),
+            "default_leverage": int(default_lev),
+            "max_leverage": int(max_lev),
+        }
 
     @staticmethod
     def get_position_limits(config: Dict[str, Any]) -> Dict[str, float]:

@@ -145,3 +145,28 @@ def test_pretrade_risk_gate_protects_initial_300_seconds(monkeypatch):
     assert "PRE_RISK_COOLDOWN_PROTECT" in decision.reason
     assert gate_meta["post_entry_protection_active"] is True
     assert gate_meta["exit_confirmed"] is False
+
+
+def test_entry_filter_prefers_engine_confluence_macd_flags():
+    bot = _make_bot()
+    decision = FundFlowDecision(
+        operation=FundFlowOperation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.2,
+        leverage=3,
+        reason="base",
+        metadata={
+            "macd_5m_cross": "NONE",
+            "macd_5m_hist_expand_up": False,
+            "macd_5m_hist_expand_down": False,
+            "macd_trigger_pass_long": False,
+            "macd_early_pass_long": False,
+            "confluence_macd_trigger_long": True,
+            "confluence_macd_early_long": True,
+        },
+    )
+
+    filtered = bot._apply_ma10_macd_entry_filter("BTCUSDT", decision)
+
+    assert filtered.operation == FundFlowOperation.BUY
+    assert filtered.reason == "base"
