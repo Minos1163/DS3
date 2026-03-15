@@ -150,3 +150,36 @@ def test_close_partial_qty_rounded_to_zero_promotes_to_full_close(tmp_path: Path
     assert result["quantity_info"]["promotion_reason"] == "partial_qty_rounded_to_zero"
     assert len(client.calls) == 1
     assert client.calls[0]["params"]["quantity"] == 0.002
+
+
+def test_open_respects_entry_tif_override_gtc(tmp_path: Path):
+    client = _FakeClient(
+        responses=[
+            {"orderId": 321, "status": "NEW"},
+        ]
+    )
+    risk = FundFlowRiskEngine(_risk_cfg(), symbol_whitelist=["BTCUSDT"])
+    attr = FundFlowAttributionEngine(str(tmp_path))
+    router = FundFlowExecutionRouter(client, risk, attr)
+
+    decision = FundFlowDecision(
+        operation=Operation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.2,
+        leverage=2,
+        max_price=100.0,
+        take_profit_price=110.0,
+        stop_loss_price=95.0,
+        time_in_force=TimeInForce.IOC,
+        metadata={"entry_tif_override": "GTC"},
+    )
+    result = router.execute_decision(
+        decision=decision,
+        account_state={"available_balance": 1000.0},
+        current_price=100.0,
+        position=None,
+    )
+
+    assert result["status"] == "pending"
+    assert len(client.calls) == 1
+    assert client.calls[0]["params"]["timeInForce"] == "GTC"

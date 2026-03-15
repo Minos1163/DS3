@@ -170,3 +170,76 @@ def test_entry_filter_prefers_engine_confluence_macd_flags():
 
     assert filtered.operation == FundFlowOperation.BUY
     assert filtered.reason == "base"
+
+
+def test_pretrade_risk_gate_blocks_entry_when_execution_quality_1m_blocks():
+    bot = _make_bot()
+    decision = FundFlowDecision(
+        operation=FundFlowOperation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.2,
+        leverage=3,
+        reason="base",
+        metadata={},
+    )
+
+    gated, gate_meta = bot._apply_pretrade_risk_gate(
+        symbol="BTCUSDT",
+        decision=decision,
+        position=None,
+        flow_context={
+            "execution_quality_1m": {
+                "mode": "BLOCK",
+                "block_entry": True,
+                "reason": "hard_risk_switch spread_bps=18.00, vpin=0.82",
+            }
+        },
+        current_price=100.0,
+        account_summary={"equity": 1000.0, "max_leverage": 10.0},
+    )
+
+    assert gated.operation == FundFlowOperation.HOLD
+    assert "EXECUTION_1M_BLOCK" in gated.reason
+    assert gate_meta["action"] == "BLOCK"
+
+
+def test_pretrade_risk_gate_marks_passive_only_entry_execution_policy(monkeypatch):
+    bot = _make_bot()
+    decision = FundFlowDecision(
+        operation=FundFlowOperation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.2,
+        leverage=3,
+        reason="base",
+        metadata={},
+    )
+    monkeypatch.setattr(
+        bot_module,
+        "gate_trade_decision",
+        lambda *args, **kwargs: {"action": "ENTER", "score": 0.2, "enter": True, "exit": False, "details": {}},
+    )
+
+    gated, gate_meta = bot._apply_pretrade_risk_gate(
+        symbol="BTCUSDT",
+        decision=decision,
+        position=None,
+        flow_context={
+            "execution_quality_1m": {
+                "mode": "PASSIVE_ONLY",
+                "block_entry": False,
+                "passive_only": True,
+                "prefer_passive_entry": True,
+                "entry_tif_override": "GTC",
+                "disable_market_fallback": True,
+                "reason": "degraded_microstructure spread_bps=7.00, vpin=0.52",
+            }
+        },
+        current_price=100.0,
+        account_summary={"equity": 1000.0, "max_leverage": 10.0},
+    )
+
+    assert gated.operation == FundFlowOperation.BUY
+    assert gated.metadata["entry_tif_override"] == "GTC"
+    assert gated.metadata["disable_market_fallback"] is True
+    assert gate_meta["entry_execution_policy"] == "PASSIVE_ONLY"
+    assert "EXECUTION_1M_PASSIVE" in gated.reason

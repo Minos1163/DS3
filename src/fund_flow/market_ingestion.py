@@ -125,6 +125,16 @@ class MarketIngestionService:
             "spread_bps": self._to_float(metrics.get("spread_bps"), 0.0),
             "spread_z": self._to_float(metrics.get("spread_z"), 0.0),
             "trade_imbalance": self._to_float(metrics.get("trade_imbalance"), 0.0),
+            "volume_imbalance": self._to_float(metrics.get("volume_imbalance"), 0.0),
+            "vpin": self._to_float(metrics.get("vpin"), 0.0),
+            "flow_toxicity": self._to_float(metrics.get("flow_toxicity"), 0.0),
+            "quote_volume": self._to_float(metrics.get("quote_volume"), 0.0),
+            "taker_buy_quote": self._to_float(metrics.get("taker_buy_quote"), 0.0),
+            "taker_sell_quote": self._to_float(metrics.get("taker_sell_quote"), 0.0),
+            "taker_delta_quote": self._to_float(metrics.get("taker_delta_quote"), 0.0),
+            "orderflow_cvd_quote": self._to_float(metrics.get("orderflow_cvd_quote"), 0.0),
+            "orderflow_cvd_ratio": self._to_float(metrics.get("orderflow_cvd_ratio"), 0.0),
+            "orderflow_cvd_momentum": self._to_float(metrics.get("orderflow_cvd_momentum"), 0.0),
             "phantom": self._to_float(metrics.get("phantom"), 0.0),
             "trap_score": self._to_float(metrics.get("trap_score"), 0.0),
             "ret_period": self._to_float(metrics.get("ret_period"), 0.0),
@@ -144,6 +154,7 @@ class MarketIngestionService:
         - microprice_delta: 微价格变化
         - phantom_score: 幽灵订单评分
         - trap_score: 陷阱评分
+        - vpin / flow_toxicity: 成交毒性/噪声强度
         """
         spread_bps = self._to_float(metrics.get("spread_bps"), 0.0)
         imbalance = self._to_float(metrics.get("imbalance"), 0.0)
@@ -152,6 +163,8 @@ class MarketIngestionService:
         trap = self._to_float(metrics.get("trap_score"), 0.0)
         # trade_imb: 真正的成交不平衡，不是 CVD
         trade_imb = self._to_float(metrics.get("trade_imbalance"), 0.0)
+        vpin = self._to_float(metrics.get("vpin"), 0.0)
+        flow_toxicity = self._to_float(metrics.get("flow_toxicity"), vpin)
         
         # spread_z: 从历史统计计算真正的 z-score
         spread_z = self._to_float(metrics.get("spread_z"), 0.0)
@@ -168,6 +181,8 @@ class MarketIngestionService:
             "microprice_delta": micro_delta,
             "phantom_score": phantom,
             "trap_score": trap,
+            "vpin": vpin,
+            "flow_toxicity": flow_toxicity,
         }
     
     def _extract_fund_flow_features(self, metrics: Dict[str, Any]) -> Dict[str, float]:
@@ -188,12 +203,22 @@ class MarketIngestionService:
         - ret_period: 周期收益率 (用于 OI 方向分离)
         - flow_confirm: 资金一致性 (CVD/OI/价格方向是否一致)
         """
-        cvd = self._to_float(metrics.get("cvd_ratio"), 0.0)
-        cvd_mom = self._to_float(metrics.get("cvd_momentum"), 0.0)
+        cvd = self._to_float(
+            metrics.get("orderflow_cvd_ratio"),
+            self._to_float(metrics.get("cvd_ratio"), 0.0),
+        )
+        cvd_mom = self._to_float(
+            metrics.get("orderflow_cvd_momentum"),
+            self._to_float(metrics.get("cvd_momentum"), 0.0),
+        )
         oi_delta = self._to_float(metrics.get("oi_delta_ratio"), 0.0)
         funding = self._to_float(metrics.get("funding_rate"), 0.0)
         liq_delta = self._to_float(metrics.get("liquidity_delta_norm"), 0.0)
         depth = self._to_float(metrics.get("depth_ratio"), 1.0)
+        trade_imbalance = self._to_float(metrics.get("trade_imbalance"), 0.0)
+        vpin = self._to_float(metrics.get("vpin"), 0.0)
+        flow_toxicity = self._to_float(metrics.get("flow_toxicity"), vpin)
+        orderflow_cvd_quote = self._to_float(metrics.get("orderflow_cvd_quote"), 0.0)
         
         # 获取价格收益率用于 OI 方向分离（更可靠）
         ret_period = self._to_float(metrics.get("ret_period"), 
@@ -234,6 +259,10 @@ class MarketIngestionService:
             "funding": funding,
             "depth_ratio": depth,
             "liquidity_delta": liq_delta,  # 统一为 liquidity_delta
+            "trade_imbalance": trade_imbalance,
+            "vpin": vpin,
+            "flow_toxicity": flow_toxicity,
+            "orderflow_cvd_quote": orderflow_cvd_quote,
             # === 方向分离字段（保留用于分析）===
             "oi_delta_long": oi_delta_long,
             "oi_delta_short": oi_delta_short,

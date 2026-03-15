@@ -850,6 +850,13 @@ class FundFlowExecutionRouter:
                 order_price = self._format_price(decision.symbol, order_price)
                 side = "BUY" if decision.operation == Operation.BUY else "SELL"
                 position_side = "LONG" if decision.operation == Operation.BUY else "SHORT"
+                md = decision.metadata if isinstance(decision.metadata, dict) else {}
+                tif_override = str(md.get("entry_tif_override", "") or "").strip().upper()
+                entry_tif = decision.time_in_force
+                if tif_override == "GTC":
+                    entry_tif = TimeInForce.GTC
+                elif tif_override == "IOC":
+                    entry_tif = TimeInForce.IOC
 
                 order_result = self._try_place_with_fallback(
                     symbol=decision.symbol,
@@ -857,7 +864,7 @@ class FundFlowExecutionRouter:
                     position_side=position_side,
                     quantity=qty,
                     price=order_price,
-                    tif=decision.time_in_force,
+                    tif=entry_tif,
                     reduce_only=False,
                 )
                 if isinstance(order_result, dict) and order_result.get("open_blocked"):

@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from src.fund_flow.log_compaction import (
+    compact_decision_payload,
+    compact_execution_result_payload,
+    compact_flow_context_payload,
+    compact_json_dumps,
+    compact_portfolio_payload,
+    compact_trigger_context_payload,
+)
 from src.fund_flow.models import FundFlowDecision
 
 
@@ -23,15 +33,19 @@ class FundFlowAttributionEngine:
         logs_dir: str,
         file_name: str = "fund_flow_attribution.jsonl",
         bucket_root_dir: str | None = None,
+        raw_keep_days: int = 2,
     ) -> None:
         self.logs_dir = logs_dir
         self.file_name = file_name
         self.bucket_root_dir = bucket_root_dir
+        self.raw_keep_days = max(0, int(raw_keep_days))
+        self._last_archive_day = datetime.now().date()
         os.makedirs(self.logs_dir, exist_ok=True)
         self.log_path = os.path.join(self.logs_dir, self.file_name)
         if isinstance(self.bucket_root_dir, str) and self.bucket_root_dir.strip():
             os.makedirs(self.bucket_root_dir, exist_ok=True)
             self._migrate_legacy_bucket_layout()
+        self._archive_old_logs()
 
     @staticmethod
     def _ts() -> str:
@@ -68,9 +82,13 @@ class FundFlowAttributionEngine:
             return datetime.now()
 
     def _append(self, payload: Dict[str, Any]) -> None:
+        today = datetime.now().date()
+        if today != self._last_archive_day:
+            self._archive_old_logs()
+            self._last_archive_day = today
         payload = {"ts": self._ts(), **payload}
         with open(self._resolve_log_path(), "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            f.write(compact_json_dumps(payload) + "\n")
 
     def _resolve_log_path(self) -> str:
         if not isinstance(self.bucket_root_dir, str) or not self.bucket_root_dir.strip():
@@ -163,12 +181,62 @@ class FundFlowAttributionEngine:
                 except Exception:
                     pass
 
+    def _archive_old_logs(self) -> None:
+        roots = []
+        if isinstance(self.bucket_root_dir, str) and self.bucket_root_dir.strip():
+            roots.append(self.bucket_root_dir)
+        else:
+            roots.append(self.logs_dir)
+        cutoff_day = datetime.now().date().toordinal() - self.raw_keep_days + 1
+        current_path = os.path.abspath(self._resolve_log_path())
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            for dir_path, _dir_names, file_names in os.walk(root):
+                for name in file_names:
+                    if name != self.file_name:
+                        continue
+                    path = os.path.join(dir_path, name)
+                    abs_path = os.path.abspath(path)
+                    if abs_path == current_path:
+                        continue
+                    try:
+                        modified = datetime.fromtimestamp(os.path.getmtime(path)).date().toordinal()
+                    except Exception:
+                        continue
+                    if modified >= cutoff_day:
+                        continue
+                    gz_path = path + ".gz"
+                    if os.path.exists(gz_path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        with open(path, "rb") as src, gzip.open(gz_path, "wb", compresslevel=6) as dst:
+                            shutil.copyfileobj(src, dst)
+                        os.remove(path)
+                    except Exception:
+                        try:
+                            if os.path.exists(gz_path):
+                                os.remove(gz_path)
+                        except Exception:
+                            pass
+
     def log_decision(self, decision: FundFlowDecision, context: Dict[str, Any]) -> None:
+        context = context if isinstance(context, dict) else {}
         self._append(
             {
                 "event": "decision",
-                "decision": decision.to_dict(),
-                "context": context,
+                "decision": compact_decision_payload(decision),
+                "context": {
+                    "symbol": context.get("symbol"),
+                    "price": context.get("price"),
+                    "portfolio": compact_portfolio_payload(context.get("portfolio")),
+                    "flow_context": compact_flow_context_payload(context.get("flow_context")),
+                    "trigger_context": compact_trigger_context_payload(context.get("trigger_context")),
+                },
             }
         )
 
@@ -176,8 +244,8 @@ class FundFlowAttributionEngine:
         self._append(
             {
                 "event": "execution",
-                "decision": decision.to_dict(),
-                "result": result,
+                "decision": compact_decision_payload(decision),
+                "result": compact_execution_result_payload(result),
             }
         )
     

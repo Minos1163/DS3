@@ -38,6 +38,12 @@ from src.fund_flow import (
     Operation as FundFlowOperation,
     TriggerEngine,
 )
+from src.fund_flow.log_compaction import (
+    compact_decision_payload,
+    compact_flow_context_payload,
+    compact_json_dumps,
+    compact_trigger_context_payload,
+)
 try:
     from src.risk.enhanced_risk import RiskConfig as _ImportedRiskConfig
 except ModuleNotFoundError:
@@ -741,7 +747,9 @@ class TradingBot:
             f"enabled={dca.get('enabled')}, "
             f"steps={len(dca.get('drawdown_thresholds') or [])}, "
             f"max_additions={dca.get('max_additions')}, "
-            f"base_add={dca.get('base_add_portion'):.2f}"
+            f"base_add={dca.get('base_add_portion'):.2f}, "
+            f"lev_guard<{int(self._to_float(dca.get('disable_above_leverage'), 9))}x, "
+            f"lev_now={int(self._to_float(dca.get('effective_leverage'), 1))}x"
         )
         sp_cfg = getattr(self.fund_flow_trigger_engine, "signal_pool_config", None)
         if not isinstance(sp_cfg, dict):
@@ -1490,6 +1498,180 @@ class TradingBot:
             "drawdown_weight": self._to_float(gate_cfg.get("drawdown_weight", defaults.drawdown_weight), defaults.drawdown_weight),
         }
 
+    def _execution_quality_1m_config(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) or {}
+        exec_cfg = ff_cfg.get("execution_quality_1m", {}) if isinstance(ff_cfg.get("execution_quality_1m"), dict) else {}
+        return {
+            "enabled": bool(exec_cfg.get("enabled", True)),
+            "timeframe": str(exec_cfg.get("timeframe", ff_cfg.get("execution_quality_timeframe", "1m")) or "1m").strip().lower(),
+            "trend_limit": max(20, int(self._to_float(exec_cfg.get("trend_limit", 60), 60))),
+            "orderflow_limit": max(12, int(self._to_float(exec_cfg.get("orderflow_limit", 24), 24))),
+            "block_spread_bps": max(0.0, self._to_float(exec_cfg.get("block_spread_bps", 12.0), 12.0)),
+            "block_spread_z": max(0.0, self._to_float(exec_cfg.get("block_spread_z", 2.2), 2.2)),
+            "block_vpin": min(1.0, max(0.0, self._to_float(exec_cfg.get("block_vpin", 0.72), 0.72))),
+            "block_flow_toxicity": min(
+                1.0,
+                max(0.0, self._to_float(exec_cfg.get("block_flow_toxicity", 0.72), 0.72)),
+            ),
+            "block_trap_score": min(1.0, max(0.0, self._to_float(exec_cfg.get("block_trap_score", 0.72), 0.72))),
+            "degrade_spread_bps": max(0.0, self._to_float(exec_cfg.get("degrade_spread_bps", 6.0), 6.0)),
+            "degrade_spread_z": max(0.0, self._to_float(exec_cfg.get("degrade_spread_z", 1.2), 1.2)),
+            "degrade_vpin": min(1.0, max(0.0, self._to_float(exec_cfg.get("degrade_vpin", 0.48), 0.48))),
+            "degrade_flow_toxicity": min(
+                1.0,
+                max(0.0, self._to_float(exec_cfg.get("degrade_flow_toxicity", 0.48), 0.48)),
+            ),
+            "degrade_trap_score": min(1.0, max(0.0, self._to_float(exec_cfg.get("degrade_trap_score", 0.45), 0.45))),
+            "passive_max_spread_bps": max(
+                0.0,
+                self._to_float(exec_cfg.get("passive_max_spread_bps", 4.0), 4.0),
+            ),
+            "passive_max_spread_z": max(0.0, self._to_float(exec_cfg.get("passive_max_spread_z", 0.8), 0.8)),
+            "passive_max_vpin": min(1.0, max(0.0, self._to_float(exec_cfg.get("passive_max_vpin", 0.35), 0.35))),
+            "passive_max_flow_toxicity": min(
+                1.0,
+                max(0.0, self._to_float(exec_cfg.get("passive_max_flow_toxicity", 0.35), 0.35)),
+            ),
+            "passive_max_trap_score": min(
+                1.0,
+                max(0.0, self._to_float(exec_cfg.get("passive_max_trap_score", 0.30), 0.30)),
+            ),
+            "passive_max_bb_pos_norm": min(
+                1.0,
+                max(0.0, self._to_float(exec_cfg.get("passive_max_bb_pos_norm", 0.65), 0.65)),
+            ),
+        }
+
+    def _build_execution_quality_1m(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = self._execution_quality_1m_config()
+        timeframe = str(cfg.get("timeframe", "1m") or "1m").strip().lower()
+        out: Dict[str, Any] = {
+            "enabled": bool(cfg.get("enabled", True)),
+            "timeframe": timeframe,
+            "mode": "NEUTRAL",
+            "block_entry": False,
+            "passive_only": False,
+            "prefer_passive_entry": False,
+            "entry_tif_override": None,
+            "disable_market_fallback": False,
+            "reason": "",
+            "reasons": [],
+            "spread_bps": 0.0,
+            "spread_z": 0.0,
+            "vpin": 0.0,
+            "flow_toxicity": 0.0,
+            "trap_score": 0.0,
+            "bb_pos_norm": 0.0,
+            "ret_1m": 0.0,
+        }
+        if not bool(cfg.get("enabled", True)):
+            out["mode"] = "DISABLED"
+            out["reason"] = "disabled"
+            return out
+
+        realtime = market_data.get("realtime", {}) if isinstance(market_data, dict) else {}
+        trend_filter_1m = market_data.get("trend_filter_1m", {}) if isinstance(market_data, dict) else {}
+        order_flow_1m = market_data.get("order_flow_1m", {}) if isinstance(market_data, dict) else {}
+
+        raw_spread = abs(self._to_float(realtime.get("spread_bps"), 0.0))
+        spread_bps = raw_spread * 10000.0 if raw_spread <= 1.0 else raw_spread
+        spread_z = max(
+            abs(self._to_float(realtime.get("spread_z"), 0.0)),
+            abs(self._to_float(trend_filter_1m.get("spread_z"), 0.0)),
+            abs(self._to_float(order_flow_1m.get("spread_z"), 0.0)),
+        )
+        vpin = max(
+            self._to_float(order_flow_1m.get("vpin"), 0.0),
+            self._to_float(realtime.get("vpin"), 0.0),
+        )
+        flow_toxicity = max(
+            self._to_float(order_flow_1m.get("flow_toxicity"), vpin),
+            self._to_float(realtime.get("flow_toxicity"), vpin),
+            vpin,
+        )
+        trap_score = max(
+            self._to_float(realtime.get("trap_score"), 0.0),
+            self._to_float(order_flow_1m.get("trap_score"), 0.0),
+        )
+        bb_pos_norm = self._to_float(trend_filter_1m.get("bb_pos_norm"), 0.0)
+        ret_1m = self._to_float(order_flow_1m.get("ret_period"), 0.0)
+
+        out.update(
+            {
+                "spread_bps": spread_bps,
+                "spread_z": spread_z,
+                "vpin": vpin,
+                "flow_toxicity": flow_toxicity,
+                "trap_score": trap_score,
+                "bb_pos_norm": bb_pos_norm,
+                "ret_1m": ret_1m,
+            }
+        )
+
+        block_reasons: List[str] = []
+        if spread_bps >= self._to_float(cfg.get("block_spread_bps"), 12.0):
+            block_reasons.append(f"spread_bps={spread_bps:.2f}")
+        if spread_z >= self._to_float(cfg.get("block_spread_z"), 2.2):
+            block_reasons.append(f"spread_z={spread_z:.2f}")
+        if vpin >= self._to_float(cfg.get("block_vpin"), 0.72):
+            block_reasons.append(f"vpin={vpin:.2f}")
+        if flow_toxicity >= self._to_float(cfg.get("block_flow_toxicity"), 0.72):
+            block_reasons.append(f"flow_toxicity={flow_toxicity:.2f}")
+        if trap_score >= self._to_float(cfg.get("block_trap_score"), 0.72):
+            block_reasons.append(f"trap_score={trap_score:.2f}")
+        if block_reasons:
+            out["mode"] = "BLOCK"
+            out["block_entry"] = True
+            out["disable_market_fallback"] = True
+            out["reasons"] = block_reasons
+            out["reason"] = "hard_risk_switch " + ", ".join(block_reasons)
+            return out
+
+        degrade_reasons: List[str] = []
+        if spread_bps >= self._to_float(cfg.get("degrade_spread_bps"), 6.0):
+            degrade_reasons.append(f"spread_bps={spread_bps:.2f}")
+        if spread_z >= self._to_float(cfg.get("degrade_spread_z"), 1.2):
+            degrade_reasons.append(f"spread_z={spread_z:.2f}")
+        if vpin >= self._to_float(cfg.get("degrade_vpin"), 0.48):
+            degrade_reasons.append(f"vpin={vpin:.2f}")
+        if flow_toxicity >= self._to_float(cfg.get("degrade_flow_toxicity"), 0.48):
+            degrade_reasons.append(f"flow_toxicity={flow_toxicity:.2f}")
+        if trap_score >= self._to_float(cfg.get("degrade_trap_score"), 0.45):
+            degrade_reasons.append(f"trap_score={trap_score:.2f}")
+        if degrade_reasons:
+            out["mode"] = "PASSIVE_ONLY"
+            out["passive_only"] = True
+            out["prefer_passive_entry"] = True
+            out["entry_tif_override"] = "GTC"
+            out["disable_market_fallback"] = True
+            out["reasons"] = degrade_reasons
+            out["reason"] = "degraded_microstructure " + ", ".join(degrade_reasons)
+            return out
+
+        if (
+            spread_bps <= self._to_float(cfg.get("passive_max_spread_bps"), 4.0)
+            and spread_z <= self._to_float(cfg.get("passive_max_spread_z"), 0.8)
+            and vpin <= self._to_float(cfg.get("passive_max_vpin"), 0.35)
+            and flow_toxicity <= self._to_float(cfg.get("passive_max_flow_toxicity"), 0.35)
+            and trap_score <= self._to_float(cfg.get("passive_max_trap_score"), 0.30)
+            and abs(bb_pos_norm) <= self._to_float(cfg.get("passive_max_bb_pos_norm"), 0.65)
+        ):
+            calm_reasons = [
+                f"spread_bps={spread_bps:.2f}",
+                f"vpin={vpin:.2f}",
+                f"trap_score={trap_score:.2f}",
+            ]
+            out["mode"] = "PREFER_PASSIVE"
+            out["prefer_passive_entry"] = True
+            out["entry_tif_override"] = "GTC"
+            out["disable_market_fallback"] = True
+            out["reasons"] = calm_reasons
+            out["reason"] = "calm_microstructure " + ", ".join(calm_reasons)
+            return out
+
+        out["reason"] = "neutral"
+        return out
+
     def _stale_protection_cleanup_config(self) -> Dict[str, Any]:
         ff_cfg = self.config.get("fund_flow", {}) or {}
         enabled = bool(ff_cfg.get("stale_protection_cleanup_enabled", True))
@@ -1502,6 +1684,29 @@ class TradingBot:
         enabled = bool(ff_cfg.get("dca_martingale_enabled", ff_cfg.get("dca_enabled", False)))
         if "dca_max_additions" in override:
             enabled = int(self._to_float(override.get("dca_max_additions"), 0)) > 0
+        dca_disable_above_leverage = max(
+            1,
+            int(self._to_float(ff_cfg.get("dca_disable_above_leverage", 9), 9)),
+        )
+        dca_high_leverage_opt_in = bool(
+            override.get("dca_allow_high_leverage", ff_cfg.get("dca_allow_high_leverage", False))
+        )
+        effective_leverage = max(
+            1,
+            int(
+                self._to_float(
+                    override.get(
+                        "default_leverage",
+                        getattr(
+                            getattr(self, "fund_flow_decision_engine", None),
+                            "default_leverage",
+                            ConfigLoader.get_default_leverage(self.config),
+                        ),
+                    ),
+                    ConfigLoader.get_default_leverage(self.config),
+                )
+            ),
+        )
         base_add_portion = self._normalize_percent_to_ratio(
             override.get("add_position_portion", ff_cfg.get("add_position_portion", ff_cfg.get("default_target_portion", 0.2))),
             0.2,
@@ -1539,6 +1744,10 @@ class TradingBot:
         max_additions = int(override.get("dca_max_additions", ff_cfg.get("dca_max_additions", len(thresholds))) or len(thresholds))
         max_additions = max(0, min(max_additions, len(thresholds)))
         min_trigger_interval_seconds = max(0, int(ff_cfg.get("dca_min_trigger_interval_seconds", 0) or 0))
+        disabled_by_high_leverage = bool(enabled) and (not dca_high_leverage_opt_in) and effective_leverage >= dca_disable_above_leverage
+        if disabled_by_high_leverage:
+            enabled = False
+            max_additions = 0
         return {
             "enabled": enabled,
             "base_add_portion": float(base_add_portion),
@@ -1546,6 +1755,10 @@ class TradingBot:
             "multipliers": multipliers,
             "max_additions": max_additions,
             "min_trigger_interval_seconds": min_trigger_interval_seconds,
+            "effective_leverage": effective_leverage,
+            "disable_above_leverage": dca_disable_above_leverage,
+            "allow_high_leverage_opt_in": dca_high_leverage_opt_in,
+            "disabled_by_high_leverage": disabled_by_high_leverage,
         }
 
     def _extreme_volatility_cooldown_config(self) -> Dict[str, Any]:
@@ -2423,7 +2636,48 @@ class TradingBot:
             "equity_fraction": equity_fraction,
         }
 
-        gate_meta: Dict[str, Any] = {"enabled": True, "state": state, "action": "HOLD", "score": 0.0}
+        execution_quality_1m_raw = flow_context.get("execution_quality_1m") if isinstance(flow_context, dict) else {}
+        execution_quality_1m = execution_quality_1m_raw if isinstance(execution_quality_1m_raw, dict) else {}
+        if isinstance(md, dict) and execution_quality_1m:
+            md["execution_quality_1m"] = execution_quality_1m
+
+        gate_meta: Dict[str, Any] = {
+            "enabled": True,
+            "state": state,
+            "action": "HOLD",
+            "score": 0.0,
+            "execution_quality_1m": execution_quality_1m,
+        }
+        if (
+            decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL)
+            and bool(execution_quality_1m.get("block_entry", False))
+        ):
+            exec_mode = str(execution_quality_1m.get("mode", "BLOCK")).upper()
+            exec_reason = str(execution_quality_1m.get("reason", "")).strip()
+            gate_meta["action"] = "BLOCK"
+            gate_meta["score"] = 1.0
+            gate_meta["entry_execution_policy"] = exec_mode
+            if isinstance(md, dict):
+                md["pretrade_risk_gate"] = gate_meta
+                md["entry_execution_policy"] = exec_mode
+                if exec_reason:
+                    md["execution_quality_reason"] = exec_reason
+            base_reason = str(decision.reason or "").strip()
+            block_reason = f"EXECUTION_1M_BLOCK mode={exec_mode}"
+            if exec_reason:
+                block_reason = f"{block_reason} {exec_reason}"
+            return (
+                FundFlowDecision(
+                    operation=FundFlowOperation.HOLD,
+                    symbol=symbol,
+                    target_portion_of_balance=0.0,
+                    leverage=decision.leverage,
+                    reason=f"{base_reason} | {block_reason}" if base_reason else block_reason,
+                    metadata=md if isinstance(md, dict) else {},
+                ),
+                gate_meta,
+            )
+
         try:
             gate_result = gate_trade_decision(
                 state,
@@ -2454,6 +2708,7 @@ class TradingBot:
                 "enter": bool(gate_result.get("enter", False)),
                 "exit": bool(gate_result.get("exit", False)),
                 "details": gate_details,
+                "execution_quality_1m": execution_quality_1m,
             }
             if isinstance(md, dict):
                 md["pretrade_risk_gate"] = gate_meta
@@ -2535,6 +2790,26 @@ class TradingBot:
                         reason=f"{base_reason} | {degrade_reason}" if base_reason else degrade_reason,
                         metadata=md if isinstance(md, dict) else {},
                     )
+
+                if bool(execution_quality_1m.get("prefer_passive_entry", False)):
+                    exec_mode = str(execution_quality_1m.get("mode", "PREFER_PASSIVE")).upper()
+                    exec_reason = str(execution_quality_1m.get("reason", "")).strip()
+                    if isinstance(md, dict):
+                        md["entry_execution_policy"] = exec_mode
+                        tif_override = str(execution_quality_1m.get("entry_tif_override", "") or "").strip()
+                        if tif_override:
+                            md["entry_tif_override"] = tif_override
+                        md["disable_market_fallback"] = bool(execution_quality_1m.get("disable_market_fallback", True))
+                        if exec_reason:
+                            md["execution_quality_reason"] = exec_reason
+                    gate_meta["entry_execution_policy"] = exec_mode
+                    base_reason = str(decision.reason or "").strip()
+                    passive_reason = f"EXECUTION_1M_PASSIVE mode={exec_mode}"
+                    if exec_reason:
+                        passive_reason = f"{passive_reason} {exec_reason}"
+                    if passive_reason not in base_reason:
+                        decision.reason = f"{base_reason} | {passive_reason}" if base_reason else passive_reason
+                    decision.metadata = md if isinstance(md, dict) else {}
 
             if (
                 isinstance(position, dict)
@@ -2834,6 +3109,14 @@ class TradingBot:
                 ),
             )
         )
+        dca_disable_above_leverage = max(1, int(self._to_float(cfg.get("disable_above_leverage", 9), 9)))
+        dca_high_leverage_opt_in = bool(cfg.get("allow_high_leverage_opt_in", False))
+        effective_leverage = max(
+            leverage,
+            int(self._to_float(cfg.get("effective_leverage", leverage), leverage)),
+        )
+        if (not dca_high_leverage_opt_in) and effective_leverage >= dca_disable_above_leverage:
+            return None
         action = FundFlowOperation.BUY if side == "LONG" else FundFlowOperation.SELL
 
         md = base_decision.metadata if isinstance(getattr(base_decision, "metadata", None), dict) else {}
@@ -2846,11 +3129,12 @@ class TradingBot:
             "dca_threshold": threshold,
             "dca_multiplier": multiplier,
             "dca_drawdown": drawdown_ratio,
+            "dca_effective_leverage": effective_leverage,
         }
         reason = (
             f"DCA/马丁触发 stage={current_stage + 1}/{max_additions}, "
             f"drawdown={drawdown_ratio:.4f} >= threshold={threshold:.4f}, "
-            f"multiplier={multiplier:.2f}"
+            f"multiplier={multiplier:.2f}, lev={effective_leverage}x"
         )
 
         decision = FundFlowDecision(
@@ -3143,11 +3427,13 @@ class TradingBot:
     def _init_fund_flow_modules(self) -> None:
         symbol_whitelist = ConfigLoader.get_trading_symbols(self.config)
         ff_cfg = self.config.get("fund_flow", {}) or {}
+        log_compaction_cfg = ff_cfg.get("log_compaction", {}) if isinstance(ff_cfg.get("log_compaction"), dict) else {}
         self._signal_pool_configs = self._build_signal_pool_configs_from_config(ff_cfg)
         self._signal_pool_configs_runtime_cache = {}
         self.fund_flow_attribution_engine = FundFlowAttributionEngine(
             self.logs_dir,
             bucket_root_dir=self.log_root_dir,
+            raw_keep_days=max(0, int(log_compaction_cfg.get("attribution_raw_keep_days", 2) or 2)),
         )
         self.fund_flow_risk_engine = FundFlowRiskEngine(self.config, symbol_whitelist=symbol_whitelist)
         self.fund_flow_decision_engine = FundFlowDecisionEngine(self.config)
@@ -3170,7 +3456,10 @@ class TradingBot:
         sync_result: Dict[str, int] = {"definitions": 0, "pools": 0}
         runtime_pool_cfg = ff_cfg.get("signal_pool", {}) if isinstance(ff_cfg.get("signal_pool"), dict) else {}
         try:
-            storage = MarketStorage(db_path=os.path.join(self.logs_dir, "fund_flow_strategy.db"))
+            storage = MarketStorage(
+                db_path=os.path.join(self.logs_dir, "fund_flow_strategy.db"),
+                audit_log_retention_days=max(1, int(log_compaction_cfg.get("db_audit_retention_days", 7) or 7)),
+            )
             self.fund_flow_storage = storage
             sync_result = storage.upsert_signal_registry_from_config(ff_cfg)
             active_pool_id = ff_cfg.get("active_signal_pool_id")
@@ -3502,18 +3791,14 @@ class TradingBot:
                 funding_rate = self._to_float(self.client.get_funding_rate(symbol), 0.0)
                 trend_filter = self.market_data.get_trend_filter_metrics(symbol, interval=regime_timeframe, limit=trend_limit) or {}
                 if isinstance(trend_filter, dict) and trend_filter:
-                    self._startup_trend_filter_cache[symbol.upper()] = {
-                        key: self._to_float(trend_filter.get(key), 0.0)
-                        for key in ("ema_fast", "ema_slow", "adx", "atr_pct", "last_open", "last_close")
-                        if trend_filter.get(key) is not None
-                    }
+                    self._startup_trend_filter_cache[symbol.upper()] = dict(trend_filter)
 
                 prev_close = self._to_float(klines[0][4], 0.0)
                 prev_ret = 0.0
                 oi_prev = 0.0
                 snapshots_for_symbol = 0
 
-                for row in klines[1:]:
+                for row_idx, row in enumerate(klines[1:], start=1):
                     if not isinstance(row, list) or len(row) < 7:
                         continue
                     close_price = self._to_float(row[4], 0.0)
@@ -3528,14 +3813,34 @@ class TradingBot:
                     oi_delta_ratio = ((oi_now - oi_prev) / abs(oi_prev)) if oi_prev > 0 and oi_now > 0 else 0.0
                     if oi_now > 0:
                         oi_prev = oi_now
+                    order_flow = self.market_data.extract_order_flow_metrics_from_klines(
+                        klines[: row_idx + 1]
+                    )
 
                     metrics = {
-                        "cvd_ratio": ret_period,
-                        "cvd_momentum": ret_period - prev_ret,
+                        "cvd_ratio": self._to_float(order_flow.get("orderflow_cvd_ratio"), ret_period),
+                        "cvd_momentum": self._to_float(
+                            order_flow.get("orderflow_cvd_momentum"),
+                            ret_period - prev_ret,
+                        ),
+                        "orderflow_cvd_quote": self._to_float(order_flow.get("orderflow_cvd_quote"), 0.0),
+                        "orderflow_cvd_ratio": self._to_float(order_flow.get("orderflow_cvd_ratio"), ret_period),
+                        "orderflow_cvd_momentum": self._to_float(
+                            order_flow.get("orderflow_cvd_momentum"),
+                            ret_period - prev_ret,
+                        ),
                         "oi_delta_ratio": oi_delta_ratio,
                         "funding_rate": funding_rate,
                         "depth_ratio": 1.0,
                         "imbalance": 0.0,
+                        "trade_imbalance": self._to_float(order_flow.get("trade_imbalance"), 0.0),
+                        "volume_imbalance": self._to_float(order_flow.get("volume_imbalance"), 0.0),
+                        "vpin": self._to_float(order_flow.get("vpin"), 0.0),
+                        "flow_toxicity": self._to_float(order_flow.get("flow_toxicity"), 0.0),
+                        "quote_volume": self._to_float(order_flow.get("quote_volume"), 0.0),
+                        "taker_buy_quote": self._to_float(order_flow.get("taker_buy_quote"), 0.0),
+                        "taker_sell_quote": self._to_float(order_flow.get("taker_sell_quote"), 0.0),
+                        "taker_delta_quote": self._to_float(order_flow.get("taker_delta_quote"), 0.0),
                         "liquidity_delta_norm": 0.0,
                         "mid_price": close_price,
                         "microprice": close_price,
@@ -3596,10 +3901,10 @@ class TradingBot:
             if tf_key not in timeframes:
                 timeframes[tf_key] = {}
             if isinstance(timeframes[tf_key], dict):
-                # 注入 trend filter 指标 (ema_fast, ema_slow, adx, atr_pct, last_open, last_close)
-                for k in ("ema_fast", "ema_slow", "adx", "atr_pct", "last_open", "last_close"):
-                    if k in trend_filter:
-                        timeframes[tf_key][k] = trend_filter[k]
+                # 注入完整趋势指标快照，避免 15m 主判链路只拿到基础趋势字段。
+                for k, v in trend_filter.items():
+                    if v is not None:
+                        timeframes[tf_key][k] = v
             out["timeframes"] = timeframes
 
         ff_cfg = self.config.get("fund_flow", {}) or {}
@@ -3763,16 +4068,39 @@ class TradingBot:
         trend_filter = self.market_data.get_trend_filter_metrics(symbol, interval=regime_timeframe, limit=120) or {}
         if not trend_filter:
             trend_filter = dict(self._startup_trend_filter_cache.get(symbol.upper(), {}))
+        exec_quality_cfg = self._execution_quality_1m_config()
+        exec_timeframe = str(exec_quality_cfg.get("timeframe", "1m") or "1m").strip().lower()
+        trend_filter_1m = trend_filter if exec_timeframe == regime_timeframe else (
+            self.market_data.get_trend_filter_metrics(
+                symbol,
+                interval=exec_timeframe,
+                limit=max(20, int(exec_quality_cfg.get("trend_limit", 60))),
+            )
+            or {}
+        )
+        order_flow_1m = self.market_data.get_order_flow_snapshot(
+            symbol,
+            interval=exec_timeframe,
+            limit=max(12, int(exec_quality_cfg.get("orderflow_limit", 24))),
+        ) or {}
         ob_flow = self._extract_orderbook_flow(symbol)
         for k, v in ob_flow.items():
             realtime[k] = v
-        return {"realtime": realtime, "trend_filter": trend_filter, "trend_filter_timeframe": regime_timeframe}
+        return {
+            "realtime": realtime,
+            "trend_filter": trend_filter,
+            "trend_filter_timeframe": regime_timeframe,
+            "trend_filter_1m": trend_filter_1m,
+            "order_flow_1m": order_flow_1m,
+            "execution_quality_timeframe": exec_timeframe,
+        }
 
     def _build_fund_flow_context(self, symbol: str, market_data: Dict[str, Any]) -> Dict[str, Any]:
         realtime = market_data.get("realtime", {}) if isinstance(market_data, dict) else {}
         # 使用动态的 trend_filter 数据
         trend_filter = market_data.get("trend_filter", {}) if isinstance(market_data, dict) else {}
         trend_filter_timeframe = market_data.get("trend_filter_timeframe", "15m") if isinstance(market_data, dict) else "15m"
+        execution_quality_1m = self._build_execution_quality_1m(market_data if isinstance(market_data, dict) else {})
         change_15m = self._to_float(realtime.get("change_15m"), 0.0) / 100.0
         change_24h = self._to_float(realtime.get("change_24h"), 0.0) / 100.0
         funding_rate = self._to_float(realtime.get("funding_rate"), 0.0)
@@ -3782,18 +4110,36 @@ class TradingBot:
         oi_delta_ratio = ((open_interest - prev_oi) / abs(prev_oi)) if prev_oi > 0 else 0.0
         self._prev_open_interest[symbol] = open_interest
 
-        cvd_ratio = change_15m
-        cvd_momentum = change_15m - (change_24h / 96.0)
+        # 优先使用真实主动买卖量构造的订单流变量；仅在缺失时回退到价格代理。
+        cvd_ratio = self._to_float(realtime.get("orderflow_cvd_ratio"), change_15m)
+        cvd_momentum = self._to_float(
+            realtime.get("orderflow_cvd_momentum"),
+            change_15m - (change_24h / 96.0),
+        )
         ob_delta_notional = self._to_float(realtime.get("ob_delta_notional"), 0.0)
         ob_total_notional = self._to_float(realtime.get("ob_total_notional"), 0.0)
         liquidity_delta_norm = self._compute_liquidity_delta_norm(symbol, ob_delta_notional, ob_total_notional)
         return {
             "cvd_ratio": cvd_ratio,
             "cvd_momentum": cvd_momentum,
+            "orderflow_cvd_quote": self._to_float(realtime.get("orderflow_cvd_quote"), 0.0),
+            "orderflow_cvd_ratio": cvd_ratio,
+            "orderflow_cvd_momentum": cvd_momentum,
             "oi_delta_ratio": oi_delta_ratio,
             "funding_rate": funding_rate,
             "depth_ratio": self._to_float(realtime.get("depth_ratio"), 1.0),
             "imbalance": self._to_float(realtime.get("imbalance"), 0.0),
+            "trade_imbalance": self._to_float(realtime.get("trade_imbalance"), cvd_ratio),
+            "volume_imbalance": self._to_float(realtime.get("volume_imbalance"), abs(cvd_ratio)),
+            "vpin": self._to_float(realtime.get("vpin"), 0.0),
+            "flow_toxicity": self._to_float(
+                realtime.get("flow_toxicity"),
+                self._to_float(realtime.get("vpin"), 0.0),
+            ),
+            "quote_volume": self._to_float(realtime.get("quote_volume"), 0.0),
+            "taker_buy_quote": self._to_float(realtime.get("taker_buy_quote"), 0.0),
+            "taker_sell_quote": self._to_float(realtime.get("taker_sell_quote"), 0.0),
+            "taker_delta_quote": self._to_float(realtime.get("taker_delta_quote"), 0.0),
             "liquidity_delta_norm": liquidity_delta_norm,
             "mid_price": self._to_float(realtime.get("mid_price"), 0.0),
             "microprice": self._to_float(realtime.get("microprice"), 0.0),
@@ -3805,7 +4151,31 @@ class TradingBot:
             "ob_total_notional": ob_total_notional,
             "trend_filter": trend_filter if isinstance(trend_filter, dict) else {},
             "trend_filter_timeframe": trend_filter_timeframe,
+            "execution_quality_1m": execution_quality_1m,
+            "execution_quality_timeframe": market_data.get("execution_quality_timeframe", "1m")
+            if isinstance(market_data, dict)
+            else "1m",
         }
+
+    def _materialize_flow_snapshot(
+        self,
+        symbol: str,
+        market_data: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Any, Dict[str, Any]]:
+        raw_flow_context = self._build_fund_flow_context(symbol, market_data)
+        flow_snapshot = self.fund_flow_ingestion_service.aggregate_from_metrics(
+            symbol=symbol,
+            metrics=raw_flow_context,
+        )
+        flow_context = self._apply_timeframe_context(raw_flow_context, flow_snapshot)
+        self._safe_storage_call(
+            "upsert_market_flow",
+            exchange=flow_snapshot.exchange,
+            symbol=flow_snapshot.symbol,
+            timestamp=flow_snapshot.timestamp,
+            metrics=flow_snapshot.to_dict(),
+        )
+        return raw_flow_context, flow_snapshot, flow_context
 
     def _has_pending_entry_order(self, symbol: str) -> bool:
         """Return True when there is an unfilled opening order for symbol."""
@@ -4532,9 +4902,19 @@ class TradingBot:
         trigger_context: Dict[str, Any],
         portfolio: Dict[str, Any],
     ) -> None:
-        decision_json = self.fund_flow_execution_router.decision_to_json(decision)
+        decision_json = compact_json_dumps(compact_decision_payload(decision))
         pre_close_side = self._extract_position_side(position) if decision.operation == FundFlowOperation.CLOSE else ""
         md = decision.metadata if isinstance(decision.metadata, dict) else {}
+        exec_trigger_context = dict(trigger_context or {})
+        if isinstance(md, dict):
+            if isinstance(md.get("execution_quality_1m"), dict):
+                exec_trigger_context["execution_quality_1m"] = md.get("execution_quality_1m")
+            if md.get("entry_execution_policy") is not None:
+                exec_trigger_context["entry_execution_policy"] = md.get("entry_execution_policy")
+            if md.get("entry_tif_override") is not None:
+                exec_trigger_context["entry_tif_override"] = md.get("entry_tif_override")
+            if md.get("disable_market_fallback") is not None:
+                exec_trigger_context["disable_market_fallback"] = bool(md.get("disable_market_fallback"))
 
         self.fund_flow_attribution_engine.log_decision(
             decision=decision,
@@ -4543,7 +4923,7 @@ class TradingBot:
                 "price": current_price,
                 "portfolio": portfolio,
                 "flow_context": flow_context,
-                "trigger_context": trigger_context,
+                "trigger_context": exec_trigger_context,
             },
         )
 
@@ -4556,7 +4936,7 @@ class TradingBot:
             account_state=account_summary,
             current_price=current_price,
             position=position,
-            trigger_context=trigger_context,
+            trigger_context=exec_trigger_context,
         )
         if isinstance(execution_result, dict):
             post_hook = self._post_execution_protection_hook(
@@ -4639,8 +5019,10 @@ class TradingBot:
             symbol=symbol,
             operation=decision.operation.value,
             decision_json=decision_json,
-            market_context_json=json.dumps(flow_context, ensure_ascii=False),
-            params_snapshot_json=json.dumps({"trigger_context": trigger_context}, ensure_ascii=False),
+            market_context_json=compact_json_dumps(compact_flow_context_payload(flow_context)),
+            params_snapshot_json=compact_json_dumps(
+                {"trigger_context": compact_trigger_context_payload(trigger_context)}
+            ),
             order_id=order_id,
             environment=str(self.config.get("environment", {}).get("mode", "production")),
             exchange="binance",
@@ -5122,11 +5504,29 @@ class TradingBot:
             )
         return result
 
-    def run_cycle(self, allow_new_entries: bool = True, ai_review_mode: str = "disabled") -> None:
-        self._run_cycle_impl(allow_new_entries=allow_new_entries, ai_review_mode=ai_review_mode)
+    def run_cycle(
+        self,
+        allow_new_entries: bool = True,
+        ai_review_mode: str = "disabled",
+        ingestion_only: bool = False,
+    ) -> None:
+        self._run_cycle_impl(
+            allow_new_entries=allow_new_entries,
+            ai_review_mode=ai_review_mode,
+            ingestion_only=ingestion_only,
+        )
 
-    def _run_cycle_impl(self, allow_new_entries: bool = True, ai_review_mode: str = "disabled") -> None:
-        context = self._prepare_cycle_context(allow_new_entries=allow_new_entries, ai_review_mode=ai_review_mode)
+    def _run_cycle_impl(
+        self,
+        allow_new_entries: bool = True,
+        ai_review_mode: str = "disabled",
+        ingestion_only: bool = False,
+    ) -> None:
+        context = self._prepare_cycle_context(
+            allow_new_entries=allow_new_entries,
+            ai_review_mode=ai_review_mode,
+            ingestion_only=ingestion_only,
+        )
         if context is None:
             return
 
@@ -5153,6 +5553,7 @@ class TradingBot:
         self,
         allow_new_entries: bool = True,
         ai_review_mode: str = "disabled",
+        ingestion_only: bool = False,
     ) -> Optional[Dict[str, Any]]:
         # 每轮先做配置文件 mtime 检查，发生变更则自动重载并立即生效
         self._reload_config_if_changed()
@@ -5200,15 +5601,25 @@ class TradingBot:
             # 仅在允许新开仓窗口清理“无仓残留保护单”，避免影响开仓。
             self._cleanup_stale_protection_orders(symbols)
         else:
-            symbols = [s for s in all_symbols if str(s).upper() in set(position_snapshot.keys())]
-            if not symbols:
-                print("⏭️ 非开仓窗口且当前无持仓，跳过本轮。")
-                return
-            print(f"📌 非开仓窗口仅检查持仓: {', '.join(symbols)}")
+            if ingestion_only:
+                symbols = list(all_symbols)
+                if not symbols:
+                    return None
+                print(f"📝 采样模式：刷新市场快照 {len(symbols)} symbols")
+            else:
+                symbols = [s for s in all_symbols if str(s).upper() in set(position_snapshot.keys())]
+                if not symbols:
+                    print("⏭️ 非开仓窗口且当前无持仓，跳过本轮。")
+                    return
+                print(f"📌 非开仓窗口仅检查持仓: {', '.join(symbols)}")
         account_summary = self.account_data.get_account_summary()
         if not account_summary:
-            print("⚠️ 账户信息不可用，跳过本轮")
-            return
+            if ingestion_only:
+                print("⚠️ 账户信息不可用，采样模式继续")
+                account_summary = {}
+            else:
+                print("⚠️ 账户信息不可用，跳过本轮")
+                return
         risk_guard = self._refresh_account_risk_guard(account_summary)
         risk_guard_enabled = bool(risk_guard.get("enabled", True))
         if risk_guard.get("blocked"):
@@ -5217,7 +5628,9 @@ class TradingBot:
                 f"remaining={risk_guard.get('remaining_seconds')}s, "
                 f"reason={risk_guard.get('reason')}"
             )
-        if not allow_new_entries:
+        if ingestion_only:
+            print("⏱️ 采样模式：仅写入市场快照，不触发决策/执行")
+        elif not allow_new_entries:
             print("⏱️ 非开仓窗口：本轮仅评估平仓/持仓风控（跳过BUY/SELL/DCA）")
 
         return {
@@ -5241,6 +5654,7 @@ class TradingBot:
             "all_symbols": all_symbols,
             "position_snapshot": position_snapshot,
             "allow_new_entries": allow_new_entries,
+            "ingestion_only": bool(ingestion_only),
             "symbols": symbols,
             "account_summary": account_summary,
             "risk_guard_enabled": risk_guard_enabled,
@@ -5267,6 +5681,7 @@ class TradingBot:
         repair_fail_reduce_ratio = self._to_float(context.get("repair_fail_reduce_ratio"), 1.0)
         immediate_close_on_repair_fail = bool(context.get("immediate_close_on_repair_fail", False))
         allow_new_entries = bool(context.get("allow_new_entries", True))
+        ingestion_only = bool(context.get("ingestion_only", False))
         risk_guard_enabled = bool(context.get("risk_guard_enabled", True))
         account_summary_raw = context.get("account_summary")
         account_summary = account_summary_raw if isinstance(account_summary_raw, dict) else {}
@@ -5301,6 +5716,7 @@ class TradingBot:
             "repair_fail_reduce_ratio": repair_fail_reduce_ratio,
             "immediate_close_on_repair_fail": immediate_close_on_repair_fail,
             "allow_new_entries": allow_new_entries,
+            "ingestion_only": ingestion_only,
             "risk_guard_enabled": risk_guard_enabled,
             "account_summary": account_summary,
             "position_snapshot": position_snapshot,
@@ -5608,19 +6024,9 @@ class TradingBot:
         ai_review_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         for _ in (0,):
-            raw_flow_context = self._build_fund_flow_context(symbol, market_data)
-            flow_snapshot = self.fund_flow_ingestion_service.aggregate_from_metrics(symbol=symbol, metrics=raw_flow_context)
-            flow_context = self._apply_timeframe_context(raw_flow_context, flow_snapshot)
+            _, flow_snapshot, flow_context = self._materialize_flow_snapshot(symbol, market_data)
             volatility_guard = self._update_extreme_volatility_state(symbol, flow_context)
             conflict_symbol_cooldown = self._conflict_symbol_cooldown_state(symbol)
-            
-            self._safe_storage_call(
-                "upsert_market_flow",
-                exchange=flow_snapshot.exchange,
-                symbol=flow_snapshot.symbol,
-                timestamp=flow_snapshot.timestamp,
-                metrics=flow_snapshot.to_dict(),
-            )
             if position is None and bool(volatility_guard.get("blocked")):
                 print(
                     f"⏭️ {symbol} 极端波动冷却中，跳过新开仓: "
@@ -6691,6 +7097,7 @@ class TradingBot:
         repair_fail_reduce_ratio = self._to_float(symbol_ctx.get("repair_fail_reduce_ratio"), 1.0)
         immediate_close_on_repair_fail = bool(symbol_ctx.get("immediate_close_on_repair_fail", False))
         allow_new_entries = bool(symbol_ctx.get("allow_new_entries", True))
+        ingestion_only = bool(symbol_ctx.get("ingestion_only", False))
         risk_guard_enabled = bool(symbol_ctx.get("risk_guard_enabled", True))
         account_summary_raw = symbol_ctx.get("account_summary")
         account_summary = account_summary_raw if isinstance(account_summary_raw, dict) else {}
@@ -6715,6 +7122,9 @@ class TradingBot:
                     continue
 
                 position = position_snapshot.get(symbol)
+                if ingestion_only:
+                    self._materialize_flow_snapshot(symbol, market_data)
+                    continue
                 if position is None:
                     self._clear_sla_tracking_for_symbol(symbol)
                     self._clear_dca_tracking_for_symbol(symbol)
@@ -7063,6 +7473,14 @@ class TradingBot:
                             "   同时保留趋势补抓窗口: "
                             f"next_entry_window(UTC)≈{next_entry_fire.strftime('%Y-%m-%d %H:%M:%S')}"
                         )
+                    try:
+                        self.run_cycle(
+                            allow_new_entries=False,
+                            ai_review_mode="disabled",
+                            ingestion_only=True,
+                        )
+                    except Exception as e:
+                        print(f"❌ ingestion_only run_cycle 异常: {e}")
             else:
                 allow_new_entries = self._should_allow_entries_this_cycle(start)
                 flat_review_due = self._should_allow_aligned_cycle(
@@ -7093,6 +7511,14 @@ class TradingBot:
                         "⏭️ 当前无持仓，等待下一次 15m AI 开仓复核窗口。"
                         f" 下次开仓窗口(UTC)≈{next_fire.strftime('%Y-%m-%d %H:%M:%S')}"
                     )
+                    try:
+                        self.run_cycle(
+                            allow_new_entries=False,
+                            ai_review_mode="disabled",
+                            ingestion_only=True,
+                        )
+                    except Exception as e:
+                        print(f"❌ ingestion_only run_cycle 异常: {e}")
             cycles += 1
             schedule_cfg = self.config.get("schedule", {}) or {}
             interval_seconds = max(1, int(schedule_cfg.get("interval_seconds", 60) or 60))

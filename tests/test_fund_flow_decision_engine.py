@@ -789,6 +789,58 @@ def test_resolve_entry_mode_blocks_entry_when_feature_snapshot_is_all_zero():
     assert "feature_snapshot_all_zero" in resolved.metadata["entry_hard_filters"]
 
 
+def test_resolve_entry_mode_allows_primary_flat_ma10_fallback_when_feature_snapshot_is_all_zero():
+    cfg = _cfg()
+    cfg["fund_flow"]["long_open_threshold"] = 0.07
+    cfg["fund_flow"]["trend_capture"] = {
+        "min_score": 0.08,
+        "min_gap": 0.02,
+        "base_score_floor_mult": 0.85,
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    resolved = engine._resolve_entry_mode(
+        symbol="BTCUSDT",
+        regime_info={
+            "regime": "TREND",
+            "guide_direction": "LONG_ONLY",
+            "allow_entry_window": True,
+            "flow_confirm": 1.0,
+            "consistency_3bars": 2,
+            "cvd_norm": 0.35,
+            "combo_compare": {
+                "feature_snapshot": {
+                    "macd_hist_sign": 0,
+                    "macd_cross_sign": 0,
+                    "kdj_cross_sign": 0,
+                    "kdj_zone_sign": 0,
+                }
+            },
+            "lw": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
+            "ev": {"components": {"primary_flat": True, "backup_source": "ma10_macd_confluence_5m"}},
+        },
+        base_scores={"long_score": 0.12, "short_score": 0.0},
+        trend_pending={"trend_pending_side": "LONG", "trend_pending_score": 0.6},
+        trend_capture={
+            "trend_capture_score_long": 0.12,
+            "trend_capture_score_short": 0.0,
+            "trend_capture_breakout_long": True,
+            "trend_capture_pullback_resume_long": False,
+        },
+        confluence={
+            "confluence_soft_penalty_long": 0.0,
+            "confluence_soft_penalty_short": 0.0,
+            "confluence_hard_block_long": False,
+            "confluence_hard_block_short": False,
+        },
+        range_veto={},
+        cfg=engine._trend_capture_config(),
+    )
+    assert resolved.operation == Operation.BUY
+    assert resolved.metadata["entry_feature_snapshot_all_zero"] is True
+    assert resolved.metadata["entry_feature_snapshot_zero_soft_bypass"] is True
+    assert "feature_snapshot_all_zero" not in resolved.metadata["entry_hard_filters"]
+
+
 def test_resolve_entry_mode_blocks_long_when_pending_side_is_short():
     cfg = _cfg()
     cfg["fund_flow"]["long_open_threshold"] = 0.07

@@ -2785,7 +2785,23 @@ class FundFlowDecisionEngine:
         feature_snapshot_all_zero = bool(feature_snapshot_numeric) and all(
             abs(v) < 1e-12 for v in feature_snapshot_numeric
         )
-        cvd_components = regime_info.get("lw", {}).get("components", {}) if isinstance(regime_info.get("lw"), dict) else {}
+        lw_info = regime_info.get("lw", {}) if isinstance(regime_info.get("lw"), dict) else {}
+        ev_info = regime_info.get("ev", {}) if isinstance(regime_info.get("ev"), dict) else {}
+        lw_components = lw_info.get("components", {}) if isinstance(lw_info.get("components"), dict) else {}
+        ev_components = ev_info.get("components", {}) if isinstance(ev_info.get("components"), dict) else {}
+        primary_flat_fallback_active = bool(
+            lw_components.get("primary_flat", False)
+            and ev_components.get("primary_flat", False)
+            and "ma10_macd_confluence_5m"
+            in {
+                str(lw_components.get("backup_source", "")),
+                str(ev_components.get("backup_source", "")),
+            }
+        )
+        feature_snapshot_zero_soft_bypass = bool(
+            feature_snapshot_all_zero and primary_flat_fallback_active
+        )
+        cvd_components = lw_components
         cvd_norm = self._to_float(
             regime_info.get("cvd_norm"),
             self._to_float(cvd_components.get("cvd"), 0.0),
@@ -2957,7 +2973,7 @@ class FundFlowDecisionEngine:
         if operation in (Operation.BUY, Operation.SELL):
             if trend_only_mode and regime != "TREND":
                 entry_hard_filters.append("trend_only_mode_non_trend")
-            if feature_snapshot_all_zero:
+            if feature_snapshot_all_zero and not feature_snapshot_zero_soft_bypass:
                 entry_hard_filters.append("feature_snapshot_all_zero")
             if regime == "TREND":
                 if require_flow_confirm and flow_confirm < required_flow_confirm:
@@ -3025,6 +3041,8 @@ class FundFlowDecisionEngine:
                 "short_entry_confirm_3m_pass": bool(confirm_3m_short),
                 "short_entry_confirm_gate_pass": bool(short_confirm_pass),
                 "entry_feature_snapshot_all_zero": bool(feature_snapshot_all_zero),
+                "entry_feature_snapshot_zero_soft_bypass": bool(feature_snapshot_zero_soft_bypass),
+                "entry_primary_flat_fallback_active": bool(primary_flat_fallback_active),
                 "entry_feature_snapshot_values": dict(feature_snapshot),
                 "entry_cvd_norm": round(cvd_norm, 4),
                 "entry_flow_confirm": round(flow_confirm, 4),

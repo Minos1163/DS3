@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -15,12 +15,14 @@ class MarketStorage:
     - ai_decision_logs / program_execution_logs
     """
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, audit_log_retention_days: int = 7) -> None:
         self.db_path = db_path
+        self.audit_log_retention_days = max(1, int(audit_log_retention_days))
         parent = os.path.dirname(self.db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._init_schema()
+        self.run_housekeeping()
 
     def _connect(self) -> sqlite3.Connection:
         # 运行期间日志目录可能被外部轮转/清理，连接前再次确保目录存在。
@@ -118,6 +120,9 @@ class MarketStorage:
             exchange TEXT
         );
 
+        CREATE INDEX IF NOT EXISTS idx_ai_decision_logs_timestamp
+        ON ai_decision_logs(timestamp);
+
         CREATE TABLE IF NOT EXISTS program_execution_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
@@ -130,6 +135,9 @@ class MarketStorage:
             environment TEXT,
             exchange TEXT
         );
+
+        CREATE INDEX IF NOT EXISTS idx_program_execution_logs_timestamp
+        ON program_execution_logs(timestamp);
 
         CREATE TABLE IF NOT EXISTS signal_definitions (
             id TEXT PRIMARY KEY,
@@ -190,7 +198,34 @@ class MarketStorage:
 
     @staticmethod
     def _ts(value: Optional[datetime]) -> str:
-        return (value or datetime.utcnow()).isoformat()
+        return (value or datetime.now(timezone.utc).replace(tzinfo=None)).isoformat()
+
+    def _vacuum_if_needed(self) -> None:
+        conn = self._connect()
+        try:
+            freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            if int(freelist or 0) > 0:
+                conn.execute("VACUUM")
+        finally:
+            conn.close()
+
+    def run_housekeeping(self) -> Dict[str, int]:
+        cutoff = self._ts(
+            datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=self.audit_log_retention_days)
+        )
+        deleted = {"ai_decision_logs": 0, "program_execution_logs": 0, "weight_router_cache": 0}
+        with self._connect() as conn:
+            for table in ("ai_decision_logs", "program_execution_logs"):
+                cursor = conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+                deleted[table] = max(0, int(cursor.rowcount or 0))
+            cursor = conn.execute(
+                "DELETE FROM weight_router_cache WHERE expires_at < ?",
+                (self._ts(datetime.now(timezone.utc).replace(tzinfo=None)),),
+            )
+            deleted["weight_router_cache"] = max(0, int(cursor.rowcount or 0))
+        if any(deleted.values()):
+            self._vacuum_if_needed()
+        return deleted
 
     def upsert_kline(
         self,
@@ -817,10 +852,13 @@ class MarketStorage:
 
     def cleanup_weight_router_cache(self) -> int:
         """清理过期的权重缓存"""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         with self._connect() as conn:
             cursor = conn.execute(
                 "DELETE FROM weight_router_cache WHERE expires_at < ?",
                 (now.isoformat(),),
             )
-            return cursor.rowcount
+            deleted = max(0, int(cursor.rowcount or 0))
+        if deleted > 0:
+            self._vacuum_if_needed()
+        return deleted
