@@ -13,7 +13,7 @@ def _cfg():
                 "state_circuit_trap_hard": 0.9,
                 "state_circuit_trap_hard_bars": 2,
                 "state_circuit_cvd_norm": 0.92,
-                "state_circuit_cvd_guard_min": 2,
+                "state_circuit_cvd_guard_min": 3,
             }
         }
     }
@@ -113,7 +113,7 @@ def test_trap_hard_requires_consecutive_bars_before_circuit_exit():
     assert r2["level"] == "conflict_hard"
 
 
-def test_cvd_extreme_can_still_immediately_trigger_circuit_exit():
+def test_cvd_extreme_requires_deep_break_or_opposite_now_to_circuit_exit():
     rm = RiskManager(_cfg())
     kwargs = {
         "symbol": "ETHUSDT",
@@ -130,11 +130,37 @@ def test_cvd_extreme_can_still_immediately_trigger_circuit_exit():
         "bb_middle": 100.0,
         "bb_lower": 99.0,
         "close_price": 99.3,
+        "mtf_scores": {"1m": -1.0, "3m": -1.0, "5m": -1.0},
     }
 
     r1 = rm.check_position_protection(now_ts=30.0, **kwargs)
     assert r1["risk_state"] == "CIRCUIT_EXIT"
     assert r1["level"] == "conflict_hard"
+
+
+def test_cvd_extreme_without_deep_break_or_opposite_now_does_not_circuit_exit():
+    cfg = _cfg()
+    cfg["risk"]["conflict_protection"]["state_circuit_cvd_guard_min"] = 2
+    rm = RiskManager(cfg)
+    kwargs = {
+        "symbol": "ETHUSDT",
+        "position_side": "LONG",
+        "macd_hist_norm": -0.20,
+        "cvd_norm": -0.98,
+        "ev_direction": "BOTH",
+        "ev_score": 0.0,
+        "lw_direction": "BOTH",
+        "lw_score": 0.0,
+        "market_regime": "TREND",
+        "trap_score": 0.71,
+        "bb_upper": 101.0,
+        "bb_middle": 100.0,
+        "bb_lower": 99.0,
+        "close_price": 99.8,
+    }
+
+    r1 = rm.check_position_protection(now_ts=31.0, **kwargs)
+    assert r1["risk_state"] != "CIRCUIT_EXIT"
 
 
 def test_check_position_protection_exposes_ev_lw_opposite_flags():

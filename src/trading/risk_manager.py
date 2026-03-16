@@ -898,7 +898,12 @@ class RiskManager:
         circuit_by_trap = (trap_count >= circuit_trap_bars) or (
             trap_val >= circuit_trap_hard and trap_count >= circuit_trap_hard_bars
         )
-        circuit_by_cvd = bool(cvd_opp_extreme and (cvd_guard_votes >= circuit_cvd_guard_min))
+        circuit_cvd_structure_ok = bool(deep_break or opposite_now)
+        circuit_by_cvd = bool(
+            cvd_opp_extreme
+            and (cvd_guard_votes >= circuit_cvd_guard_min)
+            and circuit_cvd_structure_ok
+        )
         if circuit_by_trap or circuit_by_cvd:
             self._state_reverse_counters[key] = 0
             return {
@@ -918,7 +923,8 @@ class RiskManager:
                 "reason": (
                     f"熔断 trap={trap_val:.2f} cnt={trap_count}/{circuit_trap_bars} "
                     f"cvd={cvd_norm:+.2f} opp_extreme={int(cvd_opp_extreme)} "
-                    f"guard={cvd_guard_votes}/{circuit_cvd_guard_min} trap_hard={circuit_trap_hard:.2f}"
+                    f"guard={cvd_guard_votes}/{circuit_cvd_guard_min} "
+                    f"structure_ok={int(circuit_cvd_structure_ok)} trap_hard={circuit_trap_hard:.2f}"
                 ),
             }
 

@@ -2550,6 +2550,48 @@ class TradingBot:
             return max(0.0, (current_price - entry_price) / entry_price)
         return 0.0
 
+    def _soften_conflict_exit_for_small_mae(
+        self,
+        *,
+        protection: Dict[str, Any],
+        drawdown_ratio: float,
+        conflict_cfg_hard: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        risk_state = str(protection.get("risk_state", "HOLD")).upper()
+        reason = str(protection.get("reason", "") or "")
+        deep_break = bool(protection.get("state_deep_break", False))
+        min_mae_ratio = max(
+            0.0,
+            self._normalize_percent_to_ratio(conflict_cfg_hard.get("hard_exit_min_mae", 0.002), 0.002),
+        )
+        out = {
+            "risk_state": risk_state,
+            "reduce_pct": max(0.0, self._to_float(protection.get("reduce_position_pct", 0.0), 0.0)),
+            "force_break_even": bool(protection.get("force_break_even", False)),
+            "force_reduce_signal": False,
+            "reason": reason,
+            "softened": False,
+            "min_mae_ratio": min_mae_ratio,
+        }
+        if risk_state != "CIRCUIT_EXIT" or deep_break or drawdown_ratio >= min_mae_ratio:
+            return out
+        out.update(
+            {
+                "risk_state": "REDUCE",
+                "reduce_pct": max(
+                    0.05,
+                    min(1.0, self._to_float(conflict_cfg_hard.get("state_reduce_pct", 0.35), 0.35)),
+                ),
+                "force_break_even": True,
+                "force_reduce_signal": True,
+                "reason": (
+                    f"{reason} | soften_exit mae={drawdown_ratio:.4f}<{min_mae_ratio:.4f} deep_break=0"
+                ).strip(),
+                "softened": True,
+            }
+        )
+        return out
+
     def _apply_pretrade_risk_gate(
         self,
         *,
@@ -6604,7 +6646,6 @@ class TradingBot:
 
                     if protection_level == "conflict_hard":
                         # 重度冲突：减仓、保本止损、禁止加仓
-                        reduce_pct = float(protection.get("reduce_position_pct", 0.0))
                         k_open_hard = self._to_float(decision_md.get("last_open"), 0.0)
                         k_close_hard = self._to_float(decision_md.get("last_close"), 0.0)
                         price_change_hard = ((k_close_hard - k_open_hard) / k_open_hard) if k_open_hard > 0 else 0.0
@@ -6669,12 +6710,42 @@ class TradingBot:
                             self._normalize_percent_to_ratio(stop_loss_raw, 0.015),
                         )
                         max_stop_loss_hit = bool(max_stop_loss_ratio > 0 and drawdown_hard >= max_stop_loss_ratio)
+                        soften_hard_exit = self._soften_conflict_exit_for_small_mae(
+                            protection=protection,
+                            drawdown_ratio=drawdown_hard,
+                            conflict_cfg_hard=conflict_cfg_hard,
+                        )
+                        risk_state = str(soften_hard_exit.get("risk_state", risk_state)).upper()
+                        reduce_pct = float(
+                            soften_hard_exit.get("reduce_pct", protection.get("reduce_position_pct", 0.0))
+                        )
+                        force_break_even = bool(
+                            soften_hard_exit.get("force_break_even", protection.get("force_break_even", False))
+                        )
+                        force_reduce_signal = bool(soften_hard_exit.get("force_reduce_signal", False))
+                        protection_reason = str(
+                            soften_hard_exit.get("reason", protection.get("reason", "")) or ""
+                        )
+                        softened_circuit_exit = bool(soften_hard_exit.get("softened", False))
+                        if softened_circuit_exit:
+                            decision_md["risk_softened_exit"] = True
+                            decision_md["risk_softened_exit_mae_limit"] = float(
+                                soften_hard_exit.get("min_mae_ratio", 0.0)
+                            )
+                            print(
+                                f"🛡️ {symbol} CIRCUIT_EXIT降级为REDUCE: "
+                                f"drawdown={drawdown_hard:.4f}/"
+                                f"{float(soften_hard_exit.get('min_mae_ratio', 0.0)):.4f}, "
+                                f"deep_break=0, reduce_pos={reduce_pct:.0%}"
+                            )
                         if current_side == "LONG":
                             reduce_price_confirmed = price_change_hard <= (-1.0 * hard_price_change_min)
                         else:
                             reduce_price_confirmed = price_change_hard >= hard_price_change_min
                         required_hold_seconds = hard_exit_min_hold_seconds
-                        base_reduce_signal = bool(reduce_price_confirmed or drawdown_hard >= hard_drawdown_override)
+                        base_reduce_signal = bool(
+                            force_reduce_signal or reduce_price_confirmed or drawdown_hard >= hard_drawdown_override
+                        )
                         new_pos_buffer_tag = ""
                         # EXIT/CIRCUIT_EXIT 归类为强反向信号，但未到最大止损前仍需满足最短持仓+3分钟评估节流。
                         if risk_state in ("EXIT", "CIRCUIT_EXIT"):
@@ -6714,13 +6785,13 @@ class TradingBot:
                                 + new_pos_buffer_tag
                             )
                         print(
-                            f"🛡️ {symbol} 冲突保护 HARD: {protection.get('reason')} | "
+                            f"🛡️ {symbol} 冲突保护 HARD: {protection_reason} | "
                             f"freeze_add reduce_pos={reduce_pct:.0%} force_break_even cd={'Y' if cooldown_active else 'N'} "
                             f"reduce_confirmed={int(reduce_confirmed)} max_sl_hit={int(max_stop_loss_hit)} "
                             f"eval_int={directional_eval_interval_seconds}s min_hold={required_hold_seconds}s"
                         )
                         # 收紧止损（保本止损）
-                        if bool(protection.get("force_break_even", False)):
+                        if force_break_even:
                             try:
                                 # stats: attempt
                                 self.risk_manager.record_protection_action(symbol, current_side, "breakeven", "attempt", level=protection_level)
@@ -6757,7 +6828,7 @@ class TradingBot:
                                 symbol=symbol,
                                 target_portion_of_balance=reduce_pct,
                                 leverage=decision.leverage,
-                                reason=f"RISK_PROTECT: {protection.get('reason')}",
+                                reason=f"RISK_PROTECT: {protection_reason}",
                                 metadata=decision_md,
                             )
                             # 执行减仓
