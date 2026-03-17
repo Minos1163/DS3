@@ -787,43 +787,10 @@ class TradingBot:
             f"close_gtc={bool(deg_cfg.get('close_gtc_fallback_enabled', True))}, "
             f"close_mkt={bool(deg_cfg.get('close_market_fallback_enabled', False))}"
         )
-        try:
-            guide_snapshot = self.fund_flow_decision_engine.get_direction_guide_snapshot()
-        except Exception:
-            guide_snapshot = {}
-        if isinstance(guide_snapshot, dict) and guide_snapshot:
-            guide_model_key = str(guide_snapshot.get("model", "")).upper()
-            print(
-                "🧭 方向指导: "
-                f"enabled={bool(guide_snapshot.get('enabled', True))}, "
-                f"model={guide_snapshot.get('model_label', guide_snapshot.get('model', '-'))}, "
-                f"neutral_zone={self._to_float(guide_snapshot.get('neutral_zone'), 0.02):.3f}, "
-                f"squeeze_penalty={self._to_float(guide_snapshot.get('bb_squeeze_penalty'), 0.72):.2f}"
-            )
-            if guide_model_key == "MACD_KDJ":
-                w_kdj = guide_snapshot.get("macd_kdj_weights", {})
-                if isinstance(w_kdj, dict) and w_kdj:
-                    print(
-                        "   MACD+KDJ权重: "
-                        f"macd={self._to_float(w_kdj.get('macd'), 0.0):.2f}, "
-                        f"kdj={self._to_float(w_kdj.get('kdj'), 0.0):.2f}, "
-                        f"cross={self._to_float(w_kdj.get('macd_cross'), 0.0):.2f}, "
-                        f"kdj_cross={self._to_float(w_kdj.get('kdj_cross'), 0.0):.2f}, "
-                        f"kdj_zone={self._to_float(w_kdj.get('kdj_zone'), 0.0):.2f}, "
-                        f"hist_mom={self._to_float(w_kdj.get('macd_hist_mom'), 0.0):.2f}"
-                    )
-            else:
-                w_bb = guide_snapshot.get("macd_bb_weights", {})
-                if isinstance(w_bb, dict) and w_bb:
-                    print(
-                        "   MACD+BB权重: "
-                        f"macd={self._to_float(w_bb.get('macd'), 0.0):.2f}, "
-                        f"bb={self._to_float(w_bb.get('bb'), 0.0):.2f}, "
-                        f"macd_cross={self._to_float(w_bb.get('macd_cross'), 0.0):.2f}, "
-                        f"bb_break={self._to_float(w_bb.get('bb_break'), 0.0):.2f}, "
-                        f"bb_trend={self._to_float(w_bb.get('bb_trend'), 0.0):.2f}, "
-                        f"hist_mom={self._to_float(w_bb.get('macd_hist_mom'), 0.0):.2f}"
-                    )
+        print(
+            "🧭 开仓框架: "
+            "1H EMA30定方向, 15M EMA10/EMA30 + MACD/布林共振, 动态止盈止损"
+        )
         print("=" * 66)
 
     def _position_snapshot_by_symbol(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -3688,16 +3655,23 @@ class TradingBot:
 
     def _startup_market_preload_config(self) -> Dict[str, Any]:
         startup_cfg = self.config.get("startup", {}) if isinstance(self.config.get("startup"), dict) else {}
+        ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config.get("fund_flow"), dict) else {}
         enabled = self._to_bool(startup_cfg.get("preload_market_data_enabled"), True)
-        lookback_minutes = int(self._to_float(startup_cfg.get("preload_market_lookback_minutes"), 120))
-        lookback_minutes = max(60, min(120, lookback_minutes))
-        kline_interval = str(startup_cfg.get("preload_market_kline_interval", "5m") or "5m").strip().lower()
+        decision_tf = str(ff_cfg.get("decision_timeframe") or ff_cfg.get("signal_timeframe") or "15m").strip().lower()
+        default_kline_interval = decision_tf if decision_tf in ("1m", "3m", "5m", "15m") else "15m"
+        kline_interval = str(startup_cfg.get("preload_market_kline_interval", default_kline_interval) or default_kline_interval).strip().lower()
         if kline_interval not in ("1m", "3m", "5m", "15m"):
-            kline_interval = "5m"
+            kline_interval = default_kline_interval
+        interval_minutes = max(1, self._interval_minutes(kline_interval))
+        default_preload_bars = 80 if kline_interval == "15m" else 120
+        preload_bars = int(self._to_float(startup_cfg.get("preload_market_kline_bars"), default_preload_bars))
+        preload_bars = max(50, min(200, preload_bars))
+        lookback_minutes = int(self._to_float(startup_cfg.get("preload_market_lookback_minutes"), preload_bars * interval_minutes))
+        lookback_minutes = max(preload_bars * interval_minutes, min(2400, lookback_minutes))
         oi_period = str(startup_cfg.get("preload_open_interest_period", kline_interval) or kline_interval).strip().lower()
         if oi_period not in ("5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"):
-            oi_period = "5m"
-        regime_cfg = self.config.get("fund_flow", {}).get("regime", {}) if isinstance(self.config.get("fund_flow", {}).get("regime"), dict) else {}
+            oi_period = "15m" if kline_interval == "15m" else "5m"
+        regime_cfg = ff_cfg.get("regime", {}) if isinstance(ff_cfg.get("regime"), dict) else {}
         regime_timeframe = str(regime_cfg.get("timeframe", "15m") or "15m").strip().lower()
         if regime_timeframe not in ("15m", "30m", "1h", "2h", "4h"):
             regime_timeframe = "15m"
@@ -3708,6 +3682,7 @@ class TradingBot:
         return {
             "enabled": enabled,
             "lookback_minutes": lookback_minutes,
+            "preload_bars": preload_bars,
             "kline_interval": kline_interval,
             "oi_period": oi_period,
             "regime_timeframe": regime_timeframe,
@@ -3804,18 +3779,19 @@ class TradingBot:
             return
 
         lookback_minutes = int(cfg["lookback_minutes"])
+        preload_bars = int(cfg.get("preload_bars", 80))
         kline_interval = str(cfg["kline_interval"])
         oi_period = str(cfg["oi_period"])
         regime_timeframe = str(cfg["regime_timeframe"])
         trend_limit = int(cfg["trend_limit"])
         request_sleep_ms = int(cfg["request_sleep_ms"])
         interval_minutes = max(1, self._interval_minutes(kline_interval))
-        kline_limit = max(16, int(math.ceil(lookback_minutes / interval_minutes)) + 3)
-        oi_limit = max(16, min(kline_limit + 2, 500))
+        kline_limit = max(preload_bars + 1, int(math.ceil(lookback_minutes / interval_minutes)) + 3)
+        oi_limit = max(16, min(max(kline_limit + 2, preload_bars + 4), 500))
 
         print(
             "📥 启动预载市场数据: "
-            f"symbols={len(symbols)}, lookback={lookback_minutes}m, "
+            f"symbols={len(symbols)}, bars={preload_bars}, lookback={lookback_minutes}m, "
             f"interval={kline_interval}, oi_period={oi_period}"
         )
 
@@ -3943,10 +3919,23 @@ class TradingBot:
             if tf_key not in timeframes:
                 timeframes[tf_key] = {}
             if isinstance(timeframes[tf_key], dict):
-                # 注入完整趋势指标快照，避免 15m 主判链路只拿到基础趋势字段。
                 for k, v in trend_filter.items():
                     if v is not None:
                         timeframes[tf_key][k] = v
+            out["timeframes"] = timeframes
+
+        trend_filters_by_timeframe = out.pop("trend_filters_by_timeframe", None)
+        if isinstance(trend_filters_by_timeframe, dict):
+            for tf_key_raw, tf_snapshot in trend_filters_by_timeframe.items():
+                tf_key = str(tf_key_raw or "").strip().lower()
+                if not tf_key or not isinstance(tf_snapshot, dict) or not tf_snapshot:
+                    continue
+                if tf_key not in timeframes:
+                    timeframes[tf_key] = {}
+                if isinstance(timeframes[tf_key], dict):
+                    for k, v in tf_snapshot.items():
+                        if v is not None:
+                            timeframes[tf_key][k] = v
             out["timeframes"] = timeframes
 
         ff_cfg = self.config.get("fund_flow", {}) or {}
@@ -4103,23 +4092,45 @@ class TradingBot:
 
     def get_market_data_for_symbol(self, symbol: str) -> Dict[str, Any]:
         realtime = self.market_data.get_realtime_market_data(symbol) or {}
-        # 从配置获取 regime timeframe，动态获取对应的 trend filter 数据
         ff_cfg = self.config.get("fund_flow", {}) or {}
         regime_cfg = ff_cfg.get("regime", {}) if isinstance(ff_cfg.get("regime"), dict) else {}
+        rule_cfg = ff_cfg.get("rule_strategy", {}) if isinstance(ff_cfg.get("rule_strategy"), dict) else {}
+
         regime_timeframe = str(regime_cfg.get("timeframe", "15m") or "15m").strip().lower()
-        trend_filter = self.market_data.get_trend_filter_metrics(symbol, interval=regime_timeframe, limit=120) or {}
+        primary_timeframe = str(rule_cfg.get("primary_trend_timeframe", regime_timeframe or "1h") or regime_timeframe or "1h").strip().lower()
+        entry_timeframe = str(rule_cfg.get("entry_timeframe", ff_cfg.get("decision_timeframe") or "15m") or "15m").strip().lower()
+        trend_limit = max(60, int(self._to_float(rule_cfg.get("trend_limit", 120), 120)))
+        entry_limit = max(60, int(self._to_float(rule_cfg.get("entry_limit", 120), 120)))
+
+        trend_filters_by_timeframe: Dict[str, Dict[str, Any]] = {}
+        for timeframe, limit in ((primary_timeframe, trend_limit), (entry_timeframe, entry_limit), (regime_timeframe, trend_limit)):
+            if timeframe in trend_filters_by_timeframe:
+                continue
+            tf_metrics = self.market_data.get_trend_filter_metrics(symbol, interval=timeframe, limit=limit) or {}
+            if tf_metrics:
+                trend_filters_by_timeframe[timeframe] = tf_metrics
+
+        trend_filter = trend_filters_by_timeframe.get(primary_timeframe, {})
         if not trend_filter:
             trend_filter = dict(self._startup_trend_filter_cache.get(symbol.upper(), {}))
+            if trend_filter:
+                trend_filters_by_timeframe.setdefault(primary_timeframe, dict(trend_filter))
+
         exec_quality_cfg = self._execution_quality_1m_config()
         exec_timeframe = str(exec_quality_cfg.get("timeframe", "1m") or "1m").strip().lower()
-        trend_filter_1m = trend_filter if exec_timeframe == regime_timeframe else (
-            self.market_data.get_trend_filter_metrics(
-                symbol,
-                interval=exec_timeframe,
-                limit=max(20, int(exec_quality_cfg.get("trend_limit", 60))),
+        trend_filter_1m = trend_filters_by_timeframe.get(exec_timeframe, {}) if exec_timeframe in trend_filters_by_timeframe else (
+            trend_filter if exec_timeframe == primary_timeframe else (
+                self.market_data.get_trend_filter_metrics(
+                    symbol,
+                    interval=exec_timeframe,
+                    limit=max(20, int(exec_quality_cfg.get("trend_limit", 60))),
+                )
+                or {}
             )
-            or {}
         )
+        if trend_filter_1m:
+            trend_filters_by_timeframe.setdefault(exec_timeframe, dict(trend_filter_1m))
+
         order_flow_1m = self.market_data.get_order_flow_snapshot(
             symbol,
             interval=exec_timeframe,
@@ -4131,8 +4142,9 @@ class TradingBot:
         return {
             "realtime": realtime,
             "trend_filter": trend_filter,
-            "trend_filter_timeframe": regime_timeframe,
+            "trend_filter_timeframe": primary_timeframe,
             "trend_filter_1m": trend_filter_1m,
+            "trend_filters_by_timeframe": trend_filters_by_timeframe,
             "order_flow_1m": order_flow_1m,
             "execution_quality_timeframe": exec_timeframe,
         }
@@ -4142,6 +4154,7 @@ class TradingBot:
         # 使用动态的 trend_filter 数据
         trend_filter = market_data.get("trend_filter", {}) if isinstance(market_data, dict) else {}
         trend_filter_timeframe = market_data.get("trend_filter_timeframe", "15m") if isinstance(market_data, dict) else "15m"
+        trend_filters_by_timeframe = market_data.get("trend_filters_by_timeframe", {}) if isinstance(market_data, dict) else {}
         execution_quality_1m = self._build_execution_quality_1m(market_data if isinstance(market_data, dict) else {})
         change_15m = self._to_float(realtime.get("change_15m"), 0.0) / 100.0
         change_24h = self._to_float(realtime.get("change_24h"), 0.0) / 100.0
@@ -4193,6 +4206,7 @@ class TradingBot:
             "ob_total_notional": ob_total_notional,
             "trend_filter": trend_filter if isinstance(trend_filter, dict) else {},
             "trend_filter_timeframe": trend_filter_timeframe,
+            "trend_filters_by_timeframe": trend_filters_by_timeframe if isinstance(trend_filters_by_timeframe, dict) else {},
             "execution_quality_1m": execution_quality_1m,
             "execution_quality_timeframe": market_data.get("execution_quality_timeframe", "1m")
             if isinstance(market_data, dict)
@@ -4834,8 +4848,119 @@ class TradingBot:
 
         return {"status": "error", "message": " | ".join(errors)[:1200]}
 
-    def _decision_signal_score(self, decision: Any) -> float:
+    def _rule_candidate_timeframe_context(
+        self,
+        flow_context: Optional[Dict[str, Any]],
+        md: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not isinstance(flow_context, dict):
+            return {}
+        timeframes = flow_context.get("timeframes")
+        if not isinstance(timeframes, dict):
+            return {}
+        wanted = []
+        entry_tf = str(md.get("entry_timeframe") or "").strip().lower()
+        active_tf = str(flow_context.get("active_timeframe") or "").strip().lower()
+        for tf in (entry_tf, "15m", active_tf):
+            if tf and tf not in wanted:
+                wanted.append(tf)
+        for tf in wanted:
+            tf_ctx = timeframes.get(tf)
+            if isinstance(tf_ctx, dict):
+                return tf_ctx
+        return {}
+
+    def _decision_kline_context(
+        self,
+        flow_context: Optional[Dict[str, Any]],
+        md: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        tf_ctx = self._rule_candidate_timeframe_context(flow_context, md)
+        if tf_ctx:
+            tf_used = str(md.get("entry_timeframe") or "").strip().lower() or "15m"
+            return tf_used, tf_ctx
+        ctx = flow_context if isinstance(flow_context, dict) else {}
+        timeframes = ctx.get("timeframes") if isinstance(ctx.get("timeframes"), dict) else {}
+        candidates = []
+        ff_cfg = self.config.get("fund_flow", {}) or {}
+        for tf in (
+            str(md.get("entry_timeframe") or "").strip().lower(),
+            str(ctx.get("active_timeframe") or "").strip().lower(),
+            str(ff_cfg.get("decision_timeframe") or ff_cfg.get("signal_timeframe") or "").strip().lower(),
+            "15m",
+        ):
+            if tf and tf not in candidates:
+                candidates.append(tf)
+        for tf in candidates:
+            tf_ctx = timeframes.get(tf)
+            if isinstance(tf_ctx, dict):
+                return tf, tf_ctx
+        return str(ctx.get("active_timeframe") or md.get("entry_timeframe") or "unknown"), {}
+
+    def _decision_signal_score(self, decision: Any, flow_context: Optional[Dict[str, Any]] = None) -> float:
         md = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
+        strategy_mode = str(md.get("strategy_mode") or "").strip().lower()
+        entry_logic = str(md.get("entry_logic") or "").strip().lower()
+        is_rule_mode = (
+            strategy_mode == "ema10_ema30_1h_15m_rule"
+            or "1h_ema30_direction" in entry_logic
+        )
+        if is_rule_mode and decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+            side = "LONG" if decision.operation == FundFlowOperation.BUY else "SHORT"
+            model_key = "entry_long_models" if side == "LONG" else "entry_short_models"
+            model_set = {str(item).upper() for item in (md.get(model_key) or []) if str(item).strip()}
+            model_count = len(model_set)
+            tf_ctx = self._rule_candidate_timeframe_context(flow_context, md)
+
+            model_score = 0.0
+            if model_count >= 2:
+                model_score = 200.0
+            elif model_count == 1:
+                model_score = 100.0
+
+            slope_pct = self._to_float(md.get("trend_ema30_slope_pct"), 0.0)
+            aligned_slope = max(slope_pct, 0.0) if side == "LONG" else max(-slope_pct, 0.0)
+            slope_score = min(1.0, aligned_slope / 0.0015) * 35.0
+
+            macd_hist = abs(self._to_float(md.get("entry_macd_hist"), 0.0))
+            macd_hist_delta = self._to_float(tf_ctx.get("macd_hist_delta"), 0.0)
+            aligned_hist_delta = max(macd_hist_delta, 0.0) if side == "LONG" else max(-macd_hist_delta, 0.0)
+            hist_expand = bool(
+                md.get("entry_macd_hist_expand_up", False) if side == "LONG"
+                else md.get("entry_macd_hist_expand_down", False)
+            )
+            macd_score = (
+                min(1.0, macd_hist / 0.0030) * 12.0
+                + (10.0 if hist_expand else 0.0)
+                + min(1.0, aligned_hist_delta / 0.0015) * 8.0
+            )
+
+            bb_break = str(md.get("entry_bb_break") or "NONE").upper()
+            bb_width_expand = bool(md.get("entry_bb_width_expand", False))
+            bb_width_norm = abs(self._to_float(tf_ctx.get("bb_width_norm"), self._to_float(md.get("bb_width_norm"), 0.0)))
+            bb_break_align = (side == "LONG" and bb_break == "UPPER") or (side == "SHORT" and bb_break == "LOWER")
+            bb_score = (
+                (6.0 if bb_break_align else 0.0)
+                + (8.0 if bb_width_expand else 0.0)
+                + min(1.0, bb_width_norm / 1.2) * 12.0
+            )
+
+            risk_plan = md.get("risk_plan") if isinstance(md.get("risk_plan"), dict) else {}
+            effective_stop_pct = self._to_float(risk_plan.get("effective_stop_pct"), 0.0)
+            raw_stop_pct = self._to_float(risk_plan.get("raw_stop_pct"), 0.0)
+            ff_cfg = self.config.get("fund_flow", {}) or {}
+            rule_cfg = ff_cfg.get("rule_strategy", {}) if isinstance(ff_cfg.get("rule_strategy"), dict) else {}
+            min_stop_pct = max(0.0001, self._to_float(rule_cfg.get("min_stop_pct", 0.01), 0.01))
+            max_stop_pct = max(min_stop_pct, self._to_float(rule_cfg.get("max_stop_pct", 0.025), 0.025))
+            ideal_stop_pct = (min_stop_pct + max_stop_pct) / 2.0
+            stop_span = max(0.0025, max_stop_pct - min_stop_pct)
+            stop_center_quality = max(0.0, 1.0 - abs(effective_stop_pct - ideal_stop_pct) / stop_span) if effective_stop_pct > 0 else 0.0
+            stop_structure_quality = max(0.0, 1.0 - abs(effective_stop_pct - raw_stop_pct) / stop_span) if raw_stop_pct > 0 and effective_stop_pct > 0 else 0.0
+            risk_score = (0.75 * stop_center_quality + 0.25 * stop_structure_quality) * 15.0
+
+            total = model_score + slope_score + macd_score + bb_score + risk_score
+            return round(total, 6)
+
         long_score = self._to_float(md.get("long_score"), 0.0)
         short_score = self._to_float(md.get("short_score"), 0.0)
         return max(long_score, short_score)
@@ -5165,180 +5290,32 @@ class TradingBot:
             )
             if pre_key and abs(post_amt) <= 0:
                 self._position_extrema_by_pos.pop(pre_key, None)
-        print(
-            f"   信号评分: long={long_score:.3f}, short={short_score:.3f} | "
-            f"触发类型={trigger_type}"
-        )
-        score_15m_raw = md.get("score_15m")
-        score_5m_raw = md.get("score_5m")
-        final_score_raw = md.get("final_score")
-        score_15m_md: Dict[str, Any] = score_15m_raw if isinstance(score_15m_raw, dict) else {}
-        score_5m_md: Dict[str, Any] = score_5m_raw if isinstance(score_5m_raw, dict) else {}
-        final_score_md: Dict[str, Any] = final_score_raw if isinstance(final_score_raw, dict) else {}
-        ds_confidence = self._to_float(md.get("ds_confidence"), 0.0)
+        entry_logic = str(md.get("entry_logic") or md.get("strategy_mode") or "-")
+        entry_ema_cross = str(md.get("entry_ema_cross") or "NONE")
+        entry_macd_cross = str(md.get("entry_macd_cross") or "NONE")
+        entry_macd_zone = str(md.get("entry_macd_zone") or "NEAR_ZERO")
+        entry_bb_break = str(md.get("entry_bb_break") or "NONE")
+        entry_bb_expand = bool(md.get("entry_bb_width_expand", False))
+        entry_model_key = "entry_long_models" if decision.operation == FundFlowOperation.BUY else "entry_short_models"
+        entry_models_raw = md.get(entry_model_key)
+        entry_models = [str(item) for item in entry_models_raw] if isinstance(entry_models_raw, list) else []
 
-        # 获取 EV 和 LW 方向判断结果
-        ev_direction = md.get("ev_direction", "BOTH")
-        ev_score = self._to_float(md.get("ev_score"), 0.0)
-        lw_direction = md.get("lw_direction", "BOTH")
-        lw_score = self._to_float(md.get("lw_score"), 0.0)
-        combo_compare_raw = md.get("combo_compare")
-        combo_compare: Dict[str, Any] = combo_compare_raw if isinstance(combo_compare_raw, dict) else {}
-        lw_components = md.get("lw_components", {})
-        final_dir_info = md.get("final", {})
-        need_confirm = final_dir_info.get("need_confirm", False) if isinstance(final_dir_info, dict) else False
-
-        print(
-            "   3.0评分: "
-            f"score_15m(L/S)={self._to_float(score_15m_md.get('long_score'), 0.0):.3f}/{self._to_float(score_15m_md.get('short_score'), 0.0):.3f}, "
-            f"score_5m(L/S)={self._to_float(score_5m_md.get('long_score'), 0.0):.3f}/{self._to_float(score_5m_md.get('short_score'), 0.0):.3f}, "
-            f"final_score(L/S)={self._to_float(final_score_md.get('long_score'), 0.0):.3f}/{self._to_float(final_score_md.get('short_score'), 0.0):.3f}, "
-            f"direction_lock={direction_lock or '-'}, "
-            f"ds_confidence={ds_confidence:.3f}"
-        )
-        # 显示详细的方向判断信息
-        def _fmt_lw_component(v: Any) -> str:
-            if isinstance(v, bool):
-                return "1" if v else "0"
-            if isinstance(v, (int, float)):
-                return f"{float(v):+.2f}"
-            if isinstance(v, dict):
-                return "{...}"
-            if isinstance(v, (list, tuple)):
-                return "[...]"
-            return str(v)
-
-        comp_str = ",".join([f"{k}:{_fmt_lw_component(v)}" for k, v in lw_components.items()]) if lw_components else "-"
-        div = abs(lw_score - ev_score)
-        agree = (lw_direction == ev_direction) or (lw_direction == "BOTH" or ev_direction == "BOTH")
-        confirm_tag = "⚠️需确认" if need_confirm else ""
-        
-        # K线 open/close 价格
-        kline_open = self._to_float(md.get("last_open"), 0.0)
-        kline_close = self._to_float(md.get("last_close"), 0.0)
-        # 始终显示 K线价格，即使为 0（方便调试）
+        tf_used, kline_tf_ctx = self._decision_kline_context(flow_context, md)
+        kline_open = self._to_float(md.get("last_open"), self._to_float(kline_tf_ctx.get("last_open"), 0.0))
+        kline_close = self._to_float(md.get("last_close"), self._to_float(kline_tf_ctx.get("last_close"), 0.0))
         if kline_open > 0 or kline_close > 0:
             kline_change_pct = (kline_close - kline_open) / kline_open * 100 if kline_open > 0 else 0.0
-            print(f"   K线价格: open={kline_open:.4f} | close={kline_close:.4f} | change={kline_change_pct:+.2f}%")
+            print(f"   K线价格({tf_used}): open={kline_open:.4f} | close={kline_close:.4f} | change={kline_change_pct:+.2f}%")
         else:
-            # 调试：显示为什么没有 K线数据
-            tf_used = md.get("active_timeframe", "unknown")
             print(f"   K线价格: 未获取到 (tf={tf_used}, open={kline_open}, close={kline_close})")
-        
+
         print(
-            f"   方向判断: dir_lw={lw_direction[:4]}({lw_score:+.2f}) | dir_ev={ev_direction[:4]}({ev_score:+.2f}) | "
-            f"agree={1 if agree else 0} div={div:.2f} conf={abs(lw_score):.2f} {confirm_tag}"
+            "   规则上下文: "
+            f"trigger={trigger_type}, logic={entry_logic}, lock={direction_lock or '-'}, "
+            f"ema_cross={entry_ema_cross}, macd={entry_macd_cross}/{entry_macd_zone}, "
+            f"bb_break={entry_bb_break}, bb_expand={1 if entry_bb_expand else 0}, "
+            f"models={'+'.join(entry_models) if entry_models else '-'}"
         )
-        if combo_compare:
-            # 兼容新旧结构：
-            # 新版：active_model/lw_winner/ev_winner/lw_combo_score/ev_combo_score/winner
-            # 旧版：active_dir/active_score/legacy_dir/legacy_score/agility_new/agility_old/flow_align_new/flow_align_old
-            active_model = str(combo_compare.get("active_model", "MACD+KDJ"))
-            lw_winner = str(combo_compare.get("lw_winner", "-"))
-            ev_winner = str(combo_compare.get("ev_winner", "-"))
-            lw_combo_score = self._to_float(combo_compare.get("lw_combo_score"), 0.0)
-            ev_combo_score = self._to_float(combo_compare.get("ev_combo_score"), 0.0)
-            has_new_combo = ("lw_winner" in combo_compare) or ("ev_winner" in combo_compare)
-            print(
-                "   方向对照: "
-                f"active_model={active_model} | "
-                + (
-                    f"LW={lw_winner}({lw_combo_score:+.2f}) | EV={ev_winner}({ev_combo_score:+.2f}) | "
-                    if has_new_combo
-                    else
-                    f"MACD+KDJ={str(combo_compare.get('active_dir', ev_direction))[:4]}({self._to_float(combo_compare.get('active_score'), ev_score):+.2f}) | "
-                    f"MACD+BB={str(combo_compare.get('legacy_dir', 'BOTH'))[:4]}({self._to_float(combo_compare.get('legacy_score'), 0.0):+.2f}) | "
-                    f"agile={self._to_float(combo_compare.get('agility_new'), abs(ev_score)):.2f}/{self._to_float(combo_compare.get('agility_old'), 0.0):.2f} | "
-                    f"flow_align={int(self._to_int(combo_compare.get('flow_align_new'), 0))}/{int(self._to_int(combo_compare.get('flow_align_old'), 0))} | "
-                )
-                + f"winner={combo_compare.get('winner', '-')}"
-            )
-            guide_model = str(combo_compare.get("direction_guide_model_label", active_model))
-            guide_dir = str(combo_compare.get("guide_dir", combo_compare.get("active_dir", ev_direction)))
-            guide_score = self._to_float(combo_compare.get("guide_score"), self._to_float(combo_compare.get("active_score"), ev_score))
-            guide_neutral_zone = self._to_float(combo_compare.get("guide_neutral_zone"), 0.02)
-            guide_score_source = str(combo_compare.get("guide_score_source", "-"))
-            trigger_score_source = str(md.get("trigger_score_source", "-"))
-            print(
-                "   开仓指导: "
-                f"model={guide_model}, dir={guide_dir[:8]}, score={guide_score:+.3f}, "
-                f"neutral_zone={guide_neutral_zone:.3f}, "
-                f"guide_score_source={guide_score_source}, "
-                f"trigger_score_source={trigger_score_source}"
-            )
-            guide_model_key = str(combo_compare.get("direction_guide_model", "")).upper()
-            is_kdj_guide = guide_model_key == "MACD_KDJ" or "KDJ" in guide_model.upper()
-            kdj_weights_raw = combo_compare.get("macd_kdj_weights", {})
-            kdj_weights = kdj_weights_raw if isinstance(kdj_weights_raw, dict) else {}
-            bb_weights_raw = combo_compare.get("macd_bb_weights", {})
-            bb_weights = bb_weights_raw if isinstance(bb_weights_raw, dict) else {}
-            if is_kdj_guide and kdj_weights:
-                print(
-                    "   MACD+KDJ设置: "
-                    f"macd={self._to_float(kdj_weights.get('macd'), 0.0):.2f}, "
-                    f"kdj={self._to_float(kdj_weights.get('kdj'), 0.0):.2f}, "
-                    f"cross={self._to_float(kdj_weights.get('macd_cross'), 0.0):.2f}, "
-                    f"kdj_cross={self._to_float(kdj_weights.get('kdj_cross'), 0.0):.2f}, "
-                    f"kdj_zone={self._to_float(kdj_weights.get('kdj_zone'), 0.0):.2f}, "
-                    f"hist_mom={self._to_float(kdj_weights.get('macd_hist_mom'), 0.0):.2f}"
-                )
-            elif bb_weights:
-                print(
-                    "   MACD+BB设置: "
-                    f"macd={self._to_float(bb_weights.get('macd'), 0.0):.2f}, "
-                    f"bb={self._to_float(bb_weights.get('bb'), 0.0):.2f}, "
-                    f"cross={self._to_float(bb_weights.get('macd_cross'), 0.0):.2f}, "
-                    f"bb_break={self._to_float(bb_weights.get('bb_break'), 0.0):.2f}, "
-                    f"bb_trend={self._to_float(bb_weights.get('bb_trend'), 0.0):.2f}, "
-                    f"hist_mom={self._to_float(bb_weights.get('macd_hist_mom'), 0.0):.2f}"
-                )
-            feature_raw = combo_compare.get("feature_snapshot", {})
-            feature = feature_raw if isinstance(feature_raw, dict) else {}
-            if feature:
-                if is_kdj_guide:
-                    print(
-                        "   MACD+KDJ因子: "
-                        f"macd={self._to_float(feature.get('macd'), 0.0):+.3f}, "
-                        f"kdj={self._to_float(feature.get('kdj'), 0.0):+.3f}, "
-                        f"macd_cross={self._to_float(feature.get('macd_cross'), 0.0):+.3f}, "
-                        f"kdj_cross={self._to_float(feature.get('kdj_cross'), 0.0):+.3f}, "
-                        f"kdj_zone={self._to_float(feature.get('kdj_zone'), 0.0):+.3f}, "
-                        f"hist_mom={self._to_float(feature.get('macd_hist_mom'), 0.0):+.3f}"
-                    )
-                else:
-                    print(
-                        "   MACD+BB因子: "
-                        f"macd={self._to_float(feature.get('macd'), 0.0):+.3f}, "
-                        f"bb={self._to_float(feature.get('bb'), 0.0):+.3f}, "
-                        f"macd_cross={self._to_float(feature.get('macd_cross'), 0.0):+.3f}, "
-                        f"bb_break={self._to_float(feature.get('bb_break'), 0.0):+.3f}, "
-                        f"bb_trend={self._to_float(feature.get('bb_trend'), 0.0):+.3f}, "
-                        f"hist_mom={self._to_float(feature.get('macd_hist_mom'), 0.0):+.3f}, "
-                        f"bb_squeeze={self._to_float(feature.get('bb_squeeze'), 0.0):.0f}"
-                    )
-            settings_raw = combo_compare.get("settings", {})
-            settings = settings_raw if isinstance(settings_raw, dict) else {}
-            if settings:
-                if is_kdj_guide:
-                    print(
-                        "   MACD+KDJ补充: "
-                        f"align_bonus={self._to_float(settings.get('align_bonus'), 0.05):.2f}, "
-                        f"squeeze_penalty_applied={bool(settings.get('squeeze_penalty_applied', False))}"
-                    )
-                else:
-                    print(
-                        "   MACD+BB补充: "
-                        f"squeeze_penalty={self._to_float(settings.get('bb_squeeze_penalty'), 0.72):.2f}, "
-                        f"align_bonus={self._to_float(settings.get('align_bonus'), 0.05):.2f}, "
-                        f"squeeze_penalty_applied={bool(settings.get('squeeze_penalty_applied', False))}"
-                    )
-        print(f"   components(lw): {comp_str}")
-        ds_weights_snapshot = md.get("ds_weights_snapshot")
-        if isinstance(ds_weights_snapshot, dict) and ds_weights_snapshot:
-            ds_weights_text = json.dumps(ds_weights_snapshot, ensure_ascii=False, separators=(",", ":"))
-            if len(ds_weights_text) > 320:
-                ds_weights_text = ds_weights_text[:317] + "..."
-            print(f"   DS权重快照: {ds_weights_text}")
         if engine_tag:
             print(
                 "   引擎上下文: "
@@ -5363,8 +5340,7 @@ class TradingBot:
                 f"mode={neutral_trial_mode}, "
                 f"active={1 if neutral_trial_active else 0}, "
                 f"backdrop_ok={1 if neutral_trial_backdrop_ok else 0}, "
-                f"pending={neutral_trial_pending_side}/{neutral_trial_pending_score:.3f}, "
-                f"reg15={neutral_trial_regime_long_score:.3f}/{neutral_trial_regime_short_score:.3f}, "
+                f"pending={neutral_trial_pending_side}, "
                 f"flow_ok={1 if neutral_trial_flow_ok else 0}, "
                 f"cons_ok={1 if neutral_trial_consistency_ok else 0}, "
                 f"hard_block={1 if neutral_trial_hard_block else 0}, "
@@ -5416,38 +5392,22 @@ class TradingBot:
             f"liq_norm={self._to_float(flow_context.get('liquidity_delta_norm'), 0.0):+.4f}"
         )
         if decision.reason:
-            print(f"   决策原因: {decision.reason}")
+            decision_reason = str(decision.reason)
+            if "score=" not in decision_reason and "KDJ" not in decision_reason.upper():
+                print(f"   决策原因: {decision_reason}")
         if decision.operation == FundFlowOperation.HOLD:
-            open_thresholds_raw = md.get("open_thresholds")
-            open_thresholds: Dict[str, Any] = open_thresholds_raw if isinstance(open_thresholds_raw, dict) else {}
-            final_long_score = self._to_float(md.get("final_long_score", md.get("long_score")), 0.0)
-            final_short_score = self._to_float(md.get("final_short_score", md.get("short_score")), 0.0)
-            long_threshold = self._to_float(open_thresholds.get("long"), 0.0)
-            short_threshold = self._to_float(open_thresholds.get("short"), 0.0)
             direction_lock_applied = bool(md.get("direction_lock_applied", False))
-            blocked_long = direction_lock in ("SHORT_ONLY",) and final_long_score >= long_threshold > 0.0
-            blocked_short = direction_lock in ("LONG_ONLY",) and final_short_score >= short_threshold > 0.0
-            if direction_lock_applied and (blocked_long or blocked_short):
-                blocked_side = "LONG" if blocked_long else "SHORT"
-                blocked_score = final_long_score if blocked_long else final_short_score
-                blocked_threshold = long_threshold if blocked_long else short_threshold
+            if direction_lock_applied and direction_lock in ("SHORT_ONLY", "LONG_ONLY"):
+                blocked_side = "LONG" if direction_lock == "SHORT_ONLY" else "SHORT"
                 print(
                     "   HOLD归因: "
                     f"direction_lock_blocked={blocked_side}, "
-                    f"lock={direction_lock or '-'}, "
-                    f"score={blocked_score:.3f}, "
-                    f"threshold={blocked_threshold:.3f}"
+                    f"lock={direction_lock or '-'}"
                 )
             else:
-                dominant_side = "LONG" if final_long_score >= final_short_score else "SHORT"
-                dominant_score = final_long_score if dominant_side == "LONG" else final_short_score
-                dominant_threshold = long_threshold if dominant_side == "LONG" else short_threshold
                 print(
                     "   HOLD归因: "
-                    f"score_below_threshold={dominant_side}, "
-                    f"score={dominant_score:.3f}, "
-                    f"threshold={dominant_threshold:.3f}, "
-                    f"lock={direction_lock or '-'}"
+                    f"waiting_rule_confirmation, lock={direction_lock or '-'}"
                 )
         if isinstance(leverage_sync, dict) and leverage_sync.get("status") == "error":
             print(f"   ⚠️ 杠杆同步失败: {leverage_sync.get('message')}")
@@ -6122,7 +6082,7 @@ class TradingBot:
                     confluence = self._compute_ma10_macd_confluence(symbol, confluence_cfg)
                     self._inject_confluence_into_flow_context(flow_context, confluence, confluence_cfg)
                 except Exception as e:
-                    print(f"⚠️ {symbol} MA10+MACD/KDJ/布林 帧内特征注入失败: {e}")
+                    print(f"⚠️ {symbol} EMA+MACD/布林 帧内特征注入失败: {e}")
             
             decision = self.fund_flow_decision_engine.decide(
                 symbol=symbol,
@@ -6306,8 +6266,7 @@ class TradingBot:
                         f"⏭️ {symbol} signal_pool过滤未通过，跳过开仓/加仓: "
                         f"pool={trigger_context.get('signal_pool_id')}, "
                         f"reason={pool_eval.get('reason')}, "
-                        f"edge={edge_obj.get('reason')}, "
-                        f"score={self._to_float(pool_eval.get('score'), 0.0):.3f}"
+                        f"edge={edge_obj.get('reason')}"
                     )
                     continue
             
@@ -6333,8 +6292,7 @@ class TradingBot:
                         f"hold={int(self._to_float(gate_meta.get('exit_hold_seconds'), 0)):d}s"
                     )
                 print(
-                    f"🧭 {symbol} 前置风控Gate: action={gate_action}, "
-                    f"score={self._to_float(gate_meta.get('score'), 0.0):.3f}{extra}"
+                    f"🧭 {symbol} 前置风控Gate: action={gate_action}{extra}"
                 )
             if risk_guard_enabled and self._is_cooldown_active() and decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                 print(
@@ -6512,25 +6470,16 @@ class TradingBot:
                     ext_runtime: Dict[str, float] = ext_runtime_raw if isinstance(ext_runtime_raw, dict) else {}
                     mfe_runtime = max(0.0, float(ext_runtime.get("max_favorable_ratio", 0.0))) * 100.0
                     mae_runtime = min(0.0, float(ext_runtime.get("max_adverse_ratio", 0.0))) * 100.0
-                    close_decision = protection.get("close_decision", {})
-                    close_score = self._to_float(close_decision.get("score"), 0.0)
-                    macd_score = self._to_float(close_decision.get("macd_score"), 0.0)
-                    kdj_score = self._to_float(close_decision.get("kdj_score"), 0.0)
-                    ff_score = self._to_float(close_decision.get("fund_flow_score"), 0.0)
-                    close_weights = close_decision.get("weights", {})
                     print(
                         "🧪 风控摘要 "
                         f"symbol={symbol} engine={str(decision_md.get('engine') or decision_md.get('regime') or '-').upper()} "
                         f"side={current_side} entry={self._to_float(position.get('entry_price'), 0.0):.6f} "
                         f"atr={self._to_float(decision_md.get('regime_atr_pct'), 0.0):.4f} "
-                        f"gate_score={gate_score_now:+.3f} protect={protection_level} "
-                        f"state={risk_state} "
+                        f"protect={protection_level} state={risk_state} "
                         f"bars={int(protection.get('conflict_bars', 0) or 0)} "
                         f"pen={self._to_float(protection.get('penetration'), 0.0):+.2f} "
                         f"votes={int(self._to_int(protection.get('hard_votes'), 0))} "
                         f"hold={hold_seconds_runtime}s mfe={mfe_runtime:.2f}% mae={mae_runtime:.2f}% "
-                        f"close_score={close_score:+.3f}(MACD:{macd_score:+.3f}/KDJ:{kdj_score:+.3f}/FF:{ff_score:+.3f}) "
-                        f"weights=FF:{self._to_float(close_weights.get('fund_flow'), 0.55):.2f}/M:{self._to_float(close_weights.get('macd'), 0.30):.2f}/K:{self._to_float(close_weights.get('kdj'), 0.15):.2f} "
                         f"action={protection_action}"
                     )
             
@@ -6586,7 +6535,7 @@ class TradingBot:
                         )
                         pending_new_entries.append({
                             "symbol": symbol,
-                            "score": max(1.0, self._decision_signal_score(decision)),
+                            "score": max(1.0, self._decision_signal_score(decision, flow_context)),
                             "max_active_symbols": max_active_symbols,
                             "engine": decision_md.get("engine"),
                             "decision": decision,
@@ -6834,7 +6783,7 @@ class TradingBot:
                             # 执行减仓
                             pending_new_entries.append({
                                 "symbol": symbol,
-                                "score": max(1.0, self._decision_signal_score(decision)),
+                                "score": max(1.0, self._decision_signal_score(decision, flow_context)),
                                 "max_active_symbols": max_active_symbols,
                                 "engine": decision_md.get("engine"),
                                 "decision": decision,
@@ -6967,7 +6916,7 @@ class TradingBot:
                             )
                             pending_new_entries.append({
                                 "symbol": symbol,
-                                "score": max(1.0, self._decision_signal_score(decision)),
+                                "score": max(1.0, self._decision_signal_score(decision, flow_context)),
                                 "max_active_symbols": max_active_symbols,
                                 "engine": decision_md.get("engine"),
                                 "decision": decision,
@@ -7038,7 +6987,7 @@ class TradingBot:
                         print(f"✅ {symbol} 方向确认增强: {protection.get('reason')}")
             
                 if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
-                    local_entry_score = self._decision_signal_score(decision)
+                    local_entry_score = self._decision_signal_score(decision, flow_context)
                     allow_same_side_add, block_reason = self._ai_entry_guard(
                         decision=decision,
                         local_score=local_entry_score,
@@ -7049,7 +6998,7 @@ class TradingBot:
                     if not allow_same_side_add:
                         print(
                             f"⏭️ {symbol} 同向加仓被拦截: "
-                            f"score={local_entry_score:.3f}, reason={block_reason}"
+                            f"reason={block_reason}"
                         )
                         continue
             
@@ -7118,7 +7067,7 @@ class TradingBot:
                 pending_new_entries.append(
                     {
                         "symbol": symbol,
-                        "score": self._decision_signal_score(decision),
+                        "score": self._decision_signal_score(decision, flow_context),
                         "max_active_symbols": item_max_active_symbols,
                         "engine": decision_md.get("engine"),
                         "decision": decision,
@@ -7319,7 +7268,7 @@ class TradingBot:
                     decision_i = _item_decision(item)
                     local_action = decision_i.operation.value.upper() if decision_i else "UNKNOWN"
                     shortlist_parts.append(
-                        f"{rank}.{symbol_i}:{local_action}:score={score_i:.3f}"
+                        f"{rank}.{symbol_i}:{local_action}"
                     )
                 if shortlist_parts:
                     print(
@@ -7351,7 +7300,7 @@ class TradingBot:
                     print(
                         f"⏭️ {item.get('symbol')} 候选开仓被跳过："
                         f"持仓交易对已满({active_count}/{item_max_active_symbols})，"
-                        f"候选排名={rank}, score={float(item.get('score', 0.0)):.3f}"
+                        f"候选排名={rank}"
                     )
                     continue
 
@@ -7379,7 +7328,7 @@ class TradingBot:
                     if decision_i.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL) and current_price_i > 0:
                         print(
                             f"🤖 {symbol_i} AI终审请求: rank={rank} "
-                            f"local={decision_i.operation.value.upper()} score={local_score:.3f} "
+                            f"local={decision_i.operation.value.upper()} "
                             f"price={current_price_i:.6f}"
                         )
                         ai_trigger_context = dict(trigger_context_i)
@@ -7419,7 +7368,7 @@ class TradingBot:
                             print(
                                 f"⛔ {symbol_i} AI终审结构拦截: rank={rank} "
                                 f"local={decision_i.operation.value.upper()} "
-                                f"score={local_score:.3f} reason={block_reason} "
+                                f"reason={block_reason} "
                                 f"source={ai_source} conf={ai_conf:.3f}"
                             )
                             continue
@@ -7438,11 +7387,11 @@ class TradingBot:
                             )
                         decision_i = ai_decision
                         item["decision"] = decision_i
-                        item["score"] = self._decision_signal_score(decision_i)
+                        item["score"] = self._decision_signal_score(decision_i, flow_context_i)
                     else:
                         print(
                             f"🤖 {symbol_i} 未进入AI终审: rank={rank} "
-                            f"local={decision_i.operation.value.upper()} score={local_score:.3f}"
+                            f"local={decision_i.operation.value.upper()}"
                         )
                 self._execute_and_log_decision(
                     symbol=symbol_i,

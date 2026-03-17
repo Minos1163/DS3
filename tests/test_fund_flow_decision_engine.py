@@ -1137,3 +1137,197 @@ def test_decide_uses_dynamic_short_term_stop_loss_for_trend_entries():
     assert round((100.0 - float(decision.stop_loss_price)) / 100.0, 4) == 0.0035
     tp_levels = decision.metadata.get("tp_levels", [])
     assert len(tp_levels) == 2
+
+
+def _rule_cfg():
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "ema10_ema30_1h_15m_rule"
+    cfg["fund_flow"]["decision_timeframe"] = "15m"
+    cfg["fund_flow"]["rule_strategy"] = {
+        "enabled": True,
+        "primary_trend_timeframe": "1h",
+        "entry_timeframe": "15m",
+        "min_stop_pct": 0.02,
+        "max_stop_pct": 0.05,
+        "tp1_min_pct": 0.05,
+        "tp1_max_pct": 0.10,
+        "runner_activate_pct": 0.05,
+        "tp1_reduce_pct": 0.5,
+        "stop_break_buffer_pct": 0.0,
+    }
+    return cfg
+
+
+def _rule_entry_context(*, direction: str, overrides=None):
+    entry_tf = {
+        "last_open": 100.0,
+        "last_close": 101.0 if direction == "LONG_ONLY" else 99.0,
+        "ema_10": 101.0 if direction == "LONG_ONLY" else 99.0,
+        "ema_30": 100.0,
+        "ema_cross": "GOLDEN" if direction == "LONG_ONLY" else "DEAD",
+        "macd_cross": "GOLDEN" if direction == "LONG_ONLY" else "DEAD",
+        "macd_zone": "ABOVE_ZERO" if direction == "LONG_ONLY" else "BELOW_ZERO",
+        "macd_hist": 0.2 if direction == "LONG_ONLY" else -0.2,
+        "macd_hist_expand_up": direction == "LONG_ONLY",
+        "macd_hist_expand_down": direction == "SHORT_ONLY",
+        "bb_middle": 100.0,
+        "bb_upper": 101.2,
+        "bb_lower": 98.8,
+        "bb_break": "NONE",
+        "bb_width_expand": False,
+    }
+    if isinstance(overrides, dict):
+        entry_tf.update(overrides)
+    return {"timeframes": {"15m": entry_tf}}
+
+
+def test_rule_entry_confluence_macd_long_requires_ema_cross():
+    engine = FundFlowDecisionEngine(_rule_cfg())
+    confluence = engine._rule_entry_confluence(
+        _rule_entry_context(direction="LONG_ONLY", overrides={"ema_cross": "NONE"}),
+        {"direction": "LONG_ONLY"},
+    )
+    assert confluence["long_ok"] is False
+    assert confluence["long_models"] == []
+
+
+
+def test_rule_entry_confluence_bollinger_long_allows_without_ema_cross():
+    engine = FundFlowDecisionEngine(_rule_cfg())
+    confluence = engine._rule_entry_confluence(
+        _rule_entry_context(
+            direction="LONG_ONLY",
+            overrides={
+                "ema_cross": "NONE",
+                "macd_cross": "NONE",
+                "macd_hist_expand_up": False,
+                "bb_break": "UPPER",
+                "bb_width_expand": True,
+            },
+        ),
+        {"direction": "LONG_ONLY"},
+    )
+    assert confluence["long_ok"] is True
+    assert confluence["long_models"] == ["EMA_BB"]
+
+
+
+def test_rule_entry_confluence_macd_short_requires_ema_cross():
+    engine = FundFlowDecisionEngine(_rule_cfg())
+    confluence = engine._rule_entry_confluence(
+        _rule_entry_context(direction="SHORT_ONLY", overrides={"ema_cross": "NONE"}),
+        {"direction": "SHORT_ONLY"},
+    )
+    assert confluence["short_ok"] is False
+    assert confluence["short_models"] == []
+
+
+def test_rule_risk_plan_respects_2_to_5_pct_stop_band():
+    engine = FundFlowDecisionEngine(_rule_cfg())
+    risk_plan = engine._rule_build_risk_plan(
+        direction="LONG",
+        entry_price=100.0,
+        stop_anchor=99.8,
+        entry_models=["EMA_MACD"],
+    )
+    assert risk_plan["valid"] is True
+    assert round((100.0 - float(risk_plan["stop_trigger_price"])) / 100.0, 4) == 0.02
+
+    too_wide = engine._rule_build_risk_plan(
+        direction="LONG",
+        entry_price=100.0,
+        stop_anchor=94.0,
+        entry_models=["EMA_MACD"],
+    )
+    assert too_wide["valid"] is False
+    assert "stop_too_wide" in too_wide["reason"]
+
+
+def test_rule_stop_trigger_long_stops_on_macd_dead_cross_before_ema30_break():
+    engine = FundFlowDecisionEngine(_rule_cfg())
+    stop_state = engine._rule_stop_trigger(
+        "LONG",
+        _rule_entry_context(
+            direction="LONG_ONLY",
+            overrides={
+                "last_close": 101.0,
+                "ema_10": 102.0,
+                "ema_30": 100.0,
+                "macd_cross": "DEAD",
+                "macd_zone": "ABOVE_ZERO",
+            },
+        ),
+        fallback_price=101.0,
+        current_pos={"entry_price": 100.0},
+    )
+    assert stop_state["triggered"] is True
+    assert stop_state["runner_active"] is False
+    assert stop_state["exit_trigger"] == "macd_dead_cross"
+
+
+def test_rule_stop_trigger_short_stops_on_below_zero_golden_cross_before_ema30_break():
+    engine = FundFlowDecisionEngine(_rule_cfg())
+    stop_state = engine._rule_stop_trigger(
+        "SHORT",
+        _rule_entry_context(
+            direction="SHORT_ONLY",
+            overrides={
+                "last_close": 99.0,
+                "ema_10": 98.5,
+                "ema_30": 100.0,
+                "macd_cross": "GOLDEN",
+                "macd_zone": "BELOW_ZERO",
+            },
+        ),
+        fallback_price=99.0,
+        current_pos={"entry_price": 100.0},
+    )
+    assert stop_state["triggered"] is True
+    assert stop_state["runner_active"] is False
+    assert stop_state["exit_trigger"] == "macd_golden_cross_below_zero"
+
+
+def test_rule_stop_trigger_long_runner_exits_on_ema10_break():
+    engine = FundFlowDecisionEngine(_rule_cfg())
+    stop_state = engine._rule_stop_trigger(
+        "LONG",
+        _rule_entry_context(
+            direction="LONG_ONLY",
+            overrides={
+                "last_close": 106.0,
+                "ema_10": 107.0,
+                "ema_30": 100.0,
+                "macd_cross": "NONE",
+            },
+        ),
+        fallback_price=106.0,
+        current_pos={"entry_price": 100.0},
+    )
+    assert stop_state["triggered"] is True
+    assert stop_state["runner_active"] is True
+    assert stop_state["exit_stage"] == "RUNNER"
+    assert stop_state["exit_trigger"] == "ema10_break"
+
+
+def test_rule_stop_trigger_short_runner_exits_on_below_zero_golden_cross():
+    engine = FundFlowDecisionEngine(_rule_cfg())
+    stop_state = engine._rule_stop_trigger(
+        "SHORT",
+        _rule_entry_context(
+            direction="SHORT_ONLY",
+            overrides={
+                "last_close": 94.0,
+                "ema_10": 95.0,
+                "ema_30": 100.0,
+                "macd_cross": "GOLDEN",
+                "macd_zone": "BELOW_ZERO",
+            },
+        ),
+        fallback_price=94.0,
+        current_pos={"entry_price": 100.0},
+    )
+    assert stop_state["triggered"] is True
+    assert stop_state["runner_active"] is True
+    assert stop_state["exit_stage"] == "RUNNER"
+    assert stop_state["exit_trigger"] == "macd_golden_cross_below_zero"
+

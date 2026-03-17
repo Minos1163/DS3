@@ -12,9 +12,6 @@ _METADATA_SCALAR_KEYS = (
     "regime_reason",
     "decision_source",
     "side",
-    "score",
-    "long_score",
-    "short_score",
     "direction_lock",
     "direction_lock_mode",
     "entry_mode",
@@ -38,7 +35,7 @@ _METADATA_SCALAR_KEYS = (
     "regime_atr_pct",
 )
 
-_METADATA_OBJECT_KEYS = ("score_15m", "score_5m", "final_score", "fusion_info")
+_METADATA_OBJECT_KEYS = ("risk_plan", "stop_trigger", "pretrade_risk_gate", "leverage_model")
 
 _FLOW_SCALAR_KEYS = (
     "cvd_ratio",

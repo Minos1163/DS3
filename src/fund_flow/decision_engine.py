@@ -350,7 +350,48 @@ class FundFlowDecisionEngine:
             min(1.0, self._to_float(trend_capture_cfg.get("trend_both_trial_loose_min_regime_score"), 0.06)),
         )
         self.symbol_side_overrides = self._parse_symbol_side_overrides(ff)
-        
+
+        self.strategy_mode = str(ff.get("strategy_mode", "legacy_score_fusion") or "legacy_score_fusion").strip().lower()
+        rule_cfg = ff.get("rule_strategy", {}) if isinstance(ff.get("rule_strategy"), dict) else {}
+        self.rule_strategy_enabled = bool(
+            rule_cfg.get("enabled", self.strategy_mode == "ema10_ema30_1h_15m_rule")
+        )
+        self.rule_primary_trend_timeframe = str(
+            rule_cfg.get("primary_trend_timeframe", regime_cfg.get("timeframe", "1h") or "1h") or "1h"
+        ).strip().lower()
+        self.rule_entry_timeframe = str(
+            rule_cfg.get("entry_timeframe", ff.get("decision_timeframe", "15m") or "15m") or "15m"
+        ).strip().lower()
+        self.rule_attack_ema_period = max(2, int(self._to_float(rule_cfg.get("attack_ema_period"), 10)))
+        self.rule_ema_period = max(2, int(self._to_float(rule_cfg.get("ema_period"), 30)))
+        self.rule_stop_ema_period = max(2, int(self._to_float(rule_cfg.get("stop_ema_period"), self.rule_ema_period)))
+        self.rule_runner_ema_period = max(2, int(self._to_float(rule_cfg.get("runner_ema_period"), self.rule_attack_ema_period)))
+        self.rule_ema_band_pct = self._normalize_pct_ratio(rule_cfg.get("ema_band_pct"), 0.001)
+        self.rule_ema_flat_slope_pct_threshold = self._normalize_pct_ratio(
+            rule_cfg.get("ema_flat_slope_pct_threshold"), 0.00015
+        )
+        self.rule_bb_touch_tolerance_pct = self._normalize_pct_ratio(rule_cfg.get("bollinger_touch_tolerance_pct"), 0.003)
+        self.rule_stop_break_buffer_pct = self._normalize_pct_ratio(rule_cfg.get("stop_break_buffer_pct"), 0.0)
+        self.rule_stop_buffer_pct = self._normalize_pct_ratio(rule_cfg.get("stop_buffer_pct"), 0.003)
+        self.rule_min_stop_pct = self._normalize_pct_ratio(rule_cfg.get("min_stop_pct"), 0.01)
+        self.rule_max_stop_pct = max(
+            self.rule_min_stop_pct,
+            self._normalize_pct_ratio(rule_cfg.get("max_stop_pct"), 0.025),
+        )
+        self.rule_tp1_min_pct = self._normalize_pct_ratio(rule_cfg.get("tp1_min_pct"), 0.05)
+        self.rule_tp1_max_pct = max(
+            self.rule_tp1_min_pct,
+            self._normalize_pct_ratio(rule_cfg.get("tp1_max_pct"), 0.10),
+        )
+        self.rule_runner_activate_pct = self._normalize_pct_ratio(
+            rule_cfg.get("runner_activate_pct"), self.rule_tp1_min_pct
+        )
+        self.rule_tp1_reduce_pct = max(
+            0.0,
+            min(1.0, self._to_float(rule_cfg.get("tp1_reduce_pct"), 0.5)),
+        )
+        self.rule_legacy_auxiliary_filters_enabled = bool(rule_cfg.get("legacy_auxiliary_filters_enabled", True))
+
         # 启动时打印默认权重摘要（确认配置是否生效）
         import logging
         logger = logging.getLogger(__name__)
@@ -1923,24 +1964,80 @@ class FundFlowDecisionEngine:
             self._ev_reliability[key] = (alpha, beta)
 
     def _detect_regime(self, market_flow_context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        市场状态检测 + 方向判断 (三层架构)
+        if self.rule_strategy_enabled:
+            timeframes = market_flow_context.get("timeframes") if isinstance(market_flow_context, dict) else {}
+            if not isinstance(timeframes, dict):
+                return {"regime": "NO_TRADE", "direction": "BOTH", "reason": "missing_timeframes"}
 
-        返回结构:
-        {
-            "regime": "TREND"/"RANGE"/"NO_TRADE",
-            "direction": "LONG_ONLY"/"SHORT_ONLY"/"BOTH",
-            "reason": "...",
-            # 基础指标
-            "ema_fast": ..., "ema_slow": ..., "adx": ..., "atr_pct": ...,
-            # 方向判断详情
-            "lw": {"dir": ..., "score": ..., "components": {...}, "conflict": ...},
-            "ev": {"dir": ..., "score": ..., "components": {...}, "reliabilities": {...}},
-            "final": {"dir": ..., "score": ..., "method": "LW", "need_confirm": ...},
-            # 辅助字段
-            "ev_direction": ..., "ev_score": ..., "lw_direction": ..., "lw_score": ...,
-        }
-        """
+            trend_tf = timeframes.get(self.rule_primary_trend_timeframe)
+            if not isinstance(trend_tf, dict):
+                return {
+                    "regime": "NO_TRADE",
+                    "direction": "BOTH",
+                    "reason": f"missing_{self.rule_primary_trend_timeframe}_context",
+                    "strategy_mode": self.strategy_mode,
+                }
+
+            close_price = self._to_float(trend_tf.get("last_close"), 0.0)
+            open_price = self._to_float(trend_tf.get("last_open"), 0.0)
+            ema30 = self._to_float(
+                trend_tf.get("ema_30"),
+                self._to_float(trend_tf.get("ema30"), self._to_float(trend_tf.get("ema_mid"), 0.0)),
+            )
+            ema30_slope_pct = self._to_float(trend_tf.get("ema30_slope_pct"), 0.0)
+            if close_price <= 0 or ema30 <= 0:
+                return {
+                    "regime": "NO_TRADE",
+                    "direction": "BOTH",
+                    "reason": f"missing_{self.rule_primary_trend_timeframe}_ema30",
+                    "strategy_mode": self.strategy_mode,
+                }
+
+            band = max(abs(ema30) * self.rule_ema_band_pct, 0.0)
+            distance_pct = (close_price - ema30) / ema30 if ema30 else 0.0
+            slope_abs = abs(ema30_slope_pct)
+            tf_label = self.rule_primary_trend_timeframe.upper()
+            if slope_abs <= self.rule_ema_flat_slope_pct_threshold:
+                direction = "BOTH"
+                regime = "NO_TRADE"
+                reason = (
+                    f"{tf_label}_ema30_flat close={close_price:.4f} ema30={ema30:.4f} "
+                    f"slope_pct={ema30_slope_pct:.6f}"
+                )
+            elif close_price > ema30 + band and ema30_slope_pct > 0:
+                direction = "LONG_ONLY"
+                regime = "TREND"
+                reason = (
+                    f"{tf_label}_above_ema30 close={close_price:.4f} ema30={ema30:.4f} "
+                    f"slope_pct={ema30_slope_pct:.6f}"
+                )
+            elif close_price < ema30 - band and ema30_slope_pct < 0:
+                direction = "SHORT_ONLY"
+                regime = "TREND"
+                reason = (
+                    f"{tf_label}_below_ema30 close={close_price:.4f} ema30={ema30:.4f} "
+                    f"slope_pct={ema30_slope_pct:.6f}"
+                )
+            else:
+                direction = "BOTH"
+                regime = "NO_TRADE"
+                reason = (
+                    f"{tf_label}_ema30_conflict close={close_price:.4f} ema30={ema30:.4f} "
+                    f"slope_pct={ema30_slope_pct:.6f}"
+                )
+
+            return {
+                "regime": regime,
+                "direction": direction,
+                "reason": reason,
+                "last_open": open_price,
+                "last_close": close_price,
+                "trend_timeframe": self.rule_primary_trend_timeframe,
+                "trend_ema30": ema30,
+                "trend_distance_pct": distance_pct,
+                "trend_ema30_slope_pct": ema30_slope_pct,
+                "strategy_mode": self.strategy_mode,
+            }
         timeframes = market_flow_context.get("timeframes")
         if not isinstance(timeframes, dict):
             return {"regime": "NO_TRADE", "direction": "BOTH", "reason": "missing_timeframes"}
@@ -1950,16 +2047,13 @@ class FundFlowDecisionEngine:
         if not isinstance(tf_ctx, dict):
             return {"regime": "NO_TRADE", "direction": "BOTH", "reason": f"missing_{tf}_context"}
 
-        # ========== 获取基础指标 ==========
         ema_fast = self._to_float(tf_ctx.get("ema_fast"), 0.0)
         ema_slow = self._to_float(tf_ctx.get("ema_slow"), 0.0)
         adx = self._to_float(tf_ctx.get("adx"), 0.0)
         atr_pct = abs(self._to_float(tf_ctx.get("atr_pct"), 0.0))
-        # K线 open/close 价格
         last_open = self._to_float(tf_ctx.get("last_open"), 0.0)
         last_close = self._to_float(tf_ctx.get("last_close"), 0.0)
 
-        # 趋势判定不再依赖 EMA（仅保留 EMA 数值用于观察日志）
         if adx <= 0 or atr_pct <= 0:
             return {
                 "regime": "NO_TRADE",
@@ -1969,34 +2063,21 @@ class FundFlowDecisionEngine:
                 "last_close": last_close,
             }
 
-        # ========== 第一层：计算归一化特征 ==========
         features = self._compute_direction_features(tf_ctx, market_flow_context)
-
-        # ========== 第二层：两套算法 ==========
         lw_result = self._score_lw(features, market_flow_context)
         ev_result = self._score_ev(features, market_flow_context)
-
-        # ========== 第三层：汇总与冲突处理 ==========
         lw_dir = lw_result["dir"]
         lw_score = lw_result["score"]
         ev_dir = ev_result["dir"]
         ev_score = ev_result["score"]
-
-        # 分歧度
         divergence = abs(lw_score - ev_score)
-
-        # 一致性检查
         agree = (lw_dir == ev_dir) or (lw_dir == "BOTH" or ev_dir == "BOTH")
-
-        # 是否需要额外确认
         need_confirm = False
         if not agree and divergence > self._divergence_threshold:
             need_confirm = True
 
         lw_combo = lw_result.get("combo_compare", {}) if isinstance(lw_result.get("combo_compare"), dict) else {}
         ev_combo = ev_result.get("combo_compare", {}) if isinstance(ev_result.get("combo_compare"), dict) else {}
-
-        # 开仓方向指导：默认固定使用 MACD+BB（可配置切换）
         guide_model = self._direction_guide_model
         guide_model_map = {
             "MACD_BB": "MACD+BB",
@@ -2011,116 +2092,38 @@ class FundFlowDecisionEngine:
                 float(self._direction_guide_trend_relaxed_neutral_zone),
             )
         if guide_model == "MACD_KDJ":
-            guide_score = self._to_float(
-                lw_result.get("score"),
-                self._to_float(lw_combo.get("score_macd_kdj"), 0.0),
-            )
-            if self._direction_guide_enhanced_fallback_enabled:
-                fallback_th = float(self._direction_guide_enhanced_fallback_threshold)
-                if abs(guide_score) < fallback_th and abs(lw_score) >= fallback_th:
-                    guide_score = lw_score
-                    guide_score_source = "lw_enhanced_fallback"
-                elif abs(lw_score) >= fallback_th and abs(lw_score) > abs(guide_score) and guide_score * lw_score > 0:
-                    guide_score = 0.35 * guide_score + 0.65 * lw_score
-                    guide_score_source = "lw_bias_blend"
-        elif guide_model == "EV_PRIMARY":
-            guide_score = ev_score
-            guide_score_source = "ev_primary"
+            guide_score = self._to_float(lw_combo.get("macd_kdj_score"), lw_score)
+            guide_direction = self._direction_from_score(guide_score, effective_neutral_zone)
+        elif guide_model == "MACD_BB":
+            guide_score = self._to_float(lw_combo.get("macd_bb_score"), lw_score)
+            guide_direction = self._direction_from_score(guide_score, effective_neutral_zone)
         else:
-            guide_score = self._to_float(ev_combo.get("score_macd_bb"), ev_score)
-            guide_score_source = "combo_macd_bb"
-        guide_direction = self._direction_from_score(guide_score, effective_neutral_zone)
-        if (
-            self._direction_guide_enabled
-            and guide_direction == "BOTH"
-            and self._direction_guide_enhanced_fallback_enabled
-        ):
-            fallback_th = float(self._direction_guide_enhanced_fallback_threshold)
-            if abs(lw_score) >= fallback_th and lw_dir in {"LONG_ONLY", "SHORT_ONLY"}:
-                guide_score = lw_score
-                guide_direction = lw_dir
-                guide_score_source = "lw_dir_fallback"
-            elif abs(ev_score) >= max(fallback_th, 0.06) and ev_dir in {"LONG_ONLY", "SHORT_ONLY"}:
-                guide_score = ev_score
-                guide_direction = ev_dir
-                guide_score_source = "ev_dir_fallback"
+            guide_score_source = "ev_primary"
+            guide_score = ev_score
+            guide_direction = ev_dir
 
-        active_model = guide_model_map.get(guide_model, guide_model)
-        direction = guide_direction if self._direction_guide_enabled else ev_dir
-        active_dir = guide_direction if self._direction_guide_enabled else ev_dir
-        active_score = guide_score if self._direction_guide_enabled else ev_score
-        final_score = active_score
+        if guide_direction == "BOTH" and self._direction_guide_enhanced_fallback_enabled:
+            alt_score = self._to_float(lw_combo.get("macd_bb_score"), lw_score)
+            if abs(alt_score) >= self._direction_guide_enhanced_fallback_threshold:
+                guide_direction = self._direction_from_score(alt_score, effective_neutral_zone)
+                guide_score = alt_score
+                guide_score_source = "enhanced_fallback"
 
-        # 如果分歧太大且最终指导本身不明确，使用 BOTH
-        if need_confirm and active_dir == "BOTH" and abs(active_score) < max(self._direction_guide_enhanced_fallback_threshold, 0.06):
-            direction = "BOTH"
+        final_dir = guide_direction if self._direction_guide_enabled else ev_dir
+        final_score = guide_score if self._direction_guide_enabled else ev_score
+        if abs(final_score) < self._direction_neutral_zone:
+            final_dir = "BOTH"
 
-        # 日志对照采用固定映射：
-        # LW -> MACD+KDJ，EV -> MACD+BB
-        # winner 仍保留动态优胜组合，便于观测两组合强弱
-        lw_winner = "MACD+KDJ"
-        ev_winner = "MACD+BB"
-        winner = str(ev_combo.get("winner", "MACD+KDJ"))
-        combo_compare = {
-            "active_model": active_model,
-            "active_dir": active_dir,
-            "active_score": round(active_score, 3),
-            "lw_winner": lw_winner,
-            "ev_winner": ev_winner,
-            "lw_combo_score": round(self._to_float(lw_combo.get("score_macd_kdj"), 0.0), 3),
-            "ev_combo_score": round(self._to_float(ev_combo.get("score_macd_bb"), 0.0), 3),
-            "winner": winner,
-            "lw_dynamic_winner": str(lw_combo.get("winner", "MACD+KDJ")),
-            "ev_dynamic_winner": str(ev_combo.get("winner", "MACD+KDJ")),
-            "direction_guide_enabled": bool(self._direction_guide_enabled),
-            "direction_guide_model": str(guide_model),
-            "direction_guide_model_label": active_model,
-            "guide_dir": guide_direction,
-            "guide_score": round(guide_score, 3),
-            "guide_neutral_zone": float(self._direction_guide_neutral_zone),
-            "guide_effective_neutral_zone": float(effective_neutral_zone),
-            "guide_score_source": str(guide_score_source),
-            "macd_bb_weights": dict(ev_combo.get("weights", {}).get("macd_bb", {}))
-            if isinstance(ev_combo.get("weights", {}), dict)
-            else {},
-            "macd_kdj_weights": dict(lw_combo.get("weights", {}).get("macd_kdj", {}))
-            if isinstance(lw_combo.get("weights", {}), dict)
-            else {},
-            "feature_snapshot": dict(ev_combo.get("feature_snapshot", {}))
-            if isinstance(ev_combo.get("feature_snapshot", {}), dict)
-            else {},
-            "settings": dict(ev_combo.get("settings", {}))
-            if isinstance(ev_combo.get("settings", {}), dict)
-            else {},
-        }
+        regime = "NO_TRADE"
+        if adx >= self.regime_adx_trend_on and self.regime_atr_pct_min <= atr_pct <= self.regime_atr_pct_max:
+            regime = "TREND"
+        elif adx <= self.regime_adx_range_on:
+            regime = "RANGE"
 
-        # 构建日志原因（components 可能包含 dict/bool，避免格式化异常导致策略中断）
-        def _fmt_component_value(v: Any) -> str:
-            if isinstance(v, bool):
-                return "1" if v else "0"
-            if isinstance(v, (int, float)):
-                return f"{float(v):+.2f}"
-            if isinstance(v, dict):
-                return "{...}"
-            if isinstance(v, (list, tuple)):
-                return "[...]"
-            return str(v)
-
-        lw_components = lw_result.get("components", {})
-        if not isinstance(lw_components, dict):
-            lw_components = {}
-        comp_str = ",".join([f"{k}:{_fmt_component_value(v)}" for k, v in lw_components.items()])
-        direction_reason = (
-            f"dir_lw={lw_dir[:4]} score_lw={lw_score:+.2f} | "
-            f"dir_ev={ev_dir[:4]} score_ev={ev_score:+.2f} | "
-            f"guide={active_model}:{active_dir[:4]}({active_score:+.2f}) | "
-            f"agree={1 if agree else 0} div={divergence:.2f} conf={abs(active_score):.2f} | "
-            f"winner={winner} lw={lw_winner} ev={ev_winner} | "
-            f"components({comp_str})"
-        )
-
-        # ========== 市场状态判断 ==========
-        base_result = {
+        return {
+            "regime": regime,
+            "direction": final_dir,
+            "reason": f"{tf}_adx={adx:.2f},atr={atr_pct:.4f},guide={guide_model_map.get(guide_model, guide_model)}",
             "ema_fast": ema_fast,
             "ema_slow": ema_slow,
             "adx": adx,
@@ -2129,66 +2132,526 @@ class FundFlowDecisionEngine:
             "last_close": last_close,
             "lw": lw_result,
             "ev": ev_result,
-            "final": {
-                "dir": direction,
-                "score": final_score,
-                "method": f"DIRECTION_GUIDE_{guide_model}" if self._direction_guide_enabled else "EV_PRIMARY",
-                "need_confirm": need_confirm,
-            },
-            # 兼容旧接口
+            "final": {"dir": final_dir, "score": final_score, "method": guide_score_source, "need_confirm": need_confirm},
             "ev_direction": ev_dir,
             "ev_score": ev_score,
             "lw_direction": lw_dir,
             "lw_score": lw_score,
-            "guide_direction": active_dir,
-            "guide_score": active_score,
-            "lw_components": lw_result["components"],
-            "legacy_direction": "BOTH",
-            "legacy_score": 0.0,
-            "combo_compare": combo_compare,
+            "guide_direction": guide_direction,
+            "guide_score": guide_score,
+            "guide_model": guide_model,
+            "guide_model_label": guide_model_map.get(guide_model, guide_model),
+            "guide_score_source": guide_score_source,
+            "legacy_direction": self._direction_from_score(self._to_float(lw_combo.get("macd_bb_score"), lw_score), effective_neutral_zone),
+            "legacy_score": self._to_float(lw_combo.get("macd_bb_score"), lw_score),
+            "combo_compare": {**lw_combo, **ev_combo},
         }
 
-        if atr_pct < self.regime_atr_pct_min:
+    def _rule_strategy_context(self, market_flow_context: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        timeframes = market_flow_context.get("timeframes") if isinstance(market_flow_context, dict) else {}
+        if not isinstance(timeframes, dict):
+            return {}, {}
+        trend_tf = timeframes.get(self.rule_primary_trend_timeframe)
+        entry_tf = timeframes.get(self.rule_entry_timeframe)
+        return (trend_tf if isinstance(trend_tf, dict) else {}), (entry_tf if isinstance(entry_tf, dict) else {})
+
+    def _rule_position_pnl_ratio(
+        self,
+        position_side: str,
+        current_pos: Optional[Dict[str, Any]],
+        current_price: float,
+    ) -> float:
+        entry_price = self._to_float((current_pos or {}).get("entry_price"), 0.0)
+        if entry_price <= 0 or current_price <= 0:
+            return 0.0
+        side = str(position_side or "").upper()
+        if side == "LONG":
+            return (current_price - entry_price) / entry_price
+        if side == "SHORT":
+            return (entry_price - current_price) / entry_price
+        return 0.0
+
+    def _rule_build_risk_plan(
+        self,
+        *,
+        direction: str,
+        entry_price: float,
+        stop_anchor: float,
+        entry_models: List[str],
+    ) -> Dict[str, Any]:
+        side = str(direction or "").upper()
+        if side not in {"LONG", "SHORT"}:
+            return {"valid": False, "reason": "invalid_rule_direction"}
+        if entry_price <= 0 or stop_anchor <= 0:
+            return {"valid": False, "reason": "missing_rule_risk_context"}
+
+        raw_stop_pct = abs(entry_price - stop_anchor) / entry_price
+        if raw_stop_pct <= 0:
+            return {"valid": False, "reason": "invalid_rule_stop_distance"}
+        if raw_stop_pct > self.rule_max_stop_pct:
             return {
-                **base_result,
-                "regime": "NO_TRADE",
-                "direction": "BOTH",
-                "reason": f"atr_pct_low({atr_pct:.4f}<{self.regime_atr_pct_min:.4f}) {direction_reason}",
-            }
-        if atr_pct > self.regime_atr_pct_max:
-            return {
-                **base_result,
-                "regime": "NO_TRADE",
-                "direction": "BOTH",
-                "reason": f"atr_pct_high({atr_pct:.4f}>{self.regime_atr_pct_max:.4f}) {direction_reason}",
+                "valid": False,
+                "reason": f"stop_too_wide raw={raw_stop_pct:.4f} max={self.rule_max_stop_pct:.4f}",
+                "raw_stop_pct": raw_stop_pct,
+                "max_stop_pct": self.rule_max_stop_pct,
             }
 
-        if adx >= self.regime_adx_trend_on:
-            return {
-                **base_result,
-                "regime": "TREND",
-                "direction": direction,
-                "reason": f"adx_trend({adx:.1f}) {direction_reason}",
-            }
-        if adx <= self.regime_adx_range_on:
-            return {
-                **base_result,
-                "regime": "RANGE",
-                "direction": "BOTH",
-                "reason": f"adx_range({adx:.1f}) {direction_reason}",
-            }
-
-        if self.regime_no_trade_low < adx < self.regime_no_trade_high:
-            reason = f"adx_no_trade({adx:.1f}) {direction_reason}"
+        effective_stop_pct = min(
+            self.rule_max_stop_pct,
+            max(self.rule_min_stop_pct, raw_stop_pct + self.rule_stop_buffer_pct),
+        )
+        if side == "LONG":
+            stop_trigger_price = min(
+                stop_anchor * (1.0 - self.rule_stop_break_buffer_pct),
+                entry_price * (1.0 - effective_stop_pct),
+            )
         else:
-            reason = f"adx_mid({adx:.1f}) {direction_reason}"
+            stop_trigger_price = max(
+                stop_anchor * (1.0 + self.rule_stop_break_buffer_pct),
+                entry_price * (1.0 + effective_stop_pct),
+            )
+
+        model_set = set(entry_models or [])
+        model_count = len(model_set)
+        tp1_pct = max(self.rule_tp1_min_pct, min(self.rule_tp1_max_pct, effective_stop_pct * 4.0))
+        if "EMA_MACD" in model_set and "EMA_BB" in model_set:
+            tp1_pct = max(tp1_pct, 0.08)
+        elif "EMA_BB" in model_set:
+            tp1_pct = max(tp1_pct, 0.07)
+        else:
+            tp1_pct = max(tp1_pct, 0.06)
+        tp1_pct = min(self.rule_tp1_max_pct, tp1_pct)
+
+        tp_levels = []
+        tp1_price = None
+        if self.rule_tp1_reduce_pct > 0 and tp1_pct > 0:
+            tp_levels = self._build_tp_levels_metadata(
+                price=entry_price,
+                direction=side,
+                pct_levels=[tp1_pct],
+                reduce_levels=[self.rule_tp1_reduce_pct],
+            )
+            if tp_levels:
+                tp1_price = tp_levels[0].get("price")
+
         return {
-            **base_result,
-            "regime": "NO_TRADE",
-            "direction": "BOTH",
+            "valid": True,
+            "direction": side,
+            "stop_anchor_price": stop_anchor,
+            "stop_trigger_price": stop_trigger_price,
+            "raw_stop_pct": raw_stop_pct,
+            "effective_stop_pct": effective_stop_pct,
+            "tp1_pct": tp1_pct,
+            "tp1_price": tp1_price,
+            "tp_levels": tp_levels,
+            "runner_activate_pct": self.rule_runner_activate_pct,
+            "runner_reduce_pct": self.rule_tp1_reduce_pct,
+            "stop_buffer_pct": self.rule_stop_buffer_pct,
+        }
+    def _rule_entry_confluence(self, market_flow_context: Dict[str, Any], regime_info: Dict[str, Any]) -> Dict[str, Any]:
+        _, entry_tf = self._rule_strategy_context(market_flow_context)
+        direction = str(regime_info.get("direction", "BOTH")).upper()
+        close_price = self._to_float(entry_tf.get("last_close"), 0.0)
+        open_price = self._to_float(entry_tf.get("last_open"), 0.0)
+        ema10 = self._to_float(
+            entry_tf.get("ema_10"),
+            self._to_float(entry_tf.get("ema10"), self._to_float(entry_tf.get("ema_attack"), 0.0)),
+        )
+        ema30 = self._to_float(
+            entry_tf.get("ema_30"),
+            self._to_float(entry_tf.get("ema30"), self._to_float(entry_tf.get("ema_mid"), 0.0)),
+        )
+        ema_cross = str(entry_tf.get("ema_cross", "NONE")).upper()
+        macd_cross = str(entry_tf.get("macd_cross", "NONE")).upper()
+        macd_zone = str(entry_tf.get("macd_zone", "NEAR_ZERO")).upper()
+        macd_hist = self._to_float(entry_tf.get("macd_hist"), 0.0)
+        macd_hist_expand_up = bool(entry_tf.get("macd_hist_expand_up", False))
+        macd_hist_expand_down = bool(entry_tf.get("macd_hist_expand_down", False))
+        bb_break = str(entry_tf.get("bb_break", "NONE")).upper()
+        bb_width_expand = bool(entry_tf.get("bb_width_expand", False))
+        bb_middle = self._to_float(entry_tf.get("bb_middle"), 0.0)
+        bb_upper = self._to_float(entry_tf.get("bb_upper"), 0.0)
+        bb_lower = self._to_float(entry_tf.get("bb_lower"), 0.0)
+        if close_price <= 0 or ema10 <= 0 or ema30 <= 0:
+            return {
+                "long_ok": False,
+                "short_ok": False,
+                "reason": f"missing_{self.rule_entry_timeframe}_context",
+                "entry_tf": entry_tf,
+            }
+
+        long_ema_bias = ema10 > ema30 and close_price >= ema30
+        short_ema_bias = ema10 < ema30 and close_price <= ema30
+        long_ema_cross_ok = ema_cross == "GOLDEN"
+        short_ema_cross_ok = ema_cross == "DEAD"
+        long_macd_ok = long_ema_bias and long_ema_cross_ok and (
+            macd_cross == "GOLDEN"
+            or (macd_zone == "ABOVE_ZERO" and (macd_hist > 0 or macd_hist_expand_up))
+        )
+        short_macd_ok = short_ema_bias and short_ema_cross_ok and (
+            macd_cross == "DEAD"
+            or (macd_zone == "BELOW_ZERO" and (macd_hist < 0 or macd_hist_expand_down))
+        )
+        long_bb_ok = long_ema_bias and bb_break == "UPPER" and bb_width_expand
+        short_bb_ok = short_ema_bias and bb_break == "LOWER" and bb_width_expand
+
+        long_models: List[str] = []
+        short_models: List[str] = []
+        if long_macd_ok:
+            long_models.append("EMA_MACD")
+        if long_bb_ok:
+            long_models.append("EMA_BB")
+        if short_macd_ok:
+            short_models.append("EMA_MACD")
+        if short_bb_ok:
+            short_models.append("EMA_BB")
+
+        long_ok = direction == "LONG_ONLY" and bool(long_models)
+        short_ok = direction == "SHORT_ONLY" and bool(short_models)
+        reason = "entry_ready"
+        if not long_ok and not short_ok:
+            reason = (
+                f"15m_confluence_block dir={direction} ema_cross={ema_cross} "
+                f"macd={macd_cross}/{macd_zone} bb={bb_break}/expand={int(bb_width_expand)}"
+            )
+
+        return {
+            "long_ok": bool(long_ok),
+            "short_ok": bool(short_ok),
+            "long_models": long_models,
+            "short_models": short_models,
+            "entry_close": close_price,
+            "entry_open": open_price,
+            "entry_ema10": ema10,
+            "entry_ema30": ema30,
+            "ema_cross": ema_cross,
+            "macd_cross": macd_cross,
+            "macd_zone": macd_zone,
+            "macd_hist": macd_hist,
+            "macd_hist_expand_up": bool(macd_hist_expand_up),
+            "macd_hist_expand_down": bool(macd_hist_expand_down),
+            "bb_middle": bb_middle,
+            "bb_upper": bb_upper,
+            "bb_lower": bb_lower,
+            "bb_break": bb_break,
+            "bb_width_expand": bool(bb_width_expand),
             "reason": reason,
         }
+    def _rule_stop_trigger(
+        self,
+        position_side: str,
+        market_flow_context: Dict[str, Any],
+        fallback_price: float,
+        current_pos: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        _, entry_tf = self._rule_strategy_context(market_flow_context)
+        entry_close = self._to_float(entry_tf.get("last_close"), fallback_price)
+        ema10 = self._to_float(
+            entry_tf.get("ema_10"),
+            self._to_float(entry_tf.get("ema10"), self._to_float(entry_tf.get("ema_attack"), 0.0)),
+        )
+        ema30 = self._to_float(
+            entry_tf.get("ema_30"),
+            self._to_float(entry_tf.get("ema30"), self._to_float(entry_tf.get("ema_mid"), 0.0)),
+        )
+        macd_cross = str(entry_tf.get("macd_cross", "NONE")).upper()
+        macd_zone = str(entry_tf.get("macd_zone", "NEAR_ZERO")).upper()
+        if entry_close <= 0 or ema30 <= 0:
+            return {
+                "triggered": False,
+                "reason": "missing_entry_stop_context",
+                "entry_close": entry_close,
+                "entry_ema10": ema10,
+                "entry_ema30": ema30,
+                "entry_macd_cross": macd_cross,
+                "entry_macd_zone": macd_zone,
+            }
 
+        side = str(position_side or "").upper()
+        pnl_ratio = self._rule_position_pnl_ratio(side, current_pos, entry_close)
+        runner_active = bool(pnl_ratio >= self.rule_runner_activate_pct and ema10 > 0)
+        stop_anchor_label = f"ema{self.rule_runner_ema_period}" if runner_active else f"ema{self.rule_stop_ema_period}"
+        stop_anchor = ema10 if runner_active and ema10 > 0 else ema30
+        stop_buffer_pct = self.rule_stop_break_buffer_pct
+        exit_trigger = "NONE"
+        ema_break_triggered = False
+        macd_triggered = False
+        if side == "LONG":
+            stop_trigger_price = stop_anchor * (1.0 - stop_buffer_pct)
+            ema_break_triggered = entry_close < stop_trigger_price
+            macd_triggered = macd_cross == "DEAD"
+            if ema_break_triggered:
+                exit_trigger = f"{stop_anchor_label}_break"
+            elif macd_triggered:
+                exit_trigger = "macd_dead_cross"
+            triggered = ema_break_triggered or macd_triggered
+        elif side == "SHORT":
+            stop_trigger_price = stop_anchor * (1.0 + stop_buffer_pct)
+            ema_break_triggered = entry_close > stop_trigger_price
+            macd_triggered = macd_cross == "GOLDEN" and macd_zone == "BELOW_ZERO"
+            if ema_break_triggered:
+                exit_trigger = f"{stop_anchor_label}_break"
+            elif macd_triggered:
+                exit_trigger = "macd_golden_cross_below_zero"
+            triggered = ema_break_triggered or macd_triggered
+        else:
+            stop_trigger_price = stop_anchor
+            triggered = False
+        exit_stage = "RUNNER" if runner_active else "STOP"
+        return {
+            "triggered": bool(triggered),
+            "reason": (
+                f"15m_{exit_stage.lower()}_{exit_trigger.lower()} side={side} close={entry_close:.4f} "
+                f"trigger={stop_trigger_price:.4f} pnl={pnl_ratio:.4f}"
+            ),
+            "entry_close": entry_close,
+            "entry_ema10": ema10,
+            "entry_ema30": ema30,
+            "entry_macd_cross": macd_cross,
+            "entry_macd_zone": macd_zone,
+            "stop_anchor_price": stop_anchor,
+            "stop_anchor_label": stop_anchor_label,
+            "stop_trigger_price": stop_trigger_price,
+            "runner_active": runner_active,
+            "pnl_ratio": pnl_ratio,
+            "stop_buffer_pct": stop_buffer_pct,
+            "exit_stage": exit_stage,
+            "exit_trigger": exit_trigger,
+            "ema_break_triggered": bool(ema_break_triggered),
+            "macd_triggered": bool(macd_triggered),
+        }
+    def _decide_rule_strategy(
+        self,
+        symbol: str,
+        portfolio: Dict[str, Any],
+        price: float,
+        market_flow_context: Dict[str, Any],
+        regime_info: Dict[str, Any],
+    ) -> FundFlowDecision:
+        engine_params = self._engine_params_for("TREND")
+        current_pos = (portfolio.get("positions") or {}).get(symbol)
+        pos_side = str((current_pos or {}).get("side", "")).upper()
+
+        aux_score_15m = {"long_score": 0.0, "short_score": 0.0}
+        aux_score_5m = {"long_score": 0.0, "short_score": 0.0}
+        aux_flow_confirm = 0.0
+        aux_consistency_3bars = 0
+        if self.rule_legacy_auxiliary_filters_enabled:
+            tf_15m_ctx = self._extract_15m_context(market_flow_context or {})
+            tf_5m_ctx = self._extract_5m_context(market_flow_context or {})
+            aux_score_15m = self._score_trend(tf_15m_ctx) if tf_15m_ctx else {"long_score": 0.0, "short_score": 0.0}
+            aux_score_5m = self._score_trend(tf_5m_ctx) if tf_5m_ctx else {"long_score": 0.0, "short_score": 0.0}
+            aux_flow_confirm, aux_consistency_3bars = self._compute_flow_consistency(
+                market_flow_context or {}, tf_15m_ctx, tf_5m_ctx
+            )
+
+        confluence = self._rule_entry_confluence(market_flow_context or {}, regime_info)
+        metadata = {
+            "strategy_mode": self.strategy_mode,
+            "entry_logic": "1h_ema30_direction + 15m_ema10_cross_ema30_macd_or_ema_bias_bb + ema30_macd_stop + ema10_macd_runner",
+            "trend_timeframe": self.rule_primary_trend_timeframe,
+            "entry_timeframe": self.rule_entry_timeframe,
+            "attack_ema_period": self.rule_attack_ema_period,
+            "trend_ema_period": self.rule_ema_period,
+            "stop_ema_period": self.rule_stop_ema_period,
+            "runner_ema_period": self.rule_runner_ema_period,
+            "regime": regime_info.get("regime"),
+            "direction_lock": regime_info.get("direction", "BOTH"),
+            "regime_reason": regime_info.get("reason"),
+            "trend_ema30": regime_info.get("trend_ema30", 0.0),
+            "trend_distance_pct": regime_info.get("trend_distance_pct", 0.0),
+            "trend_ema30_slope_pct": regime_info.get("trend_ema30_slope_pct", 0.0),
+            "entry_ema10": confluence.get("entry_ema10", 0.0),
+            "entry_ema30": confluence.get("entry_ema30", 0.0),
+            "entry_close": confluence.get("entry_close", 0.0),
+            "entry_open": confluence.get("entry_open", 0.0),
+            "entry_ema_cross": confluence.get("ema_cross", "NONE"),
+            "entry_macd_cross": confluence.get("macd_cross", "NONE"),
+            "entry_macd_zone": confluence.get("macd_zone", "NEAR_ZERO"),
+            "entry_macd_hist": confluence.get("macd_hist", 0.0),
+            "entry_macd_hist_expand_up": bool(confluence.get("macd_hist_expand_up", False)),
+            "entry_macd_hist_expand_down": bool(confluence.get("macd_hist_expand_down", False)),
+            "entry_bb_middle": confluence.get("bb_middle", 0.0),
+            "entry_bb_upper": confluence.get("bb_upper", 0.0),
+            "entry_bb_lower": confluence.get("bb_lower", 0.0),
+            "entry_bb_break": confluence.get("bb_break", "NONE"),
+            "entry_bb_width_expand": bool(confluence.get("bb_width_expand", False)),
+            "entry_long_models": list(confluence.get("long_models", [])),
+            "entry_short_models": list(confluence.get("short_models", [])),
+            "runner_activate_pct": self.rule_runner_activate_pct,
+            "tp1_reduce_pct": self.rule_tp1_reduce_pct,
+        }
+
+        default_lev = int(engine_params.get("default_leverage", self.default_leverage))
+        min_lev = int(engine_params.get("min_leverage", self.min_leverage))
+        max_lev = int(engine_params.get("max_leverage", self.max_leverage))
+        allowed_levs = self._normalize_leverage_levels(
+            engine_params.get("allowed_leverage_values", self.allowed_leverage_values)
+        )
+        target_portion = float(engine_params.get("default_target_portion", self.default_portion))
+
+        if pos_side in {"LONG", "SHORT"}:
+            stop_state = self._rule_stop_trigger(
+                pos_side,
+                market_flow_context or {},
+                price,
+                current_pos=current_pos,
+            )
+            metadata["stop_trigger"] = stop_state
+            if bool(stop_state.get("triggered", False)):
+                if pos_side == "LONG":
+                    return FundFlowDecision(
+                        operation=Operation.CLOSE,
+                        symbol=symbol,
+                        target_portion_of_balance=1.0,
+                        leverage=default_lev,
+                        max_price=price * (1.0 + self.entry_slippage),
+                        reason=f"RULE_STOP_LONG {stop_state.get('reason')}",
+                        metadata=metadata,
+                    )
+                return FundFlowDecision(
+                    operation=Operation.CLOSE,
+                    symbol=symbol,
+                    target_portion_of_balance=1.0,
+                    leverage=default_lev,
+                    min_price=price * (1.0 - self.entry_slippage),
+                    reason=f"RULE_STOP_SHORT {stop_state.get('reason')}",
+                    metadata=metadata,
+                )
+            return FundFlowDecision(
+                operation=Operation.HOLD,
+                symbol=symbol,
+                target_portion_of_balance=0.0,
+                leverage=default_lev,
+                reason=(
+                    f"position_hold_no_15m_{stop_state.get('stop_anchor_label', 'ema30')}_break dir={pos_side}"
+                ),
+                metadata=metadata,
+            )
+
+        if str(regime_info.get("regime", "NO_TRADE")).upper() == "NO_TRADE":
+            return FundFlowDecision(
+                operation=Operation.HOLD,
+                symbol=symbol,
+                target_portion_of_balance=0.0,
+                leverage=default_lev,
+                reason=f"rule_regime_block {regime_info.get('reason')}",
+                metadata=metadata,
+            )
+
+        long_models = list(confluence.get("long_models", []))
+        short_models = list(confluence.get("short_models", []))
+        long_strength = min(1.0, 0.55 + 0.15 * len(long_models)) if confluence.get("long_ok") else 0.0
+        short_strength = min(1.0, 0.55 + 0.15 * len(short_models)) if confluence.get("short_ok") else 0.0
+
+        if confluence.get("long_ok") and not confluence.get("short_ok"):
+            risk_plan = self._rule_build_risk_plan(
+                direction="LONG",
+                entry_price=price,
+                stop_anchor=self._to_float(confluence.get("entry_ema30"), 0.0),
+                entry_models=long_models,
+            )
+            metadata["risk_plan"] = risk_plan
+            if not bool(risk_plan.get("valid", False)):
+                return FundFlowDecision(
+                    operation=Operation.HOLD,
+                    symbol=symbol,
+                    target_portion_of_balance=0.0,
+                    leverage=default_lev,
+                    reason=f"rule_risk_block {risk_plan.get('reason', 'invalid_risk_plan')}",
+                    metadata=metadata,
+                )
+            leverage = self._pick_leverage(
+                long_strength,
+                0.55,
+                min_leverage=min_lev,
+                max_leverage=max_lev,
+                default_leverage=default_lev,
+                allowed_levels=allowed_levs,
+            )
+            tp_levels = list(risk_plan.get("tp_levels") or [])
+            take_profit_price = risk_plan.get("tp1_price")
+            stop_loss_price = risk_plan.get("stop_trigger_price")
+            return self._apply_symbol_side_override(
+                FundFlowDecision(
+                    operation=Operation.BUY,
+                    symbol=symbol,
+                    target_portion_of_balance=target_portion,
+                    leverage=leverage,
+                    max_price=price * (1.0 + self.entry_slippage),
+                    take_profit_price=take_profit_price,
+                    stop_loss_price=stop_loss_price,
+                    time_in_force=TimeInForce.IOC,
+                    tp_execution=ExecutionMode.LIMIT,
+                    sl_execution=ExecutionMode.LIMIT,
+                    reason=f"RULE_LONG 1H_EMA30 + 15M_{'+'.join(long_models)}",
+                    metadata={
+                        **metadata,
+                        "tp_levels": tp_levels,
+                        "runner_exit": "15m_ema10_or_macd_after_profit",
+                        "leverage_model": {"min": min_lev, "max": max_lev, "levels": allowed_levs, "picked": leverage},
+                    },
+                )
+            )
+
+        if confluence.get("short_ok") and not confluence.get("long_ok"):
+            risk_plan = self._rule_build_risk_plan(
+                direction="SHORT",
+                entry_price=price,
+                stop_anchor=self._to_float(confluence.get("entry_ema30"), 0.0),
+                entry_models=short_models,
+            )
+            metadata["risk_plan"] = risk_plan
+            if not bool(risk_plan.get("valid", False)):
+                return FundFlowDecision(
+                    operation=Operation.HOLD,
+                    symbol=symbol,
+                    target_portion_of_balance=0.0,
+                    leverage=default_lev,
+                    reason=f"rule_risk_block {risk_plan.get('reason', 'invalid_risk_plan')}",
+                    metadata=metadata,
+                )
+            leverage = self._pick_leverage(
+                short_strength,
+                0.55,
+                min_leverage=min_lev,
+                max_leverage=max_lev,
+                default_leverage=default_lev,
+                allowed_levels=allowed_levs,
+            )
+            tp_levels = list(risk_plan.get("tp_levels") or [])
+            take_profit_price = risk_plan.get("tp1_price")
+            stop_loss_price = risk_plan.get("stop_trigger_price")
+            return self._apply_symbol_side_override(
+                FundFlowDecision(
+                    operation=Operation.SELL,
+                    symbol=symbol,
+                    target_portion_of_balance=target_portion,
+                    leverage=leverage,
+                    min_price=price * (1.0 - self.entry_slippage),
+                    take_profit_price=take_profit_price,
+                    stop_loss_price=stop_loss_price,
+                    time_in_force=TimeInForce.IOC,
+                    tp_execution=ExecutionMode.LIMIT,
+                    sl_execution=ExecutionMode.LIMIT,
+                    reason=f"RULE_SHORT 1H_EMA30 + 15M_{'+'.join(short_models)}",
+                    metadata={
+                        **metadata,
+                        "tp_levels": tp_levels,
+                        "runner_exit": "15m_ema10_or_macd_after_profit",
+                        "leverage_model": {"min": min_lev, "max": max_lev, "levels": allowed_levs, "picked": leverage},
+                    },
+                )
+            )
+
+        return FundFlowDecision(
+            operation=Operation.HOLD,
+            symbol=symbol,
+            target_portion_of_balance=0.0,
+            leverage=default_lev,
+            reason=confluence.get("reason", "rule_entry_block"),
+            metadata=metadata,
+        )
     def _should_apply_direction_lock(self, regime: str, direction: str, regime_info: Dict[str, Any]) -> bool:
         if regime != "TREND":
             return False
@@ -2202,7 +2665,6 @@ class FundFlowDecisionEngine:
         adx = self._to_float(regime_info.get("adx"), 0.0)
         adx_strong = adx >= (self.regime_adx_trend_on + self.direction_lock_soft_adx_buffer)
         return bool(adx_strong)
-
     def _compute_trend_pending(
         self,
         symbol: str,
@@ -3354,6 +3816,8 @@ class FundFlowDecisionEngine:
         regime_info = self._detect_regime(market_flow_context or {})
         regime = str(regime_info.get("regime", "NO_TRADE")).upper()
         direction = str(regime_info.get("direction", "BOTH")).upper()
+        if self.rule_strategy_enabled:
+            return self._decide_rule_strategy(symbol, portfolio, price, market_flow_context or {}, regime_info)
         trend_cfg = self._trend_capture_config()
         trend_pending = self._compute_trend_pending(symbol, market_flow_context or {}, regime_info, cfg=trend_cfg)
         
@@ -4340,3 +4804,6 @@ class FundFlowDecisionEngine:
             reason=resolved.reason or f"{regime}信号不足 long={long_score:.3f} short={short_score:.3f}",
             metadata={**metadata_base, **score_out, **resolved_md},
         )
+
+
+

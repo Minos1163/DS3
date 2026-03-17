@@ -1,0 +1,23 @@
+{
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XAGUSDT",
+    "LTCUSDT"
+  ],
+  "initial_capital": 1000.0,
+  "final_equity": 271.846195,
+  "total_return_pct": -72.8154,
+  "max_drawdown_pct": -75.2086,
+  "trade_count": 260,
+  "win_rate_pct": 20.0,
+  "avg_trade_pnl": -2.453981,
+  "profit_factor": 0.591829,
+  "max_active_symbols": 2,
+  "leverage": 4.0,
+  "margin_pct_per_trade": 0.4,
+  "days": 30,
+  "warmup_days": 7
+}

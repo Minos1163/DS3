@@ -1,0 +1,174 @@
+{
+  "mode": "strict",
+  "profile_name": "doge_sol_focus",
+  "allowed_entry_hours": [
+    0,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    12,
+    14,
+    15,
+    16,
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "symbols": [
+    "DOGEUSDT",
+    "SOLUSDT"
+  ],
+  "initial_capital": 1000.0,
+  "final_equity": 1093.229673,
+  "total_return_pct": 9.323,
+  "max_drawdown_pct": -5.5062,
+  "trade_count": 32,
+  "win_rate_pct": 37.5,
+  "avg_trade_pnl": 3.096026,
+  "profit_factor": 1.836961,
+  "max_active_symbols": 2,
+  "max_same_side_positions": 1,
+  "leverage": 4.0,
+  "margin_pct_per_trade": 0.12,
+  "cooldown_bars": 16,
+  "min_1h_slope_pct": 0.0011,
+  "min_macd_hist_pct": 0.0001,
+  "min_bb_width_delta": 0.0008,
+  "require_dual_models": true,
+  "max_daily_loss_percent": 5.0,
+  "max_consecutive_losses": 2,
+  "consecutive_loss_cooldown_seconds": 1800,
+  "risk_events": [
+    {
+      "timestamp": "2026-02-16T01:00:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-02-16T01:30:00"
+    },
+    {
+      "timestamp": "2026-02-16T17:15:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=3 until=2026-02-16T17:45:00"
+    },
+    {
+      "timestamp": "2026-02-17T12:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=4 until=2026-02-17T13:00:00"
+    },
+    {
+      "timestamp": "2026-02-17T16:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=5 until=2026-02-17T17:00:00"
+    },
+    {
+      "timestamp": "2026-02-19T06:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=6 until=2026-02-19T07:00:00"
+    },
+    {
+      "timestamp": "2026-02-19T15:00:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=7 until=2026-02-19T15:30:00"
+    },
+    {
+      "timestamp": "2026-02-19T17:15:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=8 until=2026-02-19T17:45:00"
+    },
+    {
+      "timestamp": "2026-02-20T11:45:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=9 until=2026-02-20T12:15:00"
+    },
+    {
+      "timestamp": "2026-02-21T20:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=10 until=2026-02-21T21:00:00"
+    },
+    {
+      "timestamp": "2026-03-04T06:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-03-04T07:00:00"
+    },
+    {
+      "timestamp": "2026-03-06T07:15:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-03-06T07:45:00"
+    },
+    {
+      "timestamp": "2026-03-06T10:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=3 until=2026-03-06T11:00:00"
+    }
+  ],
+  "analysis": {
+    "worst_symbols": [
+      {
+        "symbol": "DOGEUSDT",
+        "trade_count": 10,
+        "total_pnl": 31.751939070000002,
+        "avg_pnl": 3.175193907,
+        "win_rate": 30.0
+      },
+      {
+        "symbol": "SOLUSDT",
+        "trade_count": 22,
+        "total_pnl": 67.32088203,
+        "avg_pnl": 3.0600400922727276,
+        "win_rate": 40.909090909090914
+      }
+    ],
+    "worst_entry_hours": [
+      {
+        "entry_hour": 14,
+        "trade_count": 5,
+        "total_pnl": -28.673122489999997,
+        "avg_pnl": -5.734624498,
+        "win_rate": 20.0
+      },
+      {
+        "entry_hour": 4,
+        "trade_count": 3,
+        "total_pnl": -13.652554599999998,
+        "avg_pnl": -4.550851533333333,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 19,
+        "trade_count": 2,
+        "total_pnl": -12.12460698,
+        "avg_pnl": -6.06230349,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 9,
+        "trade_count": 2,
+        "total_pnl": -9.01382396,
+        "avg_pnl": -4.50691198,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 10,
+        "trade_count": 1,
+        "total_pnl": -7.37262731,
+        "avg_pnl": -7.37262731,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 16,
+        "trade_count": 1,
+        "total_pnl": -7.16521433,
+        "avg_pnl": -7.16521433,
+        "win_rate": 0.0
+      }
+    ]
+  },
+  "days": 30,
+  "warmup_days": 7
+}

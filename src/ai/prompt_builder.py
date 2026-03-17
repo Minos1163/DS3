@@ -50,7 +50,7 @@ class PromptBuilder:
 - 币种: {symbol}
 - 资金类型: 永续期货合约
 - 支持双向交易: 可以做多(买入)或做空(卖出)
-- 杠杆范围: 1-100倍（建议3-10倍）
+- 杠杆范围: {self.config.get("fund_flow", {}).get("min_leverage", self.config["trading"].get("min_leverage", 3))}-{self.config.get("fund_flow", {}).get("max_leverage", self.config["trading"].get("max_leverage", 5))}倍（默认{self.config.get("fund_flow", {}).get("default_leverage", self.config["trading"].get("default_leverage", 4))}倍）
 
 ### 决策原则
 请基于以下技术指标和市场数据进行理性分析，给出最优交易决策。
@@ -86,8 +86,8 @@ class PromptBuilder:
 {{
     "action": "BUY_OPEN" | "SELL_OPEN" | "CLOSE" | "HOLD",
     "confidence": 0.0-1.0,
-    "leverage": 1-100,
-    "position_percent": 10-30,
+    "leverage": {self.config.get("fund_flow", {}).get("default_leverage", self.config["trading"].get("default_leverage", 4))},
+    "position_percent": {self.config["trading"].get("max_position_percent", 30)},
     "take_profit_percent": 5.0,
     "stop_loss_percent": -2.0,
     "reason": "1-2句话说明决策理由，包含关键指标和值"
@@ -96,8 +96,8 @@ class PromptBuilder:
 ### 字段说明:
 - action: BUY_OPEN(开多)/SELL_OPEN(开空)/CLOSE(平仓)/HOLD(持有)
 - confidence: 信心度 0.0-1.0
-- leverage: 杠杆倍数 1-100
-- position_percent: 仓位百分比 10-30
+- leverage: 杠杆倍数（范围 {self.config.get("fund_flow", {}).get("min_leverage", self.config["trading"].get("min_leverage", 3))}-{self.config.get("fund_flow", {}).get("max_leverage", self.config["trading"].get("max_leverage", 5))}）
+- position_percent: 仓位百分比（范围 {self.config["trading"].get("min_position_percent", 10)}-{self.config["trading"].get("max_position_percent", 30)}）
 - take_profit_percent: 止盈百分比（相对于开仓价）
 - stop_loss_percent: 止损百分比（相对于开仓价）
 - reason: 决策理由（关键指标+值）
@@ -198,30 +198,33 @@ class PromptBuilder:
         account_summary: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        """
-        构建多币种统一分析提示词
+        """构建多币种统一分析提示词"""
+        default_lev = self.config.get("fund_flow", {}).get("default_leverage", self.config["trading"].get("default_leverage", 4))
+        min_lev = self.config.get("fund_flow", {}).get("min_leverage", self.config["trading"].get("min_leverage", 3))
+        max_lev = self.config.get("fund_flow", {}).get("max_leverage", self.config["trading"].get("max_leverage", 5))
+        max_pos = self.config["trading"].get("max_position_percent", 60)
+        configured_symbols = self.config.get("trading", {}).get("symbols", []) or []
+        symbol_text = "、".join(str(s) for s in configured_symbols) if configured_symbols else "按配置文件交易标的"
+        sample_buy_symbol = str(configured_symbols[0]) if configured_symbols else "BTCUSDT"
+        sample_hold_symbol = str(configured_symbols[1]) if len(configured_symbols) > 1 else sample_buy_symbol
 
-        Args:
-            all_symbols_data: {{symbol: {{market_data, position}}}}
-            all_positions: {{symbol: position_info}}
-            account_summary: 账户摘要
-            history: 历史决策记录
-
-        Returns:
-            完整的多币种提示词
-        """
         prompt = f"""
-# 高胜率交易决策系统 (目标: 80%+)
+# 合约短线交易决策系统
 
 时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-## 优化策略 (提升胜率至80%+)
-1. ✅ 只交易BTC/ETH/SOL主流币（高流动性、低噪音）
-2. ✅ 成交量放大确认（15m成交量比>150%）
-3. ✅ 移动止损保护（盈利>5%后止损上移到成本价）
-4. ✅ 避开低波动时段（UTC 00:00-08:00）
+## 主策略
+- 交易标的: 以 JSON 配置为准，当前监控 {symbol_text}
+- 主周期: 1H，只负责方向过滤
+- 入场周期: 15M，只负责起爆共振
+- 主方向规则: 价格在 1H EMA30 上方只做多；价格在 1H EMA30 下方只做空；1H EMA30 走平则观望
+- 入场规则A: 15M EMA10/EMA30 同向 + MACD 金叉/零轴上 做多；15M EMA10/EMA30 同向 + MACD 死叉/零轴下 做空
+- 入场规则B: 15M EMA10/EMA30 同向 + 布林上轨突破且开口扩大 做多；15M EMA10/EMA30 同向 + 布林下轨跌破且开口扩大 做空
+- 动态止损: 以 15M EMA30 破位为硬止损锚点，允许适度缓冲，止损可放宽到约 1%-2.5%
+- 动态止盈: 先在 5%-10% 区间减仓 1/2，剩余仓位改看 15M EMA10 runner 出场
+- 5m/3m: 仅作辅助过滤和置信度参考，不能推翻 1H/15M 主链
 
-仓位: 单币最大{self.config["trading"].get("max_position_percent", 30)}% | 杠杆: 3-10x | 止损: 严格-0.6% | 止盈: 趋势反转时
+仓位: 单币最大{max_pos}% | 杠杆: {min_lev}-{max_lev}x（默认{default_lev}x）
 
 ## 市场数据
 {self._format_all_symbols_data(all_symbols_data)}
@@ -229,52 +232,27 @@ class PromptBuilder:
 ## 账户状态
 {self._format_account_summary(account_summary) if account_summary else ""}
 
-## 决策规则 (严格执行)
-
-### 【入场信号 - 必须全部满足】
-**BUY_OPEN (做多):**
-1. 1d EMA20>EMA50 且 4h EMA20>EMA50 (主趋势向上)
-2. 1h/4h RSI均未超买(<70) 且15m RSI在30-50区间(回调完成)
-3. 4h MACD柱转正 或 持续为正
-4. ✅ 15m成交量比>150% (放量确认)
-5. confidence: HIGH
-
-**SELL_OPEN (做空):**
-1. 1d EMA20<EMA50 且 4h EMA20<EMA50 (主趋势向下)
-2. 1h/4h RSI均未超卖(>30) 且15m RSI在50-70区间(反弹完成)
-3. 4h MACD柱转负 或 持续为负
-4. ✅ 15m成交量比>150% (放量确认)
-5. confidence: HIGH
-
-### 【出场信号】
-**CLOSE (平仓):**
-1. 持仓浮亏接近-0.6% (距离止损20%以内即-0.48%时)
-2. 主趋势反转: 4h EMA20穿越EMA50反向
-3. 4h MACD柱颜色反转 (多单MACD转负 / 空单MACD转正)
-4. ⚠️ 禁止在盈利<5%时因小幅回调就平仓
-5. ℹ️ 盈利>5%会自动启动移动止损保护
-
-**HOLD (观望):**
-1. 任一入场条件不满足
-2. 信号矛盾 (如1d上升但4h下降)
-3. RSI处于50附近区间 (45-55震荡)
-4. 15m成交量比<=150% (缺乏放量确认)
+## 输出要求
+- 只在 1H 方向明确且 15M 至少一套共振成立时开仓
+- 做多/做空方向不能与 1H EMA30 方向冲突
+- 原因只写 1H 方向 + 15M 共振类型 + 15M EMA30/EMA10 动态风控
+- 若条件不全，统一输出 HOLD
 
 ## 输出格式 (纯JSON,无任何额外文本)
 
 {{
-    "BTCUSDT": {{
+    "{sample_buy_symbol}": {{
         "action": "BUY_OPEN",
-        "reason": "1d/4h上升趋势,4h MACD转正,15m RSI 42回调到位,成交量比180%放量",
+        "reason": "1H站上EMA30,15M EMA+MACD共振做多,止损看15M EMA30,止盈后看15M EMA10",
         "confidence": "HIGH",
-        "leverage": 8,
-        "position_percent": 25,
-        "take_profit_percent": 14.0,
-        "stop_loss_percent": -0.6
+        "leverage": {default_lev},
+        "position_percent": {max_pos},
+        "take_profit_percent": 0,
+        "stop_loss_percent": 0
     }},
-    "ETHUSDT": {{
+    "{sample_hold_symbol}": {{
         "action": "HOLD",
-        "reason": "1d上升但4h下降,信号矛盾",
+        "reason": "1H方向不清晰或15M共振不足",
         "confidence": "LOW",
         "leverage": 0,
         "position_percent": 0,
@@ -284,16 +262,15 @@ class PromptBuilder:
 }}
 
 ⚠️ 关键要求:
-- JSON键: 完整交易对名称 (BTCUSDT/ETHUSDT/SOLUSDT)
-- reason: 简洁说明周期趋势+关键指标+成交量比,不要冗长推理
-- 严格执行规则: 条件不满足=HOLD,不要强行交易
-- 止损统一-0.6%, 止盈建议+14.0% (趋势结束前不提前出场)
-- 成交量确认: 入场必须15m成交量比>150%
+- JSON键: 完整交易对名称
+- 严格执行 1H -> 15M 顺序，不允许倒置
+- 动态止损锚点统一参考 15M EMA30，盈利后 runner 改看 15M EMA10
+- 5m/3m 只能作为辅助说明，不能成为主开仓理由
 """
         return prompt.strip()
 
     def _format_all_symbols_data(self, all_symbols_data: Dict[str, Any]) -> str:
-        """格式化所有币种的市场数据 (优化版 - 突出关键周期+指标)"""
+        """格式化所有币种的市场数据（聚焦 1H/15M 主链，5m 仅辅助）"""
         result_lines: List[str] = []
 
         for symbol, symbol_data in all_symbols_data.items():
@@ -308,45 +285,38 @@ class PromptBuilder:
             block = [f"=== {coin_name}/USDT ==="]
             block.append(f"价格: ${price:,.2f} | 24h变化: {change_24h:+.2f}%")
 
-            # 持仓信息
             if position:
-                pos = position
-                pnl_percent = pos.get("pnl_percent") or 0
-                side = pos.get("side", "N/A")
-                entry_price = pos.get("entry_price") or 0
-                mark_price = pos.get("mark_price") or 0
+                pnl_percent = position.get("pnl_percent") or 0
+                side = position.get("side", "N/A")
+                entry_price = position.get("entry_price") or 0
+                mark_price = position.get("mark_price") or 0
                 block.append(f"✅ 持仓 {side} @ ${entry_price:.2f} → ${mark_price:.2f} (盈亏{pnl_percent:+.2f}%)")
             else:
                 block.append("⭕ 无持仓")
 
-            # 关键周期指标 (1d/4h/1h/15m)
             multi_data = market_data.get("multi_timeframe", {}) or {}
-            key_intervals = ["1d", "4h", "1h", "15m"]
-            
-            for interval in key_intervals:
+            for interval in ("1h", "15m", "5m"):
                 data = multi_data.get(interval) or {}
                 ind = data.get("indicators") or {}
-                
                 if not ind:
                     block.append(f"[{interval}] 数据缺失")
                     continue
-                
-                rsi = ind.get("rsi") or 0
+
+                ema10 = ind.get("ema_10") or 0
+                ema30 = ind.get("ema_30") or 0
                 macd = ind.get("macd") or 0
                 macd_hist = ind.get("macd_histogram") or 0
-                ema20 = ind.get("ema_20") or 0
-                ema50 = ind.get("ema_50") or 0
-                
-                # 判断趋势
-                trend = "📈上升" if ema20 > ema50 else "📉下降" if ema20 < ema50 else "➡️横盘"
-                macd_signal = "✅转正" if macd_hist > 0 else "❌转负"
-                rsi_status = "🔴超买" if rsi > 70 else "🟢超卖" if rsi < 30 else "⚪中性"
-                
-                block.append(
-                    f"[{interval}] {trend} | RSI {rsi:.1f}{rsi_status} | "
-                    f"MACD {macd:.4f}{macd_signal} | EMA20/50: {ema20:.2f}/{ema50:.2f}"
-                )
-
+                bb_middle = ind.get("bollinger_middle") or 0
+                bb_upper = ind.get("bollinger_upper") or 0
+                bb_lower = ind.get("bollinger_lower") or 0
+                trend = "上方" if price > ema30 else "下方" if price < ema30 else "贴近"
+                macd_state = "零轴上/偏多" if macd >= 0 or macd_hist >= 0 else "零轴下/偏空"
+                if interval in ("1h", "15m"):
+                    block.append(
+                        f"[{interval}] EMA10/EMA30={ema10:.2f}/{ema30:.2f} | 现价相对EMA30: {trend} | MACD={macd:.4f}({macd_state}) | BB中/上/下={bb_middle:.2f}/{bb_upper:.2f}/{bb_lower:.2f}"
+                    )
+                else:
+                    block.append(f"[{interval}] 辅助观察: MACD={macd:.4f} | BB中轨={bb_middle:.2f}")
             result_lines.append("\n".join(block))
 
         return "\n\n".join(result_lines)
@@ -364,3 +334,4 @@ class PromptBuilder:
 可用余额: {available:.2f} USDT
 未实现盈亏: {unrealized_pnl:+.2f} USDT
 """
+

@@ -1,0 +1,72 @@
+{
+  "mode": "strict",
+  "profile_name": "",
+  "allowed_entry_hours": null,
+  "symbols": [
+    "SOLUSDT"
+  ],
+  "initial_capital": 1000.0,
+  "final_equity": 992.644256,
+  "total_return_pct": -0.7356,
+  "max_drawdown_pct": -1.1793,
+  "trade_count": 4,
+  "win_rate_pct": 50.0,
+  "avg_trade_pnl": -1.599229,
+  "profit_factor": 0.562631,
+  "max_active_symbols": 2,
+  "max_same_side_positions": 1,
+  "leverage": 4.0,
+  "margin_pct_per_trade": 0.15,
+  "cooldown_bars": 12,
+  "min_1h_slope_pct": 0.00035,
+  "min_macd_hist_pct": 0.00012,
+  "min_bb_width_delta": 0.0008,
+  "require_dual_models": true,
+  "max_daily_loss_percent": 5.0,
+  "max_consecutive_losses": 2,
+  "consecutive_loss_cooldown_seconds": 1800,
+  "risk_events": [],
+  "analysis": {
+    "worst_symbols": [
+      {
+        "symbol": "SOLUSDT",
+        "trade_count": 4,
+        "total_pnl": -6.396915159999999,
+        "avg_pnl": -1.5992287899999997,
+        "win_rate": 50.0
+      }
+    ],
+    "worst_entry_hours": [
+      {
+        "entry_hour": 14,
+        "trade_count": 1,
+        "total_pnl": -8.4590664,
+        "avg_pnl": -8.4590664,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 1,
+        "trade_count": 1,
+        "total_pnl": -6.16684917,
+        "avg_pnl": -6.16684917,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 12,
+        "trade_count": 1,
+        "total_pnl": 1.40228355,
+        "avg_pnl": 1.40228355,
+        "win_rate": 100.0
+      },
+      {
+        "entry_hour": 15,
+        "trade_count": 1,
+        "total_pnl": 6.82671686,
+        "avg_pnl": 6.82671686,
+        "win_rate": 100.0
+      }
+    ]
+  },
+  "days": 30,
+  "warmup_days": 7
+}

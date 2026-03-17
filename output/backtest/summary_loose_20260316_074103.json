@@ -1,0 +1,29 @@
+{
+  "mode": "loose",
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XAGUSDT",
+    "LTCUSDT"
+  ],
+  "initial_capital": 1000.0,
+  "final_equity": 565.475394,
+  "total_return_pct": -43.4525,
+  "max_drawdown_pct": -45.1781,
+  "trade_count": 178,
+  "win_rate_pct": 24.7191,
+  "avg_trade_pnl": -2.203454,
+  "profit_factor": 0.538791,
+  "max_active_symbols": 2,
+  "leverage": 4.0,
+  "margin_pct_per_trade": 0.2,
+  "cooldown_bars": 8,
+  "min_1h_slope_pct": 0.00025,
+  "min_macd_hist_pct": 8e-05,
+  "min_bb_width_delta": 0.0004,
+  "require_dual_models": false,
+  "days": 30,
+  "warmup_days": 7
+}

@@ -17,31 +17,19 @@
   },
   "trading": {
     "symbols": [
-      "XRPUSDT",
+      "BTCUSDT",
+      "ETHUSDT",
       "BNBUSDT",
       "SOLUSDT",
-      "DOGEUSDT",
-      "TRXUSDT",
-      "ADAUSDT",
-      "BCHUSDT",
-      "BARDUSDT",
-      "CYSUSDT",
-      "LINKUSDT",
-      "AVAXUSDT",
-      "XLMUSDT",
-      "SUIUSDT",
-      "HBARUSDT",
+      "XAGUSDT",
       "LTCUSDT",
-      "DOTUSDT",
-      "TONUSDT",
-      "UNIUSDT",
-      "APTUSDT"
+      "DOGEUSDT"
     ],
-    "min_leverage": 4,
-    "default_leverage": 6,
-    "max_leverage": 8,
+    "min_leverage": 3,
+    "default_leverage": 4,
+    "max_leverage": 5,
     "min_position_percent": 12,
-    "max_position_percent": 100,
+    "max_position_percent": 60,
     "reserve_percent": 20
   },
   "risk": {
@@ -51,8 +39,8 @@
     "daily_loss_cooldown_seconds": 28800,
     "consecutive_loss_cooldown_seconds": 1800,
     "daily_reset_timezone": "Asia/Shanghai",
-    "stop_loss_default_percent": 0.02,
-    "take_profit_default_percent": 0.0,
+    "stop_loss_default_percent": 0.015,
+    "take_profit_default_percent": 0.06,
     "conflict_protection": {
       "light_confirm_bars": 2,
       "hard_confirm_bars": 5,
@@ -101,17 +89,17 @@
       "close_decision_macd_weight": 0.3,
       "close_decision_kdj_weight": 0.15
     },
-    "min_leverage": 4,
-    "default_leverage": 6,
-    "max_leverage": 8
+    "min_leverage": 3,
+    "default_leverage": 4,
+    "max_leverage": 5
   },
   "strategy": {
     "mode": "FUND_FLOW"
   },
   "fund_flow": {
-    "default_target_portion": 0.1,
-    "add_position_portion": 0.05,
-    "max_symbol_position_portion": 0.15,
+    "default_target_portion": 0.6,
+    "add_position_portion": 0.6,
+    "max_symbol_position_portion": 0.6,
     "max_active_symbols": 2,
     "min_open_portion": 0.06,
     "max_open_portion": 1.0,
@@ -131,9 +119,9 @@
     "dca_multipliers": [
       1.0
     ],
-    "min_leverage": 4,
-    "default_leverage": 6,
-    "max_leverage": 8,
+    "min_leverage": 3,
+    "default_leverage": 4,
+    "max_leverage": 5,
     "strict_leverage_sync": true,
     "price_deviation_limit_percent": 1.0,
     "open_threshold": 0.38,
@@ -169,19 +157,32 @@
       "4h"
     ],
     "decision_timeframe": "15m",
-    "entry_side_mode": "BOTH",
-    "symbol_side_overrides": {
-      "BCHUSDT": "SHORT_ONLY",
-      "XRPUSDT": "SHORT_ONLY",
-      "LTCUSDT": "SHORT_ONLY",
-      "AVAXUSDT": "SHORT_ONLY",
-      "LINKUSDT": "SHORT_ONLY",
-      "APTUSDT": "SHORT_ONLY",
-      "TONUSDT": "NO_TRADE",
-      "HBARUSDT": "NO_TRADE"
+    "strategy_mode": "ema10_ema30_1h_15m_rule",
+    "rule_strategy": {
+      "enabled": true,
+      "primary_trend_timeframe": "1h",
+      "entry_timeframe": "15m",
+      "attack_ema_period": 10,
+      "ema_period": 30,
+      "stop_ema_period": 30,
+      "runner_ema_period": 10,
+      "ema_band_pct": 0.001,
+      "ema_flat_slope_pct_threshold": 0.00015,
+      "bollinger_touch_tolerance_pct": 0.003,
+      "stop_break_buffer_pct": 0.0,
+      "stop_buffer_pct": 0.003,
+      "min_stop_pct": 0.01,
+      "max_stop_pct": 0.025,
+      "tp1_min_pct": 0.05,
+      "tp1_max_pct": 0.1,
+      "runner_activate_pct": 0.05,
+      "tp1_reduce_pct": 0.5,
+      "legacy_auxiliary_filters_enabled": true
     },
+    "entry_side_mode": "BOTH",
+    "symbol_side_overrides": {},
     "regime": {
-      "timeframe": "15m",
+      "timeframe": "1h",
       "adx_trend_on": 15.0,
       "adx_range_on": 14.5,
       "adx_no_trade_low": 14.6,
@@ -198,7 +199,7 @@
       "ema_slow_period": 50
     },
     "ma10_macd_confluence": {
-      "enabled": true,
+      "enabled": false,
       "tf_exec": "5m",
       "tf_anchor": "1h",
       "ma_period": 10,
@@ -344,12 +345,12 @@
     "engine_params": {
       "TREND": {
         "max_active_symbols": 2,
-        "default_target_portion": 0.1,
-        "add_position_portion": 0.05,
-        "max_symbol_position_portion": 0.15,
-        "default_leverage": 6,
-        "max_leverage": 8,
-        "min_leverage": 4,
+        "default_target_portion": 0.6,
+        "add_position_portion": 0.6,
+        "max_symbol_position_portion": 0.6,
+        "default_leverage": 4,
+        "max_leverage": 5,
+        "min_leverage": 3,
         "long_open_threshold": 0.11,
         "short_open_threshold": 0.09,
         "close_threshold": 0.3,
@@ -366,12 +367,12 @@
       },
       "RANGE": {
         "max_active_symbols": 2,
-        "default_target_portion": 0.08,
-        "add_position_portion": 0.0,
-        "max_symbol_position_portion": 0.1,
-        "default_leverage": 6,
-        "max_leverage": 8,
-        "min_leverage": 4,
+        "default_target_portion": 0.6,
+        "add_position_portion": 0.6,
+        "max_symbol_position_portion": 0.6,
+        "default_leverage": 4,
+        "max_leverage": 5,
+        "min_leverage": 3,
         "long_open_threshold": 0.48,
         "short_open_threshold": 0.4,
         "close_threshold": 0.55,
@@ -393,8 +394,13 @@
     "major_symbol_signal_pool": {
       "enabled": true,
       "symbols": [
+        "BTCUSDT",
         "ETHUSDT",
-        "BNBUSDT"
+        "BNBUSDT",
+        "SOLUSDT",
+        "XAGUSDT",
+        "LTCUSDT",
+        "DOGEUSDT"
       ],
       "trend_pool_id": "trend_pool_major"
     },
@@ -725,7 +731,7 @@
   },
   "schedule": {
     "interval_seconds": 60,
-    "symbols_per_cycle": 22,
+    "symbols_per_cycle": 7,
     "symbols_per_cycle_prioritize_positions": true,
     "align_to_kline_close": true,
     "kline_close_delay_seconds": 3,
@@ -749,3 +755,5 @@
     "preload_request_sleep_ms": 0
   }
 }
+
+

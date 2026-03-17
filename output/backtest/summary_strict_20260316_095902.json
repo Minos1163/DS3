@@ -1,0 +1,155 @@
+{
+  "mode": "strict",
+  "profile_name": "",
+  "allowed_entry_hours": null,
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XAGUSDT",
+    "LTCUSDT"
+  ],
+  "initial_capital": 1000.0,
+  "final_equity": 995.081809,
+  "total_return_pct": -0.4918,
+  "max_drawdown_pct": -4.9098,
+  "trade_count": 18,
+  "win_rate_pct": 38.8889,
+  "avg_trade_pnl": -0.058424,
+  "profit_factor": 0.983374,
+  "max_active_symbols": 2,
+  "max_same_side_positions": 1,
+  "leverage": 4.0,
+  "margin_pct_per_trade": 0.15,
+  "cooldown_bars": 12,
+  "min_1h_slope_pct": 0.00035,
+  "min_macd_hist_pct": 0.00012,
+  "min_bb_width_delta": 0.0008,
+  "require_dual_models": true,
+  "max_daily_loss_percent": 5.0,
+  "max_consecutive_losses": 2,
+  "consecutive_loss_cooldown_seconds": 1800,
+  "risk_events": [
+    {
+      "timestamp": "2026-02-19T16:15:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-02-19T16:45:00"
+    },
+    {
+      "timestamp": "2026-03-01T15:45:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-03-01T16:15:00"
+    },
+    {
+      "timestamp": "2026-03-05T12:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=3 until=2026-03-05T13:00:00"
+    },
+    {
+      "timestamp": "2026-03-07T08:00:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=4 until=2026-03-07T08:30:00"
+    },
+    {
+      "timestamp": "2026-03-11T01:45:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-03-11T02:15:00"
+    },
+    {
+      "timestamp": "2026-03-13T21:45:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=3 until=2026-03-13T22:15:00"
+    },
+    {
+      "timestamp": "2026-03-14T04:45:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=4 until=2026-03-14T05:15:00"
+    }
+  ],
+  "analysis": {
+    "worst_symbols": [
+      {
+        "symbol": "XAGUSDT",
+        "trade_count": 3,
+        "total_pnl": -17.39237821,
+        "avg_pnl": -5.797459403333334,
+        "win_rate": 0.0
+      },
+      {
+        "symbol": "ETHUSDT",
+        "trade_count": 2,
+        "total_pnl": -12.2248791,
+        "avg_pnl": -6.11243955,
+        "win_rate": 0.0
+      },
+      {
+        "symbol": "LTCUSDT",
+        "trade_count": 5,
+        "total_pnl": -2.8641203800000006,
+        "avg_pnl": -0.5728240760000001,
+        "win_rate": 40.0
+      },
+      {
+        "symbol": "SOLUSDT",
+        "trade_count": 3,
+        "total_pnl": 2.21409378,
+        "avg_pnl": 0.73803126,
+        "win_rate": 66.66666666666666
+      },
+      {
+        "symbol": "BTCUSDT",
+        "trade_count": 2,
+        "total_pnl": 11.94048809,
+        "avg_pnl": 5.970244045,
+        "win_rate": 50.0
+      }
+    ],
+    "worst_entry_hours": [
+      {
+        "entry_hour": 14,
+        "trade_count": 2,
+        "total_pnl": -16.33488969,
+        "avg_pnl": -8.167444845,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 4,
+        "trade_count": 2,
+        "total_pnl": -11.82599072,
+        "avg_pnl": -5.91299536,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 1,
+        "trade_count": 1,
+        "total_pnl": -6.15123699,
+        "avg_pnl": -6.15123699,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 21,
+        "trade_count": 1,
+        "total_pnl": -4.79281743,
+        "avg_pnl": -4.79281743,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 16,
+        "trade_count": 1,
+        "total_pnl": -4.24292097,
+        "avg_pnl": -4.24292097,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 10,
+        "trade_count": 1,
+        "total_pnl": -3.89245314,
+        "avg_pnl": -3.89245314,
+        "win_rate": 0.0
+      }
+    ]
+  },
+  "days": 30,
+  "warmup_days": 7
+}

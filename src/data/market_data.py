@@ -274,9 +274,13 @@ class MarketDataManager:
         indicators["macd_histogram"] = histogram
 
         # EMA (确保有足够的数据)
+        ema_10 = calculate_ema(close, period=10) if len(close) >= 10 else None
         ema_20 = calculate_ema(close, period=20) if len(close) >= 20 else None
+        ema_30 = calculate_ema(close, period=30) if len(close) >= 30 else None
         ema_50 = calculate_ema(close, period=50) if len(close) >= 50 else None
+        indicators["ema_10"] = ema_10 if ema_10 is not None else 0
         indicators["ema_20"] = ema_20 if ema_20 is not None else 0
+        indicators["ema_30"] = ema_30 if ema_30 is not None else 0
         indicators["ema_50"] = ema_50 if ema_50 is not None else 0
 
         # SMA
@@ -404,7 +408,9 @@ class MarketDataManager:
             low = df["low"]
 
             # 基础指标
+            ema_attack = calculate_ema(close, period=10)
             ema_fast = calculate_ema(close, period=20)
+            ema_mid = calculate_ema(close, period=30)
             ema_slow = calculate_ema(close, period=50)
             adx = calculate_adx(high, low, close, period=14)
             atr = calculate_atr(high, low, close, period=14)
@@ -418,18 +424,31 @@ class MarketDataManager:
             kdj_k, kdj_d, kdj_j = calculate_kdj(high, low, close, period=9, smooth=3)
             bb_middle, bb_upper, bb_lower = calculate_bollinger_bands(close, period=20, num_std=2.0)
             ema_slope = calculate_ema_slope(close, period=20, slope_period=3)
+            ema30_slope = calculate_ema_slope(close, period=30, slope_period=3)
             ema_diff_pct = calculate_ema_diff_pct(close, fast_period=20, slow_period=50)
 
-            if ema_fast is None or ema_slow is None or adx is None or atr_pct is None:
+            if ema_mid is None or ema_slow is None or adx is None or atr_pct is None:
                 return {}
 
+            ema_attack_value = float(ema_attack) if ema_attack is not None else 0.0
+            ema_fast_value = float(ema_fast) if ema_fast is not None else 0.0
+            ema_mid_value = float(ema_mid) if ema_mid is not None else 0.0
+            ema30_slope_value = float(ema30_slope) if ema30_slope is not None else 0.0
             result = {
-                "ema_fast": float(ema_fast),
+                "ema_attack": ema_attack_value,
+                "ema_10": ema_attack_value,
+                "ema10": ema_attack_value,
+                "ema_fast": ema_fast_value,
+                "ema_mid": ema_mid_value,
+                "ema_30": ema_mid_value,
+                "ema30": ema_mid_value,
                 "ema_slow": float(ema_slow),
                 "adx": float(adx),
                 "atr_pct": float(atr_pct),
                 "last_close": last_close,
                 "last_open": last_open,
+                "ema30_slope": ema30_slope_value,
+                "ema30_slope_pct": (ema30_slope_value / ema_mid_value) if abs(ema_mid_value) > 1e-9 else 0.0,
             }
 
             # 归一化辅助函数
@@ -509,6 +528,27 @@ class MarketDataManager:
             if macd_signal is not None:
                 result["macd_signal"] = float(macd_signal)
 
+            if len(close) >= 31:
+                ema10_series = close.ewm(span=10, adjust=False).mean()
+                ema30_series = close.ewm(span=30, adjust=False).mean()
+                ema10_tail = ema10_series.dropna()
+                ema30_tail = ema30_series.dropna()
+                if len(ema10_tail) >= 2 and len(ema30_tail) >= 2:
+                    ema10_prev = float(ema10_tail.iloc[-2])
+                    ema10_now = float(ema10_tail.iloc[-1])
+                    ema30_prev = float(ema30_tail.iloc[-2])
+                    ema30_now = float(ema30_tail.iloc[-1])
+                    ema_cross = "NONE"
+                    if ema10_prev <= ema30_prev and ema10_now > ema30_now:
+                        ema_cross = "GOLDEN"
+                    elif ema10_prev >= ema30_prev and ema10_now < ema30_now:
+                        ema_cross = "DEAD"
+                    result["ema10_prev"] = ema10_prev
+                    result["ema10_now"] = ema10_now
+                    result["ema30_prev"] = ema30_prev
+                    result["ema30_now"] = ema30_now
+                    result["ema_cross"] = ema_cross
+
             if kdj_k is not None and kdj_d is not None and kdj_j is not None:
                 result["kdj_k"] = float(kdj_k)
                 result["kdj_d"] = float(kdj_d)
@@ -572,6 +612,18 @@ class MarketDataManager:
                 result["bb_trend"] = bb_trend
                 result["bb_trend_bias"] = 1.0 if bb_trend == "ALONG_UPPER" else (-1.0 if bb_trend == "ALONG_LOWER" else 0.0)
                 result["bb_squeeze"] = bool(width <= 0.02)
+                if len(close) >= 22:
+                    rolling_middle = close.rolling(window=20).mean()
+                    rolling_std = close.rolling(window=20).std(ddof=0)
+                    rolling_upper = rolling_middle + 2.0 * rolling_std
+                    rolling_lower = rolling_middle - 2.0 * rolling_std
+                    width_series = (rolling_upper - rolling_lower) / rolling_middle.replace(0, pd.NA)
+                    width_tail = width_series.dropna()
+                    if len(width_tail) >= 2:
+                        width_prev = float(width_tail.iloc[-2])
+                        width_now = float(width_tail.iloc[-1])
+                        result["bb_width_prev"] = width_prev
+                        result["bb_width_expand"] = bool(width_now > width_prev)
 
             if ema_diff_pct is not None:
                 result["ema_diff_pct"] = float(ema_diff_pct)

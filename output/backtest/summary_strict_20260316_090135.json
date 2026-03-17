@@ -1,0 +1,141 @@
+{
+  "mode": "strict",
+  "profile_name": "doge_first_low_dd",
+  "allowed_entry_hours": [
+    0,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    12,
+    14,
+    15,
+    16,
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "symbols": [
+    "DOGEUSDT"
+  ],
+  "initial_capital": 1000.0,
+  "final_equity": 1114.122358,
+  "total_return_pct": 11.4122,
+  "max_drawdown_pct": -2.508,
+  "trade_count": 20,
+  "win_rate_pct": 40.0,
+  "avg_trade_pnl": 5.855633,
+  "profit_factor": 3.243689,
+  "max_active_symbols": 2,
+  "max_same_side_positions": 1,
+  "leverage": 4.0,
+  "margin_pct_per_trade": 0.1,
+  "cooldown_bars": 20,
+  "min_1h_slope_pct": 0.0009,
+  "min_macd_hist_pct": 0.0001,
+  "min_bb_width_delta": 0.0008,
+  "require_dual_models": true,
+  "max_daily_loss_percent": 5.0,
+  "max_consecutive_losses": 2,
+  "consecutive_loss_cooldown_seconds": 1800,
+  "risk_events": [
+    {
+      "timestamp": "2026-02-19T06:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-02-19T07:00:00"
+    },
+    {
+      "timestamp": "2026-02-19T17:15:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=3 until=2026-02-19T17:45:00"
+    },
+    {
+      "timestamp": "2026-02-21T11:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=4 until=2026-02-21T12:00:00"
+    },
+    {
+      "timestamp": "2026-03-04T06:30:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-03-04T07:00:00"
+    },
+    {
+      "timestamp": "2026-03-07T17:15:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-03-07T17:45:00"
+    },
+    {
+      "timestamp": "2026-03-08T09:00:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=3 until=2026-03-08T09:30:00"
+    },
+    {
+      "timestamp": "2026-03-16T00:15:00",
+      "event": "consecutive_loss_stop",
+      "detail": "losses=2 until=2026-03-16T00:45:00"
+    }
+  ],
+  "analysis": {
+    "worst_symbols": [
+      {
+        "symbol": "DOGEUSDT",
+        "trade_count": 20,
+        "total_pnl": 117.11265969,
+        "avg_pnl": 5.8556329845,
+        "win_rate": 40.0
+      }
+    ],
+    "worst_entry_hours": [
+      {
+        "entry_hour": 16,
+        "trade_count": 1,
+        "total_pnl": -6.20277471,
+        "avg_pnl": -6.20277471,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 0,
+        "trade_count": 1,
+        "total_pnl": -4.53920835,
+        "avg_pnl": -4.53920835,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 6,
+        "trade_count": 1,
+        "total_pnl": -2.15677389,
+        "avg_pnl": -2.15677389,
+        "win_rate": 0.0
+      },
+      {
+        "entry_hour": 5,
+        "trade_count": 3,
+        "total_pnl": 3.35072218,
+        "avg_pnl": 1.1169073933333333,
+        "win_rate": 33.33333333333333
+      },
+      {
+        "entry_hour": 23,
+        "trade_count": 2,
+        "total_pnl": 7.47548201,
+        "avg_pnl": 3.737741005,
+        "win_rate": 50.0
+      },
+      {
+        "entry_hour": 8,
+        "trade_count": 2,
+        "total_pnl": 14.77836103,
+        "avg_pnl": 7.389180515,
+        "win_rate": 50.0
+      }
+    ]
+  },
+  "days": 30,
+  "warmup_days": 7
+}
